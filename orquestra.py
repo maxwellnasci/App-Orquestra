@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.rule import Rule
 from rich.table import Table
+from rich.markdown import Markdown
 from rich import box
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -115,6 +116,9 @@ DEFAULT_CONFIG = {
             "label": "Operário DeepSeek",
             "description": "Abertura no painel lateral via claude-deepseek"
         }
+    },
+    "ui": {
+        "mode": "tecnico"
     }
 }
 
@@ -147,7 +151,12 @@ def load_config() -> dict:
             if w_name not in cfg["workers"]:
                 cfg["workers"][w_name] = w_data
                 needs_save = True
-    
+
+    # Garante que a seção ui existe (modo técnico/chat)
+    if "ui" not in cfg:
+        cfg["ui"] = DEFAULT_CONFIG["ui"]
+        needs_save = True
+
     if needs_save:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -256,6 +265,310 @@ def handle_safe_exit(config: dict):
     sys.exit(0)
 
 # ─────────────────────────────────────────────────────────
+# Integração: Open Design
+# ─────────────────────────────────────────────────────────
+# O Open Design (nexu-io/open-design) roda como um daemon+web local que delega
+# o trabalho de agente pro `agy`/Antigravity já autenticado no PATH, com acesso
+# de leitura E escrita à pasta real do projeto via `linkedDirs` (--add-dir).
+# Serve pra gerar uma prévia visual DE VERDADE (renderizada, navegável) antes
+# de aprovar qualquer mudança de interface — em vez de descrição em texto.
+# Ver VALIDACAO_OPEN_DESIGN.md pro histórico completo da validação.
+
+def _open_design_env(config: dict) -> dict:
+    node_bin = config.get("open_design", {}).get("node_bin_dir")
+    env = os.environ.copy()
+    if node_bin:
+        env["PATH"] = f"{node_bin}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
+def open_design_tools_dev_status(config: dict) -> dict | None:
+    """Consulta o status do daemon/web do Open Design via `tools-dev status --json`.
+    None se não estiver configurado, o repo não existir, ou o comando falhar."""
+    repo_path = config.get("open_design", {}).get("repo_path")
+    if not repo_path or not Path(repo_path).is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["pnpm", "exec", "tools-dev", "status", "--json"],
+            cwd=repo_path, env=_open_design_env(config),
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    idx = result.stdout.find("{")
+    if result.returncode != 0 or idx < 0:
+        return None
+    try:
+        return json.loads(result.stdout[idx:])
+    except json.JSONDecodeError:
+        return None
+
+
+def open_design_cli(config: dict, args: list, daemon_url: str, timeout: int = 30):
+    """Roda `od <args>` chamando o node oficial + od.mjs diretamente (nunca o
+    binário `od` pelado — colide com /usr/bin/od do coreutils). Retorna
+    (ok: bool, dados: dict|None) já parseado de --json.
+    Em falha, `dados` vira {"error": "<motivo>"} em vez de None — os chamadores
+    que hoje fazem `(data or {}).get(...) if ok else None` continuam funcionando
+    do mesmo jeito (ignoram `data` quando ok=False), mas quem quiser diagnosticar
+    o motivo real de uma falha (em vez da mensagem genérica de sempre) pode ler
+    `data["error"]`."""
+    repo_path = config.get("open_design", {}).get("repo_path")
+    node_bin = config.get("open_design", {}).get("node_bin_dir")
+    if not repo_path:
+        return False, {"error": "open_design.repo_path não configurado em ~/.orquestra.json"}
+    node_exe = str(Path(node_bin) / "node") if node_bin else "node"
+    od_mjs = str(Path(repo_path) / "apps" / "daemon" / "bin" / "od.mjs")
+    cmd = [node_exe, od_mjs, *args, "--json", "--daemon-url", daemon_url]
+    try:
+        result = subprocess.run(cmd, env=_open_design_env(config), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, {"error": f"`od {' '.join(args)}` estourou o timeout de {timeout}s"}
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, {"error": detail[:2000] if detail else f"`od {' '.join(args)}` saiu com código {result.returncode}"}
+    try:
+        return True, json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        return False, {"error": f"resposta não-JSON de `od {' '.join(args)}`: {result.stdout.strip()[:500]}"}
+
+
+def open_design_ensure_running(config: dict, wait_s: int = 40) -> dict | None:
+    """Garante que o daemon/web do Open Design estejam de pé, subindo sozinho em
+    background se ainda não estiverem — só daemon+web (`tools-dev start web`),
+    sem o Electron/desktop, que a gente não usa (o preview é aberto no
+    navegador de verdade via xdg-open, e as tarefas rodam headless pela API).
+    Só é chamado quando alguém de fato pediu uma prévia, nunca no arranque do
+    orquestra.py — subir isso gasta ~1GB de RAM, não vale pagar à toa em
+    sessões que não mexem em nada visual. Retorna o dict de status ou None."""
+    def _ready(s):
+        apps = (s or {}).get("apps", {})
+        d, w = apps.get("daemon", {}), apps.get("web", {})
+        return d.get("state") == "running" and d.get("url") and w.get("state") == "running" and w.get("url")
+
+    status = open_design_tools_dev_status(config)
+    if _ready(status):
+        return status
+
+    repo_path = config.get("open_design", {}).get("repo_path")
+    if not repo_path or not Path(repo_path).is_dir():
+        console.print(f"[dim]Open Design: `open_design.repo_path` ausente ou inválido ({repo_path!r}) em ~/.orquestra.json.[/dim]")
+        return None
+
+    console.print("[dim]🎨 Open Design ainda não estava de pé — subindo agora (leva só alguns segundos)...[/dim]")
+    try:
+        subprocess.Popen(
+            ["pnpm", "exec", "tools-dev", "start", "web"],
+            cwd=repo_path, env=_open_design_env(config),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (FileNotFoundError, OSError) as e:
+        console.print(f"[dim]Open Design: falha ao rodar `pnpm exec tools-dev start web` — {e}[/dim]")
+        return None
+
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        time.sleep(3)
+        status = open_design_tools_dev_status(config)
+        if _ready(status):
+            return status
+    console.print(f"[dim]Open Design: não ficou pronto em {wait_s}s. Último status: {status}[/dim]")
+    return None
+
+
+def get_open_design_cache_file() -> Path:
+    return get_project_chat_dir() / "open_design.json"
+
+
+def load_open_design_cache() -> dict:
+    f = get_open_design_cache_file()
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_open_design_cache(data: dict):
+    get_open_design_cache_file().write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def open_design_resolve_project(config: dict) -> dict | None:
+    """Garante que existe um projeto do Open Design ligado (linkedDirs) à pasta
+    atual. Reaproveita o cache por pasta se o projeto ainda existir no daemon;
+    cria um novo caso contrário. Sobe o Open Design sozinho se ainda não
+    estiver rodando (ver open_design_ensure_running). None se não conseguir.
+    Retorna {"daemon_url", "web_url", "project_id"}."""
+    status = open_design_ensure_running(config)
+    daemon_info = (status or {}).get("apps", {}).get("daemon", {})
+    if daemon_info.get("state") != "running" or not daemon_info.get("url"):
+        return None
+    daemon_url = daemon_info["url"]
+    web_url = status.get("apps", {}).get("web", {}).get("url")
+
+    project_dir = get_project_dir()
+    cache = load_open_design_cache()
+    cached_id = cache.get("project_id")
+    if cache.get("project_dir") == project_dir and cached_id:
+        ok, info = open_design_cli(config, ["project", "info", cached_id], daemon_url)
+        if ok and info and info.get("project"):
+            return {"daemon_url": daemon_url, "web_url": web_url, "project_id": cached_id}
+
+    fd, metadata_path = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"linkedDirs": [project_dir]}, f, ensure_ascii=False)
+        ok, data = open_design_cli(
+            config,
+            ["project", "create", "--name", Path(project_dir).name, "--metadata-json", metadata_path],
+            daemon_url,
+        )
+    finally:
+        os.unlink(metadata_path)
+
+    project_id = (data or {}).get("project", {}).get("id") if ok else None
+    if not project_id:
+        if not ok and isinstance(data, dict) and data.get("error"):
+            console.print(f"[dim]Open Design: falha ao criar o projeto — {data['error'][:400]}[/dim]")
+        return None
+
+    save_open_design_cache({"project_dir": project_dir, "project_id": project_id})
+    return {"daemon_url": daemon_url, "web_url": web_url, "project_id": project_id}
+
+
+def _git_dirty_files(project_dir: str) -> set | None:
+    """Lista de arquivos com mudança não commitada, ou None se a pasta não for um repo git."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=project_dir,
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    return {line[3:].strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -> tuple[bool, str]:
+    """Roda uma automação de tiro único no Open Design ligada à pasta atual:
+    cria (--disabled) → dispara (`run`) → aguarda terminar → lê a última
+    mensagem do assistente → apaga a automação (descartável, uso único).
+    Retorna (ok, texto_da_resposta_ou_erro)."""
+    resolved = open_design_resolve_project(config)
+    if not resolved:
+        return False, ("Não consegui subir o Open Design automaticamente (repo não configurado em "
+                        "~/.orquestra.json, ou demorou demais pra iniciar). Rode `open-design-dev` "
+                        "manualmente em outro terminal e tente de novo.")
+    daemon_url = resolved["daemon_url"]
+    project_id = resolved["project_id"]
+    project_dir = get_project_dir()
+
+    # `linkedDirs` dá ao agente por trás do Open Design acesso de LEITURA E ESCRITA
+    # à pasta real (não é um sandbox isolado, apesar do nome sugerir). Mesmo
+    # pedindo explicitamente "só prévia" no prompt, ele pode escrever direto
+    # aqui — já aconteceu em teste anterior (ver VALIDACAO_OPEN_DESIGN.md, 9.2).
+    # Comparamos o `git status` antes/depois pra avisar se isso acontecer de novo.
+    files_before = _git_dirty_files(project_dir)
+
+    full_prompt = (
+        f"Você está trabalhando na pasta real do projeto: {project_dir}\n"
+        "Essa é a pasta de trabalho de verdade — leia os arquivos e o design system "
+        "REAIS daqui (paleta, componentes, tipografia, telas existentes) antes de "
+        "responder, para que a prévia reaproveite o visual já existente em vez de "
+        "inventar um estilo novo do zero.\n\n"
+        f"Tarefa pedida pelo usuário:\n{instruction}"
+    )
+
+    fd, prompt_path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(full_prompt)
+
+    # Força o agente de execução do Open Design (padrão "claude"/Claude Code, não
+    # o "antigravity"/Gemini que fica configurado como default global do Open
+    # Design em .od/app-config.json). Validado na prática: numa automação real
+    # anterior (ver VALIDACAO_OPEN_DESIGN.md, 9.2-9.3), o Claude Code leu de
+    # verdade o design system do projeto (index.css, paleta, screenshots) e
+    # replicou fielmente as cores reais — em teste comparado (16/08), a mesma
+    # tarefa com o agente default (antigravity/Gemini) gerou 3 vezes seguidas
+    # uma paleta genérica inventada, ignorando as cores reais do projeto mesmo
+    # com o prompt pedindo explicitamente pra ler os arquivos reais.
+    open_design_agent = config.get("open_design", {}).get("agent", "claude")
+
+    automation_id = None
+    try:
+        ok, data = open_design_cli(
+            config,
+            ["automation", "create", "--name", f"orquestra-preview-{int(time.time())}",
+             "--prompt-file", prompt_path, "--target", f"reuse={project_id}",
+             "--schedule", "hourly:0", "--disabled", "--agent", open_design_agent],
+            daemon_url,
+        )
+        automation_id = (data or {}).get("routine", {}).get("id") if ok else None
+        if not automation_id:
+            detail = (data or {}).get("error") if isinstance(data, dict) else None
+            msg = "Não consegui criar a tarefa no Open Design."
+            return False, f"{msg} ({detail})" if detail else msg
+
+        ok, run_data = open_design_cli(config, ["automation", "run", automation_id], daemon_url)
+        conversation_id = (run_data or {}).get("conversationId") if ok else None
+        if not conversation_id:
+            detail = (run_data or {}).get("error") if isinstance(run_data, dict) else None
+            msg = "Não consegui disparar a tarefa no Open Design."
+            return False, f"{msg} ({detail})" if detail else msg
+
+        deadline = time.time() + timeout_s
+        final_status = "running"
+        while time.time() < deadline:
+            ok, runs_data = open_design_cli(config, ["automation", "runs", automation_id, "--limit", "1"], daemon_url)
+            runs = (runs_data or {}).get("runs", []) if ok else []
+            if runs:
+                final_status = runs[0].get("status", "running")
+                if final_status not in ("queued", "running"):
+                    break
+            time.sleep(5)
+        else:
+            return False, f"Open Design não terminou em {timeout_s // 60} min (ainda '{final_status}')."
+
+        if final_status != "succeeded":
+            return False, f"A tarefa no Open Design terminou com status '{final_status}'."
+
+        req = urllib.request.Request(
+            f"{daemon_url}/api/projects/{project_id}/conversations/{conversation_id}/messages"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            messages = json.loads(resp.read().decode("utf-8")).get("messages", [])
+
+        assistant_msgs = [m for m in messages if m.get("role") == "assistant" and m.get("content")]
+        if not assistant_msgs:
+            return False, "Open Design terminou mas não devolveu nenhum texto de resposta."
+
+        text = assistant_msgs[-1]["content"].strip()
+
+        if files_before is not None:
+            files_after = _git_dirty_files(project_dir)
+            touched = (files_after or set()) - files_before
+            if touched:
+                warning = (
+                    "⚠️ ATENÇÃO: mesmo em modo prévia, o Open Design escreveu direto nos arquivos "
+                    f"REAIS do projeto: {', '.join(sorted(touched))}. Confira com `git diff` antes de aprovar "
+                    "ou commitar qualquer coisa.\n\n"
+                )
+                text = warning + text
+
+        if resolved.get("web_url"):
+            text += f"\n\n🔗 Prévia ao vivo: {resolved['web_url']}/projects/{project_id}"
+        return True, text
+    finally:
+        os.unlink(prompt_path)
+        if automation_id:
+            open_design_cli(config, ["automation", "delete", automation_id], daemon_url)
+
+
+# ─────────────────────────────────────────────────────────
 # Utilitários
 # ─────────────────────────────────────────────────────────
 
@@ -307,6 +620,9 @@ def print_help():
     table.add_row("/historico",           "Mostra o histórico de conversa do especialista ativo")
     table.add_row("/limpar-chat",         "Apaga o histórico do especialista ativo (começa do zero)")
     table.add_row("/interativo",          "Abre o agente ativo em sessão interativa")
+    table.add_row("/design",              "Abre o Open Design ligado à pasta atual (prévia visual ao vivo)")
+    table.add_row("/modo chat",           "Respostas limpas tipo chat, sem narração técnica de tool calls")
+    table.add_row("/modo tecnico",        "Volta a mostrar tudo em tempo real (padrão)")
     table.add_row("/status",              "Mostra agente ativo e pasta do projeto")
     table.add_row("/limpar",              "Limpa a tela")
     table.add_row("/sair  ou  /exit",     "Encerra o Orquestra")
@@ -693,6 +1009,206 @@ def launch_interactive(config: dict) -> int:
 
 
 # ─────────────────────────────────────────────────────────
+# Execução headless de operários — streaming em tempo real
+# ─────────────────────────────────────────────────────────
+# Roda claude/agy em modo --print + --output-format stream-json em vez de
+# abrir um painel tmux interativo e ficar catando pixels da tela. O processo
+# emite um evento JSON por linha (texto, chamada de ferramenta, resultado
+# final) e o próprio fim do processo é o sinal de conclusão — sem senha
+# mágica, sem heurística de idle, sem race condition.
+
+_ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+def _preview(value, limit=160) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = _ANSI_RE.sub('', text).replace("\n", " ").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+_IMG_MD_RE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
+_IMG_PATH_RE = re.compile(r'/\S+\.(?:png|jpe?g|gif|webp|svg)\b', re.IGNORECASE)
+
+
+def _auto_open_images(text: str):
+    """Terminal/tmux não renderiza markdown nem torna caminhos clicáveis — uma resposta
+    com ![](/caminho/imagem.jpg) fica como texto morto para o usuário. Abre a imagem de
+    verdade no visualizador padrão do sistema em vez de só imprimir o link."""
+    if not text or not shutil.which("xdg-open"):
+        return
+    candidates = set(_IMG_MD_RE.findall(text)) | set(_IMG_PATH_RE.findall(text))
+    opened = []
+    for raw in candidates:
+        cleaned = raw.strip().strip('<>').rstrip('.,;)')
+        path = Path(os.path.expanduser(cleaned))
+        if path.is_absolute() and path.is_file():
+            try:
+                subprocess.Popen(["xdg-open", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                opened.append(path.name)
+            except OSError:
+                pass
+    if opened:
+        console.print(f"[dim]🖼  Abrindo imagem(ns) no visualizador: {', '.join(opened)}[/dim]")
+
+
+# ─────────────────────────────────────────────────────────
+# Modo chat — renderização limpa (bolhas), sem narração técnica
+# ─────────────────────────────────────────────────────────
+
+_CODE_BLOCK_RE = re.compile(r'```.*?```', re.DOTALL)
+_ARTIFACT_RE = re.compile(r'<artifact[^>]*>.*?</artifact>', re.DOTALL | re.IGNORECASE)
+_URL_RE = re.compile(r'https?://\S+')
+
+
+def _chat_clean_text(text: str) -> str:
+    """Colapsa blocos grandes de código/artefato pro modo chat (ex: o HTML inteiro
+    de uma prévia do Open Design) numa linha curta. Só filtra o que é EXIBIDO —
+    o histórico salvo via save_chat_message continua completo, sem essa filtragem."""
+    text = _ARTIFACT_RE.sub("📄 (prévia/artefato gerado — veja o link acima)", text)
+
+    def _shrink(m):
+        n = m.group(0).count("\n")
+        return f"💻 (bloco de código omitido, {n} linhas — use /modo tecnico pra ver tudo)"
+
+    text = _CODE_BLOCK_RE.sub(_shrink, text)
+    return text.strip()
+
+
+def _print_chat_bubble(label: str, icon: str, color: str, text: str):
+    clean = _chat_clean_text(text)
+    if not clean:
+        return
+    console.print(Panel(
+        Markdown(clean), title=f"{icon} {label}", title_align="left",
+        border_style=color, box=box.ROUNDED, padding=(0, 1),
+    ))
+
+
+def _auto_open_links(text: str):
+    """Modo chat: abre a prévia (última URL do texto — open_design_run_task sempre
+    acrescenta '🔗 Prévia ao vivo: <url>' no fim) direto no navegador, sem o usuário
+    precisar clicar em nada no terminal."""
+    if not text or not shutil.which("xdg-open"):
+        return
+    urls = _URL_RE.findall(text)
+    if not urls:
+        return
+    url = urls[-1].rstrip('.,;)')
+    try:
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        console.print(f"[dim]🔗 Abrindo prévia no navegador: {url}[/dim]")
+    except OSError:
+        pass
+
+
+def _narrate_claude_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
+                          quiet: bool = False):
+    """Processa uma linha de stream-json do `claude` e narra em tempo real.
+    Preenche state['final_text']/state['is_error'] quando o evento 'result' chega.
+    Com quiet=True (modo chat), não imprime nada — só preenche o state."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    etype = d.get("type")
+
+    if etype == "assistant":
+        if not quiet:
+            for block in d.get("message", {}).get("content", []):
+                btype = block.get("type")
+                if btype == "text" and block.get("text", "").strip():
+                    console.print(f"[{color}]{icon} {label}:[/{color}] {block['text'].strip()}")
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "?")
+                    console.print(f"[{color}]{icon} {label} 🔧[/{color}] {tool_name}({_preview(block.get('input', {}))})")
+
+    elif etype == "user":
+        if not quiet:
+            for block in d.get("message", {}).get("content", []):
+                if block.get("type") == "tool_result":
+                    console.print(f"[dim]  ↳ resultado: {_preview(block.get('content', ''))}[/dim]")
+
+    elif etype == "result":
+        state["final_text"] = d.get("result", "") or ""
+        state["is_error"] = bool(d.get("is_error"))
+
+
+def _narrate_agy_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
+                       quiet: bool = False):
+    """Processa uma linha de stream-json do `agy` e narra em tempo real.
+    Com quiet=True (modo chat), não imprime nada — só preenche o state."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    event = d.get("event")
+
+    if event == "step_update":
+        upd = d.get("step_update", {})
+        step_type = upd.get("step_type")
+        step_idx = upd.get("step_index")
+        delta = upd.get("text_delta")
+
+        if step_type == "agent_response" and delta:
+            if not quiet:
+                if state.get("_last_stream_idx") != step_idx:
+                    console.print(f"[{color}]{icon} {label}:[/{color}] ", end="")
+                console.print(delta, end="")
+            state["_last_stream_idx"] = step_idx
+        elif step_type not in ("agent_response", "user_input", "checkpoint") and upd.get("state") == "ACTIVE":
+            key = f"_announced_{step_idx}"
+            if not state.get(key):
+                if not quiet:
+                    console.print(f"\n[{color}]{icon} {label} 🔧[/{color}] {step_type}...")
+                state[key] = True
+
+    elif event == "result":
+        res = d.get("result", {})
+        state["final_text"] = res.get("response", "") or ""
+        state["is_error"] = res.get("status") != "SUCCESS"
+        if not quiet:
+            console.print()  # fecha a linha do streaming de texto
+
+
+def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, color: str,
+                          console: Console, is_agy: bool, quiet: bool = False):
+    """Roda um operário headless, narrando eventos em tempo real (ou em silêncio,
+    se quiet=True — modo chat). Retorna (final_text, is_error, error_detail)."""
+    state = {"final_text": "", "is_error": False}
+    stderr_lines = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+    except FileNotFoundError as e:
+        return "", True, f"binário não encontrado: {e}"
+
+    def _drain_stderr():
+        for l in proc.stderr:
+            stderr_lines.append(l)
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    parser = _narrate_agy_line if is_agy else _narrate_claude_line
+    for line in proc.stdout:
+        line = line.strip()
+        if line:
+            parser(line, console, label, icon, color, state, quiet=quiet)
+
+    proc.wait()
+
+    if not state["final_text"] and proc.returncode != 0:
+        state["is_error"] = True
+
+    error_detail = "".join(stderr_lines[-40:]).strip() if state["is_error"] else ""
+    return state["final_text"], state["is_error"], error_detail
+
+# ─────────────────────────────────────────────────────────
 # REPL principal
 # ─────────────────────────────────────────────────────────
 
@@ -749,6 +1265,30 @@ def main():
             
         elif low in ("/config", "/editar-config", "/edit"):
             edit_config()
+
+        elif low.startswith("/modo") or low.startswith("/mode"):
+            parts = raw.split(maxsplit=1)
+            if len(parts) == 1:
+                atual = config.get("ui", {}).get("mode", "tecnico")
+                console.print(f"[yellow]Modo atual: {atual}. Uso: /modo chat  ou  /modo tecnico[/yellow]")
+                continue
+
+            requested = parts[1].strip().lower()
+            if requested in ("chat", "clean", "limpo"):
+                config.setdefault("ui", {})["mode"] = "chat"
+            elif requested in ("tecnico", "técnico", "technical", "dev"):
+                config.setdefault("ui", {})["mode"] = "tecnico"
+            else:
+                console.print(f"[bold red]Modo desconhecido: '{requested}'. Use 'chat' ou 'tecnico'.[/bold red]")
+                continue
+
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+            if config["ui"]["mode"] == "chat":
+                console.print("[bold green]💬 Modo chat ativado — respostas limpas, sem narração técnica.[/bold green]")
+            else:
+                console.print("[bold green]🔧 Modo técnico ativado — narração completa de tool calls.[/bold green]")
 
         elif low.startswith("/agente") or low.startswith("/agent"):
             parts = raw.split(maxsplit=1)
@@ -812,6 +1352,22 @@ def main():
         elif low == "/interativo":
             launch_interactive(config)
 
+        elif low in ("/design", "/open-design"):
+            with console.status("[bold magenta]⏳ Verificando o Open Design (sobe sozinho se ainda não estiver de pé)...[/bold magenta]", spinner="dots"):
+                resolved = open_design_resolve_project(config)
+            if not resolved:
+                console.print("[yellow]⚠ Não consegui subir o Open Design automaticamente.[/yellow]")
+                console.print("[dim]Confira se `open_design.repo_path` está certo em ~/.orquestra.json, ou rode [bold]open-design-dev[/bold] manualmente num terminal e tente [bold]/design[/bold] de novo.[/dim]")
+                continue
+            url = f"{resolved['web_url']}/projects/{resolved['project_id']}" if resolved.get("web_url") else None
+            if url:
+                console.print(f"[bold magenta]🎨 Open Design aberto:[/bold magenta] {url}")
+                if shutil.which("xdg-open"):
+                    subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                save_chat_message("orquestrador", "assistant", f"[Open Design aberto para este projeto]: {url}")
+            else:
+                console.print(f"[yellow]Projeto do Open Design pronto (id {resolved['project_id']}), mas não achei a URL do painel web.[/yellow]")
+
         else:
             # O Chat Fixo sempre usa a identidade "orquestrador"
             import datetime
@@ -837,6 +1393,17 @@ def main():
                 "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
                 "<DELEGATE binary=\"claude\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
                 "Use binary=\"claude\" para codificação, ou binary=\"agy\" para pesquisa e análise rápida.\n"
+                "Use binary=\"open-design\" para gerar uma PRÉVIA VISUAL de verdade — renderizada e navegável, "
+                "não uma descrição em texto nem uma imagem estática. Ele lê o projeto de verdade na pasta atual "
+                "(design system, componentes, paleta reais) e devolve uma prévia fiel ao visual já existente.\n\n"
+                "REGRA OBRIGATÓRIA DE PRÉVIA: sempre que o pedido envolver criar ou alterar QUALQUER coisa "
+                "visual/de interface (tela nova, componente, layout, botão, cor, animação, redesenho, etc.), "
+                "você NÃO PODE delegar a implementação real (binary=\"claude\" ou binary=\"agy\" escrevendo/"
+                "alterando arquivos de verdade) diretamente. Primeiro delegue para binary=\"open-design\" pedindo "
+                "a prévia dessa mudança específica, mostre o resultado ao usuário, e só peça a implementação real "
+                "depois que o usuário aprovar explicitamente essa prévia numa mensagem seguinte. Só pule essa "
+                "etapa se o usuário disser claramente que já aprovou / quer pular a prévia, ou se a tarefa não "
+                "tiver nenhum componente visual (ex: lógica de backend pura, bug de dado, configuração).\n\n"
                 "Você pode convocar múltiplos operários de uma vez gerando múltiplos blocos <DELEGATE>.\n\n"
                 "Histórico da Conversa:\n"
             )
@@ -859,35 +1426,101 @@ def main():
             if env_file:
                 env.update(load_env_file(env_file))
                 
-            with console.status(f"[bold {color}]⏳ {icon} {role_name.capitalize()} está pensando e orquestrando...[/bold {color}]", spinner="dots"):
-                result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-                
-            if result.returncode != 0:
-                console.print(f"[bold red]⚠ Erro ao processar no {role_name}[/bold red]")
-                if result.stderr:
-                    print(result.stderr.strip())
+            # Até 2 tentativas: o `agy`/modelo às vezes volta com stdout vazio por
+            # instabilidade momentânea (não é timeout nem erro de processo) — nesse
+            # caso específico vale a pena tentar mais uma vez antes de desistir.
+            result = None
+            clean_output = ""
+            for attempt in range(2):
+                status_label = (f"⏳ {icon} {role_name.capitalize()} está pensando e orquestrando..." if attempt == 0
+                                 else f"⏳ {icon} {role_name.capitalize()} voltou sem resposta, tentando de novo...")
+                with console.status(f"[bold {color}]{status_label}[/bold {color}]", spinner="dots"):
+                    try:
+                        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=150)
+                    except subprocess.TimeoutExpired:
+                        console.print(f"[bold red]⚠ {icon} {role_name.capitalize()} não respondeu em 150s (timeout) — provável instabilidade do modelo '{model}'.[/bold red]")
+                        console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
+                        result = None
+                        break
+
+                if result.returncode != 0:
+                    console.print(f"[bold red]⚠ Erro ao processar no {role_name}[/bold red]")
+                    if result.stderr:
+                        print(result.stderr.strip())
+                    result = None
+                    break
+
+                output = result.stdout.strip()
+                # Se usar claude via -p, o claude pode cuspir um monte de lixo visual,
+                # mas vamos tratar da mesma forma.
+                clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+                if clean_output:
+                    break
+
+                if attempt == 0:
+                    console.print(f"[dim]⚠ {icon} {role_name.capitalize()} voltou vazio na 1ª tentativa — tentando de novo...[/dim]")
+                    if result.stderr and result.stderr.strip():
+                        console.print(f"[dim]stderr: {result.stderr.strip()[:500]}[/dim]")
+
+            if result is None:
                 continue
 
-            output = result.stdout.strip()
-            # Se usar claude via -p, o claude pode cuspir um monte de lixo visual, 
-            # mas vamos tratar da mesma forma.
-            clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+            if not clean_output:
+                console.print(f"[bold red]⚠ {icon} {role_name.capitalize()} voltou sem resposta (2 tentativas) — provável instabilidade momentânea do modelo '{model}'.[/bold red]")
+                if result.stderr and result.stderr.strip():
+                    console.print(f"[dim]stderr: {result.stderr.strip()[:1000]}[/dim]")
+                console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
+                continue
             
             # Busca TODAS as tags de delegação
             delegate_matches = list(re.finditer(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', clean_output, re.DOTALL | re.IGNORECASE))
-            
+            chat_mode = config.get("ui", {}).get("mode") == "chat"
+
             if delegate_matches:
                 # Exibe a resposta removendo TODAS as tags para o usuário ver
                 user_output = re.sub(r'<DELEGATE.*?</DELEGATE>', '', output, flags=re.DOTALL | re.IGNORECASE).strip()
-                
+
                 save_chat_message(role_name, "assistant", clean_output)
                 if user_output:
-                    console.print(f"\n[bold {color}]{icon} {role_name.capitalize()}:[/bold {color}]\n{user_output}\n")
-                
+                    if chat_mode:
+                        _print_chat_bubble(role_name.capitalize(), icon, color, user_output)
+                    else:
+                        console.print(f"\n[bold {color}]{icon} {role_name.capitalize()}:[/bold {color}]\n{user_output}\n")
+                    _auto_open_images(user_output)
+
                 for idx, match in enumerate(delegate_matches):
                     target_binary_tag = match.group(1).lower()
                     delegate_instruction = match.group(2).strip()
-                    
+
+                    if target_binary_tag in ("open-design", "opendesign", "open_design"):
+                        if chat_mode:
+                            console.print(f"[dim]🎨 Open Design está cuidando da prévia (Tarefa {idx+1})...[/dim]")
+                        else:
+                            console.print(f"[bold magenta]🎨 Open Design (Tarefa {idx+1}) começou a gerar a prévia...[/bold magenta]")
+
+                        def _open_design_lifecycle(instruction, cfg, chat_mode):
+                            ok, text = open_design_run_task(cfg, instruction)
+                            if ok:
+                                summary = f"[Resposta do Open Design]:\n{text[:4000]}"
+                                save_chat_message("orquestrador", "assistant", summary)
+                                if chat_mode:
+                                    _print_chat_bubble("Open Design", "🎨", "magenta", text)
+                                    _auto_open_links(text)
+                                else:
+                                    console.print("[bold green]✓ Open Design terminou — resposta salva no contexto do Orquestra[/bold green]")
+                                    console.print(f"[magenta]{text}[/magenta]")
+                                _auto_open_images(text)
+                            else:
+                                console.print(f"[bold red]⚠ Open Design falhou: {text}[/bold red]")
+                                save_chat_message("orquestrador", "assistant", f"[Erro do Open Design]: {text}")
+
+                        threading.Thread(
+                            target=_open_design_lifecycle,
+                            args=(delegate_instruction, config, chat_mode),
+                            daemon=True
+                        ).start()
+                        continue
+
                     # Resolve qual worker usar
                     workers = config.get("workers", {})
                     if target_binary_tag == "deepseek":
@@ -906,116 +1539,73 @@ def main():
                     worker_model = worker.get("model", "")
                     worker_env_file = worker.get("env_file", "")
 
-                    # Escreve a instrução em arquivo temporário (evita problemas de aspas no shell)
-                    import tempfile
-                    tmp_fd, tmp_path = tempfile.mkstemp(prefix="orquestra_", suffix=".md")
-                    with os.fdopen(tmp_fd, "w") as f:
-                        f.write(delegate_instruction)
-
-                    # Monta prefixo de env para deepseek
-                    env_prefix = ""
-                    if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
-                        env_vars = load_env_file(worker_env_file)
-                        env_exports = " ".join(f'{k}="{v}"' for k, v in env_vars.items())
-                        env_prefix = f"export {env_exports} && "
-
-                    # Monta o comando do operário — abre INTERATIVAMENTE (não usa -p/--print)
-                    if actual_binary == "agy" and worker_model:
-                        binary_cmd = f"agy --model {worker_model}"
-                    elif actual_binary == "agy":
-                        binary_cmd = "agy"
-                    elif actual_binary == "claude" and worker_model:
-                        binary_cmd = f"claude --model {worker_model}"
-                    else:
-                        binary_cmd = "claude"
-
-                    # Script que: mostra instrução → abre ferramenta interativamente
-                    show_and_open = (
-                        f"bash -c \""
-                        f"printf '\\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n' && "
-                        f"printf '\\033[1;36m🎼 Instrução do Orquestra (Tarefa {idx+1}):\\033[0m\\n' && "
-                        f"printf '\\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n' && "
-                        f"cat {tmp_path} && "
-                        f"rm -f {tmp_path} && "
-                        f"printf '\\n\\033[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\033[0m\\n' && "
-                        f"{env_prefix}{binary_cmd}\""
-                    )
-
                     label = {"claude": "Claude Code", "agy": "Antigravity"}.get(actual_binary, actual_binary)
+                    icon = {"claude": "💻", "agy": "💚"}.get(actual_binary, "🤖")
+                    color = {"claude": "cyan", "agy": "green"}.get(actual_binary, "white")
                     if target_binary_tag == "deepseek":
-                        label = "DeepSeek"
-                    console.print(f"[bold yellow]⚡ Abrindo {label} (Tarefa {idx+1})...[/bold yellow]")
-                    
-                    # Layout: 1º corta na vertical, 2º em diante corta na horizontal do lado direito
-                    split_flag = "-h" if idx == 0 else "-v"
-                    pane_result = subprocess.run(
-                        ["tmux", "split-window", split_flag, "-p", "50",
-                         "-P", "-F", "#{pane_id}", show_and_open],
-                        capture_output=True, text=True
-                    )
-                    pane_id = pane_result.stdout.strip()
+                        label, icon, color = "DeepSeek", "💙", "blue"
 
-                    # Caminho do arquivo para capturar saída do operário
-                    safe_pid = pane_id.replace("%", "")
-                    output_capture_file = f"/tmp/orquestra_capture_{safe_pid}.txt"
+                    # Monta o comando do operário — headless (--print/-p), com streaming
+                    # estruturado em tempo real e permissões liberadas. Sem TTY pra confirmar
+                    # nada em modo headless — sem bypass, o processo travaria esperando uma
+                    # aprovação que nunca chega.
+                    if actual_binary == "agy":
+                        cmd = ["agy", "-p", delegate_instruction,
+                               "--output-format", "stream-json",
+                               "--dangerously-skip-permissions"]
+                    else:
+                        cmd = ["claude", "-p", delegate_instruction,
+                               "--output-format", "stream-json", "--verbose",
+                               "--permission-mode", "bypassPermissions"]
+                    if worker_model:
+                        cmd.extend(["--model", worker_model])
 
-                    # Ativa captura de saída do painel em tempo real
-                    subprocess.run(["tmux", "pipe-pane", "-t", pane_id,
-                                    f"cat >> {output_capture_file}"])
+                    worker_env = os.environ.copy()
+                    if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
+                        worker_env.update(load_env_file(worker_env_file))
 
-                    # Thread unificada: envia instrução + monitora encerramento + captura resposta
-                    def _worker_lifecycle(pid: str, instr: str, cap_file: str, lbl: str):
-                        # 1. Aguarda a ferramenta inicializar e envia a instrução
-                        time.sleep(3)
-                        subprocess.run(["tmux", "set-buffer", instr])
-                        subprocess.run(["tmux", "paste-buffer", "-t", pid])
-                        time.sleep(0.15)
-                        subprocess.run(["tmux", "send-keys", "-t", pid, "", "Enter"])
+                    if chat_mode:
+                        console.print(f"[dim]{icon} {label} está cuidando disso...[/dim]")
+                    else:
+                        console.print(f"[bold yellow]⚡ {label} (Tarefa {idx+1}) começou a trabalhar...[/bold yellow]")
 
-                        # 2. Monitora até o painel fechar (usuário digita /exit ou fecha)
-                        while True:
-                            active = subprocess.run(
-                                ["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
-                                capture_output=True, text=True
-                            ).stdout
-                            if pid not in active:
-                                break
-                            time.sleep(2)
+                    def _worker_lifecycle(w_cmd, w_env, lbl, ic, col, is_agy, chat_mode):
+                        final_text, is_error, error_detail = _run_worker_headless(
+                            w_cmd, w_env, get_project_dir(), lbl, ic, col, console, is_agy, quiet=chat_mode
+                        )
 
-                        # 3. Para a captura
-                        subprocess.run(["tmux", "pipe-pane", "-t", pid], capture_output=True)
+                        if is_error:
+                            console.print(f"[bold red]⚠ {lbl} terminou com erro.[/bold red]")
+                            detail = error_detail or "(sem detalhes de stderr)"
+                            console.print(f"[dim]{detail[-1500:]}[/dim]")
+                            summary = f"[Erro do {lbl}]:\n{(final_text or '').strip()}\n{detail[-1500:]}".strip()
+                            save_chat_message("orquestrador", "assistant", summary)
+                            return
 
-                        # 4. Lê e limpa a saída capturada
-                        captured = ""
-                        if os.path.exists(cap_file):
-                            with open(cap_file, "r", errors="replace") as f:
-                                captured = f.read()
-                            os.remove(cap_file)
-
-                        # Remove códigos ANSI
-                        captured = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', captured)
-                        captured = captured.strip()
-
+                        captured = final_text.strip()
                         if captured:
-                            # Salva resposta do operário no histórico do Orquestrador
                             summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
                             save_chat_message("orquestrador", "assistant", summary)
-                            # Notifica no painel principal
-                            subprocess.run([
-                                "tmux", "display-message",
-                                f"✓ {lbl} terminou — resposta salva no contexto do Orquestra"
-                            ])
+                        if chat_mode:
+                            _print_chat_bubble(lbl, ic, col, captured or "(sem resposta de texto)")
+                            console.print("[dim]Quer que eu ajuste mais alguma coisa?[/dim]")
+                        else:
+                            console.print(f"[bold green]✓ {lbl} terminou — resposta salva no contexto do Orquestra[/bold green]")
 
                     threading.Thread(
                         target=_worker_lifecycle,
-                        args=(pane_id, delegate_instruction, output_capture_file, label),
+                        args=(cmd, worker_env, label, icon, color, actual_binary == "agy", chat_mode),
                         daemon=True
                     ).start()
 
                 console.print()
             else:
                 save_chat_message(role_name, "assistant", clean_output)
-                console.print(f"\n[bold {color}]{icon} {role_name.capitalize()}:[/bold {color}]\n{output}\n")
+                if chat_mode:
+                    _print_chat_bubble(role_name.capitalize(), icon, color, output)
+                else:
+                    console.print(f"\n[bold {color}]{icon} {role_name.capitalize()}:[/bold {color}]\n{output}\n")
+                _auto_open_images(output)
 
 if __name__ == "__main__":
     main()
