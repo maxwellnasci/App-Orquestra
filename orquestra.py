@@ -30,6 +30,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.patch_stdout import patch_stdout
 
 # ─────────────────────────────────────────────────────────
 # Configuração
@@ -1172,10 +1173,131 @@ def _narrate_agy_line(line: str, console: Console, label: str, icon: str, color:
             console.print()  # fecha a linha do streaming de texto
 
 
+def _codex_clean_error_msg(raw) -> str:
+    """O `message` de erro do Codex às vezes vem como uma string JSON aninhada
+    (ex.: '{"type":"error","status":400,"error":{"message":"..."}}') em vez de
+    texto puro. Desembrulha isso pra chegar na mensagem legível de verdade."""
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+        raw = parsed
+    if isinstance(raw, dict):
+        inner = raw.get("error")
+        if isinstance(inner, dict) and inner.get("message"):
+            return str(inner["message"])
+        if raw.get("message"):
+            return str(raw["message"])
+    return str(raw)
+
+
+def _narrate_codex_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
+                         quiet: bool = False):
+    """Parser (best-effort) do --json do Codex CLI — schema próprio (thread.started/
+    turn.started/item.completed/turn.completed), diferente do stream-json do Claude
+    e do formato do Agy. Só narra em modo técnico; o texto final de sucesso não
+    depende disso — vem do arquivo passado via -o/--output-last-message, lido
+    depois em _run_worker_headless (mais confiável que garimpar o item certo aqui).
+    Em caso de erro, porém, o Codex nunca escreve esse arquivo — a única fonte da
+    causa real é este stream (o erro aparece no stdout como JSON, não no stderr),
+    então aqui SIM capturamos a mensagem de erro em state["final_text"] pra ela
+    chegar no resumo salvo no histórico / repassado ao orquestrador."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    ev_type = d.get("type", "")
+    if ev_type == "item.completed":
+        item = d.get("item") or {}
+        item_type = item.get("type", "")
+        if item_type == "agent_message":
+            state["final_text"] = item.get("text", "") or state["final_text"]
+        elif item_type == "error":
+            msg = _codex_clean_error_msg(item.get("message"))
+            if msg:
+                state["final_text"] = f"[Codex] {msg}"
+            if not quiet:
+                console.print(f"[bold red]{icon} {label} ⚠ {msg or 'erro'}[/bold red]")
+        elif not quiet:
+            console.print(f"[dim]{icon} {label} 🔧 {item_type or 'executando'}...[/dim]")
+    elif ev_type == "error":
+        state["is_error"] = True
+        msg = _codex_clean_error_msg(d.get("message"))
+        if msg:
+            state["final_text"] = f"[Codex] {msg}"
+        if not quiet:
+            console.print(f"[bold red]{icon} {label} ⚠ {msg or 'erro'}[/bold red]")
+    elif ev_type == "turn.failed":
+        state["is_error"] = True
+        msg = _codex_clean_error_msg((d.get("error") or {}).get("message") if isinstance(d.get("error"), dict) else d.get("error"))
+        if msg and not state.get("final_text"):
+            state["final_text"] = f"[Codex] {msg}"
+        if not quiet:
+            console.print(f"[bold red]{icon} {label}: turno falhou.[/bold red]")
+
+
+def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
+    """Modo chat: depois que um operário termina, pede pro próprio orquestrador
+    comentar o resultado em linguagem simples e dar continuidade à conversa,
+    em vez de só despejar a resposta crua + uma linha fixa. Retorna "" (string
+    vazia) em qualquer falha/timeout — quem chama trata isso como "sem reação"
+    e cai de volta no comportamento antigo (bolha crua)."""
+    role = config.get("roles", {}).get("orquestrador", {})
+    binary = role.get("binary", "agy")
+    model = role.get("model")
+
+    projeto = Path(get_project_dir()).name
+    prompt = (
+        f"Você é o Orquestra, assistente do projeto '{projeto}'. Você pediu para "
+        f"{event_label} executar uma tarefa e ele acabou de responder com isto:\n\n"
+        f"{raw_result[:4000]}\n\n"
+        "Comente esse resultado para o usuário, em português, em linguagem simples "
+        "e natural — como se você estivesse continuando a conversa, não repetindo "
+        "o resultado inteiro. Resuma o que foi feito e destaque só o que importa. "
+        "Termine perguntando se o usuário quer ajustar algo ou seguir para outra coisa. "
+        "Responda só com o texto da sua fala, sem tags e sem formatação especial."
+    )
+
+    cmd = [binary]
+    if binary == "agy" and model:
+        cmd.extend(["--model", model])
+    if binary == "claude":
+        cmd.extend(["-p", prompt])
+    else:
+        cmd.extend(["--print", prompt])
+
+    env = os.environ.copy()
+    env_file = role.get("env_file")
+    if env_file:
+        env.update(load_env_file(env_file))
+
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=100)
+    except subprocess.TimeoutExpired:
+        return ""
+
+    if result.returncode != 0:
+        return ""
+
+    output = result.stdout.strip()
+    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+    return clean.strip()
+
+
 def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, color: str,
-                          console: Console, is_agy: bool, quiet: bool = False):
+                          console: Console, is_agy: bool, quiet: bool = False,
+                          is_codex: bool = False, output_file: str | None = None):
     """Roda um operário headless, narrando eventos em tempo real (ou em silêncio,
-    se quiet=True — modo chat). Retorna (final_text, is_error, error_detail)."""
+    se quiet=True — modo chat). Retorna (final_text, is_error, error_detail).
+
+    output_file: quando informado (Codex), depois que o processo termina o
+    conteúdo desse arquivo (-o/--output-last-message) sobrescreve o final_text
+    capturado via streaming — é a fonte mais confiável, já que o parser do
+    --json do Codex é best-effort."""
     state = {"final_text": "", "is_error": False}
     stderr_lines = []
 
@@ -1194,7 +1316,13 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
 
     threading.Thread(target=_drain_stderr, daemon=True).start()
 
-    parser = _narrate_agy_line if is_agy else _narrate_claude_line
+    if is_codex:
+        parser = _narrate_codex_line
+    elif is_agy:
+        parser = _narrate_agy_line
+    else:
+        parser = _narrate_claude_line
+
     for line in proc.stdout:
         line = line.strip()
         if line:
@@ -1202,11 +1330,187 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
 
     proc.wait()
 
+    if output_file:
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                file_text = f.read().strip()
+            if file_text:
+                state["final_text"] = file_text
+        except OSError:
+            pass
+
     if not state["final_text"] and proc.returncode != 0:
         state["is_error"] = True
 
-    error_detail = "".join(stderr_lines[-40:]).strip() if state["is_error"] else ""
+    if state["is_error"]:
+        stderr_detail = "".join(stderr_lines[-40:]).strip()
+        # Codex reporta o erro de verdade no stdout (JSON), não no stderr —
+        # sem isso, o erro chegaria em tela como "(sem detalhes de stderr)"
+        # mesmo já sabendo a causa real (capturada em final_text pelo parser).
+        if is_codex and state["final_text"]:
+            error_detail = state["final_text"] if not stderr_detail else f"{state['final_text']}\n{stderr_detail}"
+        else:
+            error_detail = stderr_detail
+    else:
+        error_detail = ""
+
     return state["final_text"], state["is_error"], error_detail
+
+
+DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DOTALL | re.IGNORECASE)
+PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECASE)
+
+
+def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
+    """Resolve qual operário real usar a partir da tag do <DELEGATE>/<PIPELINE>.
+    Retorna (worker_config, actual_binary, label, icon, color). As três tags
+    históricas (claude/agy/deepseek) mantêm exatamente o comportamento de sempre;
+    qualquer tag nova que já exista em config["workers"] (ex.: "codex") usa o
+    binary/label/icon/color definidos lá, sem precisar mexer em código — só o
+    binary precisa de um branch dedicado em _build_worker_cmd se a CLI dele não
+    seguir o padrão -p/--print + stream-json do claude/agy (caso do codex)."""
+    workers = config.get("workers", {})
+    tag = target_binary_tag.lower()
+
+    if tag == "deepseek":
+        worker = workers.get("deepseek", {})
+        return worker, "claude", "DeepSeek", "💙", "blue"
+    if tag == "claude":
+        worker = workers.get("claude", {})
+        return worker, "claude", "Claude Code", "💻", "cyan"
+    if tag == "agy":
+        worker = workers.get("agy", {})
+        return worker, "agy", "Antigravity", "💚", "green"
+    if tag in workers:
+        worker = workers[tag]
+        actual_binary = worker.get("binary", "claude")
+        return (worker, actual_binary,
+                worker.get("label", tag.capitalize()),
+                worker.get("icon", "🤖"),
+                worker.get("color", "white"))
+
+    return workers.get("claude", {}), "claude", "Claude Code", "💻", "cyan"
+
+
+def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tuple:
+    """Monta o comando headless e o env pra rodar um operário — mesma lógica pra
+    chamada solta (<DELEGATE>) ou dentro de um <PIPELINE>. Retorna
+    (cmd, worker_env, output_file) — output_file é None pra claude/agy (o texto
+    final vem do streaming) e um caminho de arquivo temporário pro codex (a CLI
+    dele não segue o padrão -p/--print + stream-json dos outros dois; usa
+    subcomando `exec` + -o/--output-last-message pra escrever a resposta final
+    direto num arquivo, mais confiável que casar o evento certo no --json dele)."""
+    worker_model = worker.get("model", "")
+    worker_env_file = worker.get("env_file", "")
+    output_file = None
+
+    if actual_binary == "agy":
+        cmd = ["agy", "-p", instruction,
+               "--output-format", "stream-json",
+               "--dangerously-skip-permissions"]
+        if worker_model:
+            cmd.extend(["--model", worker_model])
+    elif actual_binary == "codex":
+        fd, output_file = tempfile.mkstemp(prefix="orquestra_codex_", suffix=".txt")
+        os.close(fd)
+        cmd = ["codex", "exec", instruction,
+               "--json", "--sandbox", "workspace-write",
+               "--skip-git-repo-check",
+               "-o", output_file]
+        if worker_model:
+            cmd.extend(["-m", worker_model])
+    else:
+        cmd = ["claude", "-p", instruction,
+               "--output-format", "stream-json", "--verbose",
+               "--permission-mode", "bypassPermissions"]
+        if worker_model:
+            cmd.extend(["--model", worker_model])
+
+    worker_env = os.environ.copy()
+    if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
+        worker_env.update(load_env_file(worker_env_file))
+
+    return cmd, worker_env, output_file
+
+
+def _run_pipeline(config: dict, steps: list, chat_mode: bool):
+    """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
+    orquestrador): a resposta de cada etapa vira contexto pra próxima instrução,
+    e ao final o orquestrador sintetiza tudo pro usuário revisar/implementar.
+    Roda inteira numa única thread de fundo — o REPL principal fica livre o
+    tempo todo, mesmo com várias etapas em sequência."""
+    total = len(steps)
+    previous_result = ""
+    step_summaries = []
+
+    for idx, (target_binary_tag, instruction) in enumerate(steps, start=1):
+        if target_binary_tag in ("open-design", "opendesign", "open_design"):
+            msg = (f"[Pipeline interrompido na etapa {idx}]: binary=\"open-design\" ainda não é "
+                   "suportado dentro de um <PIPELINE> (só funciona como <DELEGATE> solto).")
+            save_chat_message("orquestrador", "assistant", msg)
+            console.print(f"[bold red]⚠ Pipeline: etapa {idx} pediu Open Design, que ainda não roda em cadeia.[/bold red]")
+            return
+
+        worker, actual_binary, label, icon, color = _resolve_worker(config, target_binary_tag)
+
+        full_instruction = instruction
+        if previous_result:
+            full_instruction = (
+                f"Contexto — resultado da etapa anterior do pipeline ({step_summaries[-1][0]}):\n\n"
+                f"{previous_result[:4000]}\n\n"
+                f"Sua tarefa agora:\n{instruction}"
+            )
+
+        if chat_mode:
+            console.print(f"[dim]🔗 Pipeline — etapa {idx}/{total}: {label} está analisando...[/dim]")
+        else:
+            console.print(f"[bold yellow]⚡ Pipeline — Etapa {idx}/{total}: {label} começou a trabalhar...[/bold yellow]")
+
+        cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, full_instruction)
+        final_text, is_error, error_detail = _run_worker_headless(
+            cmd, worker_env, get_project_dir(), label, icon, color, console,
+            actual_binary == "agy", quiet=chat_mode,
+            is_codex=(actual_binary == "codex"), output_file=output_file,
+        )
+        if output_file:
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
+
+        if is_error:
+            detail = error_detail or "(sem detalhes de stderr)"
+            console.print(f"[bold red]⚠ Pipeline parou na etapa {idx} ({label}) por erro.[/bold red]")
+            console.print(f"[dim]{detail[-1500:]}[/dim]")
+            summary = f"[Pipeline interrompido na etapa {idx}/{total} — erro do {label}]:\n{detail[-1500:]}"
+            save_chat_message("orquestrador", "assistant", summary)
+            return
+
+        captured = final_text.strip()
+        step_summaries.append((label, captured))
+        save_chat_message("orquestrador", "assistant", f"[Pipeline etapa {idx}/{total} — {label}]:\n{captured[:4000]}")
+        if not chat_mode:
+            console.print(f"[bold green]✓ Etapa {idx}/{total} ({label}) concluída.[/bold green]")
+        previous_result = captured
+
+    combined = "\n\n".join(f"--- {lbl} ---\n{txt[:3000]}" for lbl, txt in step_summaries)
+    chain_desc = " → ".join(lbl for lbl, _ in step_summaries)
+
+    if chat_mode:
+        comment = _orchestrator_react(config, f"o pipeline {chain_desc}", combined)
+        if comment:
+            save_chat_message("orquestrador", "assistant", comment)
+            orch_role = config.get("roles", {}).get("orquestrador", {})
+            _print_chat_bubble(
+                "Orquestra", orch_role.get("icon", "🎼"),
+                orch_role.get("color", "cyan"), comment,
+            )
+        else:
+            _print_chat_bubble(f"Pipeline ({chain_desc})", "🔗", "yellow", combined)
+    else:
+        console.print(f"[bold green]✓ Pipeline concluído ({chain_desc}) — resultado final salvo no contexto do Orquestra[/bold green]")
+        console.print(combined)
+
 
 # ─────────────────────────────────────────────────────────
 # REPL principal
@@ -1240,7 +1544,8 @@ def main():
                 '<ansigreen><b>orquestra</b></ansigreen>'
                 '<ansiwhite> → </ansiwhite>'
             )
-            raw = session.prompt(prompt_text).strip()
+            with patch_stdout():
+                raw = session.prompt(prompt_text).strip()
         except (KeyboardInterrupt, EOFError):
             handle_safe_exit(config)
 
@@ -1392,7 +1697,9 @@ def main():
                 "Quando precisar executar uma tarefa prática (ler/escrever código, rodar comandos, acessar web), DELEGUE para um operário.\n"
                 "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
                 "<DELEGATE binary=\"claude\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
-                "Use binary=\"claude\" para codificação, ou binary=\"agy\" para pesquisa e análise rápida.\n"
+                "Use binary=\"claude\" para codificação, binary=\"agy\" para pesquisa e análise rápida, "
+                "binary=\"deepseek\" quando o usuário pedir a visão específica do DeepSeek, ou "
+                "binary=\"codex\" quando o usuário pedir a visão específica do Codex (OpenAI).\n"
                 "Use binary=\"open-design\" para gerar uma PRÉVIA VISUAL de verdade — renderizada e navegável, "
                 "não uma descrição em texto nem uma imagem estática. Ele lê o projeto de verdade na pasta atual "
                 "(design system, componentes, paleta reais) e devolve uma prévia fiel ao visual já existente.\n\n"
@@ -1404,7 +1711,26 @@ def main():
                 "depois que o usuário aprovar explicitamente essa prévia numa mensagem seguinte. Só pule essa "
                 "etapa se o usuário disser claramente que já aprovou / quer pular a prévia, ou se a tarefa não "
                 "tiver nenhum componente visual (ex: lógica de backend pura, bug de dado, configuração).\n\n"
-                "Você pode convocar múltiplos operários de uma vez gerando múltiplos blocos <DELEGATE>.\n\n"
+                "Você pode convocar múltiplos operários de uma vez gerando múltiplos blocos <DELEGATE> — eles "
+                "rodam TODOS AO MESMO TEMPO, em paralelo, cada um recebendo só a instrução que você escreveu "
+                "pra ele. Use isso quando as tarefas forem independentes entre si.\n\n"
+                "Quando o usuário pedir uma CADEIA/PIPELINE — um operário analisa algo, o resultado dele vai "
+                "para o próximo analisar, e assim por diante até um resultado final (ex.: \"analisa essa ideia "
+                "com o Antigravity, depois manda pro DeepSeek dar a visão dele, depois o Claude Code faz a "
+                "análise final\") — NÃO use vários <DELEGATE> soltos (eles rodariam em paralelo, sem um ver o "
+                "resultado do outro). Em vez disso, envolva os blocos <DELEGATE>, na ORDEM em que devem rodar, "
+                "dentro de um único bloco <PIPELINE>:\n"
+                "<PIPELINE>\n"
+                "<DELEGATE binary=\"agy\">(o que a 1ª etapa deve analisar)</DELEGATE>\n"
+                "<DELEGATE binary=\"deepseek\">(o que a 2ª etapa deve fazer)</DELEGATE>\n"
+                "<DELEGATE binary=\"claude\">(o que a 3ª etapa deve fazer)</DELEGATE>\n"
+                "</PIPELINE>\n"
+                "Cada etapa roda só depois que a anterior termina, e recebe automaticamente o resultado da "
+                "etapa anterior como contexto — você não precisa (nem deve) copiar esse resultado na instrução, "
+                "só descreva o que aquela etapa específica deve fazer com o que recebeu. Ao final da última "
+                "etapa você mesmo vai comentar o resultado consolidado pro usuário revisar e decidir se "
+                "implementa. binary=\"open-design\" ainda não é suportado dentro de <PIPELINE>. Você pode "
+                "emitir <PIPELINE> e <DELEGATE> soltos na mesma resposta, se fizer sentido.\n\n"
                 "Histórico da Conversa:\n"
             )
             for msg in history[-20:]:
@@ -1472,13 +1798,25 @@ def main():
                 console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
                 continue
             
-            # Busca TODAS as tags de delegação
-            delegate_matches = list(re.finditer(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', clean_output, re.DOTALL | re.IGNORECASE))
+            # Busca blocos <PIPELINE> primeiro (cadeias sequenciais) e tira eles
+            # do texto antes de procurar <DELEGATE> soltos — senão os DELEGATE
+            # de dentro de um pipeline seriam contados de novo como paralelos.
+            pipeline_steps_list = []
+            for pm in PIPELINE_RE.finditer(clean_output):
+                steps = [(m.group(1).lower(), m.group(2).strip()) for m in DELEGATE_RE.finditer(pm.group(1))]
+                if steps:
+                    pipeline_steps_list.append(steps)
+
+            clean_output_no_pipeline = PIPELINE_RE.sub('', clean_output)
+            output_no_pipeline = PIPELINE_RE.sub('', output)
+
+            # Busca TODAS as tags de delegação soltas (paralelas)
+            delegate_matches = list(DELEGATE_RE.finditer(clean_output_no_pipeline))
             chat_mode = config.get("ui", {}).get("mode") == "chat"
 
-            if delegate_matches:
+            if delegate_matches or pipeline_steps_list:
                 # Exibe a resposta removendo TODAS as tags para o usuário ver
-                user_output = re.sub(r'<DELEGATE.*?</DELEGATE>', '', output, flags=re.DOTALL | re.IGNORECASE).strip()
+                user_output = re.sub(r'<DELEGATE.*?</DELEGATE>', '', output_no_pipeline, flags=re.DOTALL | re.IGNORECASE).strip()
 
                 save_chat_message(role_name, "assistant", clean_output)
                 if user_output:
@@ -1504,7 +1842,16 @@ def main():
                                 summary = f"[Resposta do Open Design]:\n{text[:4000]}"
                                 save_chat_message("orquestrador", "assistant", summary)
                                 if chat_mode:
-                                    _print_chat_bubble("Open Design", "🎨", "magenta", text)
+                                    comment = _orchestrator_react(cfg, "Open Design", text) if text else ""
+                                    if comment:
+                                        save_chat_message("orquestrador", "assistant", comment)
+                                        orch_role = cfg.get("roles", {}).get("orquestrador", {})
+                                        _print_chat_bubble(
+                                            "Orquestra", orch_role.get("icon", "🎼"),
+                                            orch_role.get("color", "cyan"), comment,
+                                        )
+                                    else:
+                                        _print_chat_bubble("Open Design", "🎨", "magenta", text)
                                     _auto_open_links(text)
                                 else:
                                     console.print("[bold green]✓ Open Design terminou — resposta salva no contexto do Orquestra[/bold green]")
@@ -1521,58 +1868,28 @@ def main():
                         ).start()
                         continue
 
-                    # Resolve qual worker usar
-                    workers = config.get("workers", {})
-                    if target_binary_tag == "deepseek":
-                        worker = workers.get("deepseek", {})
-                        actual_binary = "claude"
-                    elif target_binary_tag == "claude":
-                        worker = workers.get("claude", {})
-                        actual_binary = "claude"
-                    elif target_binary_tag == "agy":
-                        worker = workers.get("agy", {})
-                        actual_binary = "agy"
-                    else:
-                        worker = workers.get("claude", {})
-                        actual_binary = "claude"
-
-                    worker_model = worker.get("model", "")
-                    worker_env_file = worker.get("env_file", "")
-
-                    label = {"claude": "Claude Code", "agy": "Antigravity"}.get(actual_binary, actual_binary)
-                    icon = {"claude": "💻", "agy": "💚"}.get(actual_binary, "🤖")
-                    color = {"claude": "cyan", "agy": "green"}.get(actual_binary, "white")
-                    if target_binary_tag == "deepseek":
-                        label, icon, color = "DeepSeek", "💙", "blue"
-
-                    # Monta o comando do operário — headless (--print/-p), com streaming
-                    # estruturado em tempo real e permissões liberadas. Sem TTY pra confirmar
-                    # nada em modo headless — sem bypass, o processo travaria esperando uma
-                    # aprovação que nunca chega.
-                    if actual_binary == "agy":
-                        cmd = ["agy", "-p", delegate_instruction,
-                               "--output-format", "stream-json",
-                               "--dangerously-skip-permissions"]
-                    else:
-                        cmd = ["claude", "-p", delegate_instruction,
-                               "--output-format", "stream-json", "--verbose",
-                               "--permission-mode", "bypassPermissions"]
-                    if worker_model:
-                        cmd.extend(["--model", worker_model])
-
-                    worker_env = os.environ.copy()
-                    if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
-                        worker_env.update(load_env_file(worker_env_file))
+                    # Resolve qual worker usar e monta o comando headless — headless
+                    # (--print/-p), com streaming estruturado em tempo real e permissões
+                    # liberadas. Sem TTY pra confirmar nada em modo headless — sem bypass,
+                    # o processo travaria esperando uma aprovação que nunca chega.
+                    worker, actual_binary, label, icon, color = _resolve_worker(config, target_binary_tag)
+                    cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, delegate_instruction)
 
                     if chat_mode:
                         console.print(f"[dim]{icon} {label} está cuidando disso...[/dim]")
                     else:
                         console.print(f"[bold yellow]⚡ {label} (Tarefa {idx+1}) começou a trabalhar...[/bold yellow]")
 
-                    def _worker_lifecycle(w_cmd, w_env, lbl, ic, col, is_agy, chat_mode):
+                    def _worker_lifecycle(w_cmd, w_env, lbl, ic, col, is_agy, chat_mode, is_codex=False, output_file=None):
                         final_text, is_error, error_detail = _run_worker_headless(
-                            w_cmd, w_env, get_project_dir(), lbl, ic, col, console, is_agy, quiet=chat_mode
+                            w_cmd, w_env, get_project_dir(), lbl, ic, col, console, is_agy, quiet=chat_mode,
+                            is_codex=is_codex, output_file=output_file,
                         )
+                        if output_file:
+                            try:
+                                os.unlink(output_file)
+                            except OSError:
+                                pass
 
                         if is_error:
                             console.print(f"[bold red]⚠ {lbl} terminou com erro.[/bold red]")
@@ -1587,14 +1904,37 @@ def main():
                             summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
                             save_chat_message("orquestrador", "assistant", summary)
                         if chat_mode:
-                            _print_chat_bubble(lbl, ic, col, captured or "(sem resposta de texto)")
-                            console.print("[dim]Quer que eu ajuste mais alguma coisa?[/dim]")
+                            comment = _orchestrator_react(config, lbl, captured) if captured else ""
+                            if comment:
+                                save_chat_message("orquestrador", "assistant", comment)
+                                orch_role = config.get("roles", {}).get("orquestrador", {})
+                                _print_chat_bubble(
+                                    "Orquestra", orch_role.get("icon", "🎼"),
+                                    orch_role.get("color", "cyan"), comment,
+                                )
+                            else:
+                                _print_chat_bubble(lbl, ic, col, captured or "(sem resposta de texto)")
+                                console.print("[dim]Quer que eu ajuste mais alguma coisa?[/dim]")
                         else:
                             console.print(f"[bold green]✓ {lbl} terminou — resposta salva no contexto do Orquestra[/bold green]")
 
                     threading.Thread(
                         target=_worker_lifecycle,
                         args=(cmd, worker_env, label, icon, color, actual_binary == "agy", chat_mode),
+                        kwargs={"is_codex": actual_binary == "codex", "output_file": output_file},
+                        daemon=True
+                    ).start()
+
+                for p_idx, steps in enumerate(pipeline_steps_list, start=1):
+                    chain_desc = " → ".join(_resolve_worker(config, tag)[2] for tag, _ in steps)
+                    if chat_mode:
+                        console.print(f"[dim]🔗 Pipeline {p_idx} iniciado: {chain_desc}[/dim]")
+                    else:
+                        console.print(f"[bold yellow]🔗 Pipeline {p_idx} iniciado ({len(steps)} etapas: {chain_desc})...[/bold yellow]")
+
+                    threading.Thread(
+                        target=_run_pipeline,
+                        args=(config, steps, chat_mode),
                         daemon=True
                     ).start()
 
