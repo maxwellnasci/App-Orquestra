@@ -8,7 +8,7 @@ A ferramenta funciona como um envelope ("wrapper") para 3 agentes diferentes:
 - **deepseek**: Usa a interface do Claude Code, mas com a API do DeepSeek v4 Pro (não gasta seus créditos Anthropic).
 - **claude**: Claude Code nativo (Anthropic).
 - **agy**: Antigravity CLI oficial.
-- **bernstein**: O orquestrador roda por trás dos panos via comandos `/bernstein` ou `/plan`.
+
 
 ## 🎯 Backlog de Ideias e Melhorias Concluídas
 

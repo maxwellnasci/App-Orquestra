@@ -1,34 +1,44 @@
-# Orquestra — Documentação Completa
+# Orquestra — O Cockpit de Agentes de IA 🚀
 
-O **Orquestra** é uma interface de chat interativa e um roteador inteligente para agentes de IA locais. Ele foi projetado para unificar o acesso a múltiplos modelos e CLIs (como Claude Code e Antigravity) debaixo de um sistema de "Papéis" (Roles), otimizando custos e organizando o fluxo de trabalho.
+O **Orquestra** (V3) é uma interface de chat interativa de terminal e um roteador inteligente para agentes de IA locais. Projetado para unificar o acesso a múltiplos modelos e CLIs (como Claude Code, DeepSeek, Antigravity) debaixo de um sistema unificado, ele traz a fluidez das interfaces gráficas direto para o console raiz.
 
-## 🏗️ Arquitetura e Funcionamento
+## 🏗️ O que há de novo no V3?
 
-O sistema é composto por três peças principais:
+### O TUI Cockpit (Terminal Vitaminado)
+Você não precisa sair do terminal para ser produtivo:
+- **Barra de Status Inferior:** O rodapé do seu console sempre exibe o modelo ativo.
+- **Teclas Rápidas:** Use `F1` (Comandos), `F2` (Trocar Combustível) e `F3` (Fila de Tarefas) direto no seu teclado, sem interromper o fluxo de digitação.
+- **Contexto Mágico (`@`):** Digite `@` no prompt para ativar o autocompletar de arquivos da sua pasta atual. Ao pressionar Enter, os arquivos selecionados têm seu conteúdo injetado automaticamente como contexto para a IA, num formato que economiza tokens.
 
-1. **O Script Central (`orquestra.py`)**: Fica na pasta do projeto e contém toda a lógica de interface (usando `rich` e `prompt_toolkit`).
-2. **O Launcher Global (`orquestra`)**: Um executável em `~/.local/bin/orquestra` que permite rodar a ferramenta de qualquer pasta no terminal.
-3. **A Configuração de Papéis (`~/.orquestra.json`)**: O coração do sistema. É aqui que definimos os especialistas e quais IAs eles usam.
+### Modo `/goal` (Estrategista e Pipelines Automáticos)
+Inspirado na arquitetura do Manus AI, o Orquestra agora suporta planejamento de longo prazo autônomo.
+- Digite `/goal <sua meta macro>` (ex: `/goal fazer um sistema de login`).
+- O motor intercepta, vira o **Estrategista** e quebra o pedido complexo em um **Pipeline Iterativo** (uma série de tarefas atômicas encadeadas).
+- O Orquestra joga tudo no banco SQLite local (`~/.orquestra_chats/memory.db`) e roda as tarefas em sequência, injetando o contexto do passo anterior no próximo.
+
+### Human-in-the-Loop Nativo (Fast-Diff)
+O agente nunca mais vai quebrar o seu código sem você ver:
+- Se um agente alterar, deletar ou criar arquivos locais, a Tarefa entra no status `⚠️ Aguardando Aprovação`.
+- Você confere as mudanças na tela. Se estiver feliz, digite `/aprovar [id]`. O Orquestra cria um commit no Git de forma limpa.
+- Se a IA errou rude, digite `/rejeitar [id]`. O Orquestra roda um `git reset --hard` para você e volta o estado original. Zero dor de cabeça.
 
 ---
 
 ## 🧠 O Roteador Inteligente (Auto-Orquestrador)
 
-Uma das maiores inovações deste projeto é o **Cérebro Roteador**. 
-Quando você digita uma frase livre no terminal (exemplo: *"revisa o arquivo de login e busca bugs"*):
-
+Quando você digita uma frase livre no terminal (ex: *"revisa o arquivo de login e busca bugs"*):
 1. O Orquestra intercepta a sua mensagem.
-2. Ele chama o **Gemini Flash** silenciosamente em background passando o seu pedido.
-3. A IA analisa o contexto e decide qual é o melhor **Especialista** para a tarefa.
-4. O Orquestra invoca automaticamente a CLI daquele especialista e repassa o seu pedido para ele.
+2. Ele chama um modelo ultraleve em background passando o seu pedido.
+3. A IA decide qual é o melhor **Especialista** para a tarefa.
+4. O Orquestra invoca o operário e delega o trabalho (em `PIPELINE` ou múltiplos operários em `DELEGATE` paralelos!).
 
-Isso elimina o problema de gastar créditos caros (como Claude Opus) para tarefas simples, garantindo que o agente certo seja chamado para o trabalho certo.
+Isso elimina o problema de gastar créditos caros para tarefas simples, garantindo que o agente certo seja chamado para o trabalho certo.
 
 ---
 
-## 🎭 Os 5 Especialistas (Papéis)
+## 🎭 Os Especialistas Padrões
 
-O sistema vem pré-configurado com 5 papéis fundamentais. Toda a configuração deles fica salva em `~/.orquestra.json`.
+Toda a configuração fica salva em `~/.orquestra.json`.
 
 | Papel | Descrição | Modelo Padrão | CLI Base |
 |---|---|---|---|
@@ -36,61 +46,26 @@ O sistema vem pré-configurado com 5 papéis fundamentais. Toda a configuração
 | 💻 **Implementador** | Codificador principal (escreve e edita arquivos). | DeepSeek v4 Pro | Claude Code (`claude`) |
 | 🔎 **Fiscal** | Revisão de código e caça a bugs. | Gemini 3.1 Pro | Antigravity (`agy`) |
 | 🛡️ **Segurança** | Análise de vulnerabilidades. | Gemini 3.1 Pro | Antigravity (`agy`) |
-| 🧠 **Estrategista** | Arquitetura, planejamento e refatoração estrutural. | Claude Opus 4.6 (Thinking) | Antigravity (`agy`) |
-| 🔬 **Analista** | Análise profunda e diagnósticos críticos. | Claude Sonnet 5 (quando disponível) | Claude Code (`claude`) |
+| 🧠 **Estrategista** | Arquitetura, planejamento e modo `/goal`. | Claude Opus 4.6 | Antigravity (`agy`) |
+| 🔬 **Analista** | Análise profunda e diagnósticos críticos. | Claude Sonnet 5 | Claude Code (`claude`) |
 
 ---
 
-## 🧠 Memória de Conversa & Resumo Automático
-
-O Orquestra cuida da memória e da continuidade do trabalho para você:
-
-- **Bom Dia Inteligente (Ao abrir):** O Orquestra lê as últimas conversas em background (via Gemini Flash) e abre o terminal com uma mensagem personalizada do especialista ativo dizendo exatamente onde o projeto parou e perguntando como continuar.
-- **Despedida Segura (Ao sair):** Ao digitar `/sair` ou pressionar `Ctrl+D`/`Ctrl+C`, o sistema pergunta se você quer gerar um arquivo `RESUMO_DIA.md`. O assistente lê todo o histórico do dia e salva um relatório Markdown completo na pasta do seu projeto.
-- **Histórico Persistente:** Salvo automaticamente em `~/.orquestra_chats/`. Use `/historico` para ver ou `/limpar-chat` para resetar.
-
----
-
-## 🎛️ Menu Interativo de Troca de Agentes (`/agentes trocar`)
-
-Você não precisa mais editar o arquivo JSON na mão para mudar os modelos de IA!
-
-Ao digitar `/agentes trocar` (ou `/swap`), um menu navegável por **setas do teclado** é aberto em 3 passos:
-
-1. **Escolha o Cargo:** Ajudante, Implementador, Fiscal, Segurança, Estrategista ou Analista.
-2. **Escolha a Família:** Gemini / Antigravity, Claude Nativo ou Deepseek.
-3. **Escolha o Modelo (Motor):** O Orquestra busca os modelos **disponíveis em tempo real** (no Antigravity e via API), trazendo os mais recentes (Gemini 3.6 Flash, Gemini 3.1 Pro, Claude Sonnet 5, Deepseek V4 Pro, etc.).
-
-Ao confirmar, o Orquestra reconfigura o especialista, ajusta o binário correto e salva tudo em `~/.orquestra.json` automaticamente.
-
----
-
-## ⚙️ Como Editar as Configurações Manuais
-
-Se preferir editar manualmente:
-1. Digite `/config` no Orquestra para abrir o `~/.orquestra.json` no editor `nano`.
-2. Altere os campos e salve (`Ctrl+O`, `Enter`, `Ctrl+X`).
-
----
-
-## ⌨️ Comandos Disponíveis na Interface
+## 🎛️ Comandos Disponíveis na Interface
 
 | Comando | O que faz |
 |---|---|
-| `<texto livre>` | Passa pelo **Roteador Inteligente** que escolhe o especialista automaticamente. |
-| `/agente <nome>` | Força a troca para um especialista específico (ex: `/agente fiscal`). |
-| `/agentes` | Lista todos os especialistas da sua equipe. |
-| `/agentes trocar` | **Menu interativo:** Troca o cérebro/modelo de qualquer agente usando as setas do teclado! |
-| `/config` | Abre o arquivo de configuração manual (`~/.orquestra.json`). |
-| `/interativo` | Abre o agente ativo em sessão interativa nativa. |
-| `/status` | Exibe qual agente está ativo, modelo e pasta do projeto. |
-| `/historico` | Exibe o histórico recente de conversas com o agente ativo. |
-| `/limpar-chat` | Reseta a memória do agente ativo. |
-| `/bernstein <objetivo>` | Repassa a tarefa para o orquestrador autônomo. |
-| `/plan <objetivo>` | Mostra o plano do Bernstein sem executar. |
-| `/limpar` | Limpa a tela do terminal. |
-| `/sair` | Pergunta se deseja salvar o `RESUMO_DIA.md` e fecha o Orquestra. |
+| `<texto livre>` | Roteador Inteligente: escolhe o especialista automaticamente. |
+| `@arquivo` | Autocompleta nomes de arquivo para injeção automática de contexto. |
+| `/goal <texto>` | Inicia o Estrategista para quebrar a meta em múltiplas Tasks e executá-las no Pipeline. |
+| `/tarefas` | (Ou `F3`) Mostra a Fila de Tarefas (Histórico do SQLite) na tela. |
+| `/aprovar [id]` | Aceita o diff gerado por uma task pendente (salva no Git). |
+| `/rejeitar [id]` | Recusa as alterações e limpa (reset) a árvore de trabalho. |
+| `/agentes trocar`| (Ou `F2`) Menu interativo TUI para trocar o modelo/motor de qualquer agente em tempo real. |
+| `/agente <nome>` | Força a troca para um especialista específico para o chat livre. |
+| `/status` | Exibe qual agente está ativo. |
+| `/historico` | Exibe o histórico recente de conversas. |
+| `/sair` | Fecha o Orquestra com a opção de criar o `RESUMO_DIA.md`. |
 
 ---
-*Criado em colaboração com Antigravity.*
-
+*Construído com Python, prompt_toolkit e sqlite3.*

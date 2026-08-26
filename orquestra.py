@@ -30,6 +30,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
+import os
 from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -268,6 +271,18 @@ def _init_memory_db():
         conn = sqlite3.connect(MEMORY_DB_FILE)
         try:
             conn.execute("""
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT,
+                    title TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS lessons (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT,
@@ -303,6 +318,67 @@ _TASK_KIND_KEYWORDS = {
     "analise": ("analis", "revis", "explica", "avalia"),
 }
 
+
+def create_task(title: str, agent: str) -> int:
+    pid = get_project_id()
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        try:
+            cursor = conn.execute(
+                "INSERT INTO tasks (project_id, title, agent, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (pid, title, agent, "⏳ Em execução", None, now, now)
+            )
+            conn.commit()
+            return cursor.lastrowid
+        finally:
+            conn.close()
+
+def update_task_status(task_id: int, status: str, result: str = None):
+    import datetime
+    now = datetime.datetime.now().isoformat()
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        try:
+            if result is not None:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, result = ?, updated_at = ? WHERE id = ?",
+                    (status, result, now, task_id)
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, now, task_id)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+def get_recent_tasks(limit=10) -> list:
+    pid = get_project_id()
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? ORDER BY id DESC LIMIT ?",
+                (pid, limit)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+def get_task(task_id: int) -> dict:
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
 def _infer_task_kind(instruction: str) -> str:
     """Heurística simples por palavra-chave, sem chamada de LLM e sem mexer no
@@ -1858,7 +1934,7 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 
     section.close(ok=not state["is_error"], error_detail=error_detail, changes_summary=changes_summary)
 
-    return state["final_text"], state["is_error"], error_detail
+    return state["final_text"], state["is_error"], error_detail, changes_summary
 
 
 DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DOTALL | re.IGNORECASE)
@@ -1976,7 +2052,9 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, full_instruction)
         section = LiveSection(label, icon, color)
         section.open()
-        final_text, is_error, error_detail = _run_worker_headless(
+        
+        task_id = create_task(instruction, label)
+        final_text, is_error, error_detail, changes_summary = _run_worker_headless(
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
             is_codex=(actual_binary == "codex"), output_file=output_file,
@@ -1993,7 +2071,14 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             summary = f"[Pipeline interrompido na etapa {idx}/{total} — erro do {label}]:\n{detail_text[-1500:]}"
             save_chat_message("orquestrador", "assistant", summary)
             _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "error")
+            update_task_status(task_id, "❌ Erro", final_text[:4000] if final_text else None)
             return
+
+        if not is_error and changes_summary:
+            new_status = "⚠️ Aguardando Aprovação"
+        else:
+            new_status = "✅ Concluído"
+        update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
 
         captured = final_text.strip()
         step_summaries.append((label, captured))
@@ -2027,6 +2112,27 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
 # REPL principal
 # ─────────────────────────────────────────────────────────
 
+
+class AtFileCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        word = document.get_word_before_cursor(WORD=True)
+        if word.startswith('@'):
+            prefix = word[1:]
+            try:
+                for root, dirs, files in os.walk('.'):
+                    if '.git' in dirs: dirs.remove('.git')
+                    if '__pycache__' in dirs: dirs.remove('__pycache__')
+                    if 'node_modules' in dirs: dirs.remove('node_modules')
+                    
+                    for f in files:
+                        rel_path = os.path.relpath(os.path.join(root, f), '.')
+                        if rel_path.startswith('./'):
+                            rel_path = rel_path[2:]
+                        if rel_path.lower().startswith(prefix.lower()):
+                            yield Completion(rel_path, start_position=-len(prefix))
+            except Exception:
+                pass
+
 def main():
     config = load_config()
     _init_memory_db()
@@ -2040,11 +2146,42 @@ def main():
     # Exibe contexto recente silenciosamente (sem chamada de rede)
     show_recent_context()
 
+    
+    kb = KeyBindings()
+    
+    @kb.add("f1")
+    def _(event):
+        # Type /ajuda and submit
+        event.app.current_buffer.text = "/ajuda"
+        event.app.current_buffer.validate_and_handle()
+
+    @kb.add("f2")
+    def _(event):
+        # Type /agentes trocar and submit
+        event.app.current_buffer.text = "/agentes trocar"
+        event.app.current_buffer.validate_and_handle()
+        
+    @kb.add("f3")
+    def _(event):
+        event.app.current_buffer.text = "/tarefas"
+        event.app.current_buffer.validate_and_handle()
+
+    def bottom_toolbar():
+        c = load_config()
+        orch = c.get("roles", {}).get("orquestrador", {})
+        m = orch.get("model", orch.get("binary", "?"))
+        return f" Orquestra: {m}  |  [F1] Comandos  |  [F2] Trocar Combustível  |  [F3] Fila de Tarefas "
+
     session = PromptSession(
         history=FileHistory(str(HISTORY_FILE)),
         style=Style.from_dict({
             "prompt": "bold ansicyan",
+            "bottom-toolbar": "bg:#333333 #ffffff",
         }),
+        completer=AtFileCompleter(),
+        complete_while_typing=True,
+        key_bindings=kb,
+        bottom_toolbar=bottom_toolbar,
     )
 
     while True:
@@ -2069,6 +2206,32 @@ def main():
         if not raw:
             continue
 
+        if raw.lower().startswith("/goal "):
+            goal_text = raw[6:].strip()
+            raw = (
+                f"O usuário enviou um /goal: '{goal_text}'. "
+                "Sua missão é atuar como Estrategista. Quebre esse objetivo macro "
+                "em até 5 tarefas, utilizando obrigatoriamente um único bloco <PIPELINE>. "
+                "Planeje as etapas, por exemplo: primeiro um operário analisa, depois outro "
+                "escreve código, e outro revisa. Retorne apenas sua fala de introdução e o bloco <PIPELINE>."
+            )
+
+        # Inject @files
+        file_matches = set(re.findall(r'@([\w./-]+)', raw))
+        injected_context = ""
+        for fpath in file_matches:
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        file_text = f.read()
+                    injected_context += f"\n\n--- Contexto Injetado: {fpath} ---\n{file_text}\n"
+                    console.print(f"[dim]📄 Arquivo injetado: {fpath}[/dim]")
+                except Exception as e:
+                    console.print(f"[dim red]Erro ao injetar {fpath}: {e}[/dim red]")
+        
+        if injected_context:
+            raw = raw + injected_context
+
         low = raw.lower()
 
         if low in ("/sair", "/exit", "/quit", "exit", "quit"):
@@ -2076,6 +2239,73 @@ def main():
 
         elif low in ("/ajuda", "/help", "/?"):
             print_help()
+            
+        elif low == "/tarefas":
+            recent = get_recent_tasks()
+            if not recent:
+                console.print("[dim]Nenhuma tarefa recente.[/dim]")
+            else:
+                from rich.table import Table
+                t = Table(title="Tarefas Recentes")
+                t.add_column("ID", style="cyan", justify="right")
+                t.add_column("Operário", style="green")
+                t.add_column("Status", style="yellow")
+                t.add_column("Instrução")
+                for task in recent:
+                    t.add_row(str(task["id"]), task["agent"], task["status"], _preview(task["title"], 60))
+                console.print(t)
+                
+        elif low.startswith("/aprovar"):
+            parts = low.split()
+            if len(parts) > 1:
+                try:
+                    tid = int(parts[1])
+                    task = get_task(tid)
+                    if task and task['status'] == "⚠️ Aguardando Aprovação":
+                        subprocess.run(["git", "add", "."], cwd=get_project_dir(), capture_output=True)
+                        subprocess.run(["git", "commit", "-m", f"Orquestra: Tarefa #{tid} aprovada"], cwd=get_project_dir(), capture_output=True)
+                        update_task_status(tid, "✅ Aprovado (Commitado)", task['result'])
+                        console.print(f"[bold green]Tarefa #{tid} aprovada e salva no Git![/bold green]")
+                    else:
+                        console.print(f"[red]Tarefa #{tid} não está aguardando aprovação.[/red]")
+                except ValueError:
+                    console.print("[red]ID inválido.[/red]")
+            else:
+                console.print("[red]Uso: /aprovar [numero][/red]")
+
+        elif low.startswith("/rejeitar"):
+            parts = low.split()
+            if len(parts) > 1:
+                try:
+                    tid = int(parts[1])
+                    task = get_task(tid)
+                    if task and task['status'] == "⚠️ Aguardando Aprovação":
+                        subprocess.run(["git", "reset", "--hard"], cwd=get_project_dir(), capture_output=True)
+                        subprocess.run(["git", "clean", "-fd"], cwd=get_project_dir(), capture_output=True)
+                        update_task_status(tid, "❌ Rejeitado (Rollback)", task['result'])
+                        console.print(f"[bold red]Mudanças da Tarefa #{tid} revertidas com sucesso![/bold red]")
+                    else:
+                        console.print(f"[red]Tarefa #{tid} não está aguardando aprovação.[/red]")
+                except ValueError:
+                    console.print("[red]ID inválido.[/red]")
+            else:
+                console.print("[red]Uso: /rejeitar [numero][/red]")
+
+        elif low.startswith("/tarefa "):
+            try:
+                tid = int(low.split()[1])
+                task = get_task(tid)
+                if not task:
+                    console.print(f"[red]Tarefa {tid} não encontrada.[/red]")
+                else:
+                    console.print(f"[bold cyan]Tarefa #{task['id']}[/bold cyan] — {task['agent']} ({task['status']})")
+                    console.print(f"[dim]Criada em: {task['created_at']}[/dim]")
+                    console.print(f"\n[bold]Instrução:[/bold]\n{task['title']}")
+                    if task['result']:
+                        console.print(f"\n[bold]Resultado:[/bold]\n{task['result']}")
+            except ValueError:
+                console.print("[red]ID inválido. Use /tarefa [numero][/red]")
+
 
         elif low in ("/agentes", "/agents", "/lista", "/roles"):
             print_roles(config)
@@ -2396,7 +2626,9 @@ def main():
                         od_section.open()
 
                         def _open_design_lifecycle(instruction, cfg, chat_mode, section):
+                            task_id = create_task(instruction, "Open Design")
                             ok, text = open_design_run_task(cfg, instruction, section=section)
+                            update_task_status(task_id, "✅ Concluído" if ok else "❌ Erro", text[:4000] if text else None)
                             _record_agent_performance(get_project_id(), "Open Design", _infer_task_kind(instruction), "success" if ok else "error")
                             if ok:
                                 summary = f"[Resposta do Open Design]:\n{text[:4000]}"
@@ -2442,8 +2674,9 @@ def main():
                     section.open()
                     pending_workers.append((cmd, worker_env, output_file, label, icon, color, actual_binary, section, delegate_instruction))
 
-                def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, is_agy, chat_mode, detail, task_kind, is_codex=False, output_file=None):
-                    final_text, is_error, error_detail = _run_worker_headless(
+                def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, is_agy, chat_mode, detail, task_kind, is_codex=False, output_file=None, delegate_instruction=""):
+                    task_id = create_task(delegate_instruction, lbl)
+                    final_text, is_error, error_detail, changes_summary = _run_worker_headless(
                         w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
                         is_codex=is_codex, output_file=output_file,
                     )
@@ -2452,7 +2685,13 @@ def main():
                             os.unlink(output_file)
                         except OSError:
                             pass
-
+                    
+                    
+                    if not is_error and changes_summary:
+                        new_status = "⚠️ Aguardando Aprovação"
+                    else:
+                        new_status = "❌ Erro" if is_error else "✅ Concluído"
+                    update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
                     _record_agent_performance(get_project_id(), lbl, task_kind, "error" if is_error else "success")
 
                     if is_error:
