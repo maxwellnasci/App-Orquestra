@@ -11,6 +11,7 @@ import shutil
 import json
 import re
 import time
+import datetime
 import threading
 import tempfile
 import urllib.request
@@ -23,6 +24,7 @@ from rich.text import Text
 from rich.rule import Rule
 from rich.table import Table
 from rich.markdown import Markdown
+from rich.padding import Padding
 from rich import box
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -116,6 +118,13 @@ DEFAULT_CONFIG = {
             "icon": "💙",
             "label": "Operário DeepSeek",
             "description": "Abertura no painel lateral via claude-deepseek"
+        },
+        "codex": {
+            "binary": "codex",
+            "model": "",
+            "icon": "🤖",
+            "label": "Operário Codex",
+            "description": "Abertura no painel lateral via Codex CLI (OpenAI)"
         }
     },
     "ui": {
@@ -124,6 +133,13 @@ DEFAULT_CONFIG = {
 }
 
 console = Console()
+
+# Protege prints concorrentes vindos de threads de worker diferentes (ex.: dois
+# <DELEGATE> paralelos escrevendo ao mesmo tempo) pra nunca quebrar uma linha
+# no meio — sem isso, deltas de texto de dois operários podem se entrelaçar
+# caractere a caractere na tela.
+_console_lock = threading.RLock()
+
 
 def load_config() -> dict:
     CHAT_HISTORY_DIR.mkdir(exist_ok=True)
@@ -224,6 +240,219 @@ def show_recent_context():
         else:
             console.print(f"[dim]  🎼  {msg['content'][:120]}[/dim]")
     console.print()
+
+# ─────────────────────────────────────────────────────────
+# Memória de Aprendizado (SQLite) — diferente do histórico de chat acima
+# (bruto, truncado, por conversa): aqui ficam lições, preferências e o
+# desempenho de cada operário, que persistem e se ACUMULAM entre sessões —
+# é o que faz o Orquestra ficar mais informado com o tempo, não só logar.
+# ─────────────────────────────────────────────────────────
+
+import sqlite3
+
+MEMORY_DB_FILE = CHAT_HISTORY_DIR / "memory.db"
+_memory_db_lock = threading.Lock()
+
+
+def get_project_id() -> str:
+    """Mesmo hash de get_project_chat_dir() (isola por pasta) — reaproveitado
+    aqui como chave de projeto na memória de aprendizado. NULL/None em vez
+    disso significa 'lição global', válida em qualquer projeto."""
+    cwd = Path.cwd().resolve()
+    return hashlib.md5(str(cwd).encode('utf-8')).hexdigest()[:8]
+
+
+def _init_memory_db():
+    CHAT_HISTORY_DIR.mkdir(exist_ok=True)
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS lessons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT,
+                    category TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    source TEXT,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    use_count INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS agent_performance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT,
+                    agent_tag TEXT NOT NULL,
+                    task_kind TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+_TASK_KIND_KEYWORDS = {
+    "seguranca": ("segur", "vulnerab", "exploit", "senha", "credencial", "auth"),
+    "ui": ("tela", "layout", "botão", "botao", "cor ", "design", "visual", "componente"),
+    "fix": ("bug", "erro", "corrigi", "conserta", "falha", "quebrado"),
+    "refactor": ("refator", "limpa", "organiza", "reestrutura"),
+    "analise": ("analis", "revis", "explica", "avalia"),
+}
+
+
+def _infer_task_kind(instruction: str) -> str:
+    """Heurística simples por palavra-chave, sem chamada de LLM e sem mexer no
+    formato das tags DELEGATE/PIPELINE. 'geral' quando nada bate."""
+    low = (instruction or "").lower()
+    for kind, keywords in _TASK_KIND_KEYWORDS.items():
+        if any(kw in low for kw in keywords):
+            return kind
+    return "geral"
+
+
+def _record_agent_performance(project_id: str, agent_tag: str, task_kind: str, outcome: str):
+    """Chamada mecânica (sem LLM) logo após um worker/pipeline/Open Design
+    terminar. Degrada silenciosamente em qualquer erro — isso é telemetria de
+    aprendizado, nunca deve derrubar o turno do usuário por causa dela."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                conn.execute(
+                    "INSERT INTO agent_performance (project_id, agent_tag, task_kind, outcome, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (project_id, agent_tag, task_kind, outcome, datetime.datetime.now().isoformat()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _store_lesson(project_id: str | None, category: str, text: str, source: str = ""):
+    """Grava uma lição curta — dedup por texto exato (se já existe, só reforça
+    peso/uso) e poda pras 200 de maior peso/uso recente por projeto/global."""
+    text = (text or "").strip()[:300]
+    if not text:
+        return
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                now = datetime.datetime.now().isoformat()
+                existing = conn.execute(
+                    "SELECT id FROM lessons WHERE text = ? AND project_id IS ?",
+                    (text, project_id),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE lessons SET weight = weight + 1, use_count = use_count + 1, last_used_at = ? WHERE id = ?",
+                        (now, existing[0]),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO lessons (project_id, category, text, source, weight, created_at, last_used_at, use_count) "
+                        "VALUES (?, ?, ?, ?, 1.0, ?, ?, 0)",
+                        (project_id, category, text, source, now, now),
+                    )
+                    conn.execute(
+                        "DELETE FROM lessons WHERE project_id IS ? AND id NOT IN ("
+                        "  SELECT id FROM lessons WHERE project_id IS ? ORDER BY weight DESC, last_used_at DESC LIMIT 200"
+                        ")",
+                        (project_id, project_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        pass
+
+
+_LESSON_RE = re.compile(r'\n?LI[ÇC][ÃA]O:\s*(.+)', re.IGNORECASE)
+
+
+def _extract_lesson(comment: str) -> tuple:
+    """Separa uma linha final 'LIÇÃO: ...' (se o orquestrador escrever uma) do
+    resto do comentário — o que sobra é o que continua sendo mostrado ao
+    usuário; a lição em si vai pro banco, não pra tela."""
+    m = _LESSON_RE.search(comment or "")
+    if not m:
+        return comment, ""
+    lesson = m.group(1).strip()
+    clean = _LESSON_RE.sub('', comment).strip()
+    return clean, lesson
+
+
+def _load_memory_context(project_id: str, max_chars: int = 1500) -> str:
+    """Lições + desempenho por agente relevantes (do projeto atual e globais),
+    formatados como bloco de texto pra injetar no prompt do orquestrador —
+    orçamento de caracteres PRÓPRIO, independente do corte de histórico bruto
+    (history[-20:]). Cada lição efetivamente injetada tem last_used_at/
+    use_count reforçados — é a estratégia de relevância (LRU simples), sem
+    embeddings/vector DB. Degrada pra string vazia em qualquer erro."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                rows = conn.execute(
+                    "SELECT id, text FROM lessons WHERE project_id IS ? OR project_id IS NULL "
+                    "ORDER BY weight DESC, last_used_at DESC LIMIT 40",
+                    (project_id,),
+                ).fetchall()
+
+                perf_rows = conn.execute(
+                    "SELECT agent_tag, task_kind, outcome, COUNT(*) FROM agent_performance "
+                    "WHERE project_id IS ? OR project_id IS NULL "
+                    "GROUP BY agent_tag, task_kind, outcome",
+                    (project_id,),
+                ).fetchall()
+
+                lines, used_ids, budget = [], [], max_chars
+                for row_id, text in rows:
+                    line = f"- {text}"
+                    if budget - len(line) < 0:
+                        break
+                    lines.append(line)
+                    used_ids.append(row_id)
+                    budget -= len(line)
+
+                if used_ids:
+                    now = datetime.datetime.now().isoformat()
+                    conn.executemany(
+                        "UPDATE lessons SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?",
+                        [(now, rid) for rid in used_ids],
+                    )
+                    conn.commit()
+
+                perf_summary = {}
+                for agent_tag, task_kind, outcome, count in perf_rows:
+                    key = (agent_tag, task_kind)
+                    slot = perf_summary.setdefault(key, {"success": 0, "error": 0})
+                    slot["success" if outcome == "success" else "error"] += count
+
+                perf_lines = []
+                for (agent_tag, task_kind), counts in perf_summary.items():
+                    total = counts["success"] + counts["error"]
+                    if total < 2:
+                        continue
+                    perf_lines.append(f"- {agent_tag}: {counts['success']}/{total} sucessos em tarefas de '{task_kind}'")
+
+                parts = []
+                if lines:
+                    parts.append("Lições aprendidas em sessões anteriores:\n" + "\n".join(lines))
+                if perf_lines:
+                    parts.append("Desempenho histórico por operário:\n" + "\n".join(perf_lines[:15]))
+                return "\n\n".join(parts)
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        return ""
+
 
 def handle_safe_exit(config: dict):
     active_role = config.get("active_role", "")
@@ -454,16 +683,27 @@ def _git_dirty_files(project_dir: str) -> set | None:
     return {line[3:].strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -> tuple[bool, str]:
+def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600,
+                          section: "LiveSection | None" = None) -> tuple[bool, str]:
     """Roda uma automação de tiro único no Open Design ligada à pasta atual:
     cria (--disabled) → dispara (`run`) → aguarda terminar → lê a última
     mensagem do assistente → apaga a automação (descartável, uso único).
-    Retorna (ok, texto_da_resposta_ou_erro)."""
+    Retorna (ok, texto_da_resposta_ou_erro).
+
+    section: quando informada, a seção já deve estar ABERTA por quem chamou
+    (mesmo contrato de _run_worker_headless) — aqui só emitimos heartbeats
+    durante o polling (que pode levar minutos) e fechamos ao final, pra nunca
+    ficar em silêncio total enquanto o Open Design trabalha."""
+    def _finish(ok: bool, text: str) -> tuple:
+        if section:
+            section.close(ok=ok, error_detail="" if ok else text)
+        return ok, text
+
     resolved = open_design_resolve_project(config)
     if not resolved:
-        return False, ("Não consegui subir o Open Design automaticamente (repo não configurado em "
+        return _finish(False, ("Não consegui subir o Open Design automaticamente (repo não configurado em "
                         "~/.orquestra.json, ou demorou demais pra iniciar). Rode `open-design-dev` "
-                        "manualmente em outro terminal e tente de novo.")
+                        "manualmente em outro terminal e tente de novo."))
     daemon_url = resolved["daemon_url"]
     project_id = resolved["project_id"]
     project_dir = get_project_dir()
@@ -512,17 +752,18 @@ def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -
         if not automation_id:
             detail = (data or {}).get("error") if isinstance(data, dict) else None
             msg = "Não consegui criar a tarefa no Open Design."
-            return False, f"{msg} ({detail})" if detail else msg
+            return _finish(False, f"{msg} ({detail})" if detail else msg)
 
         ok, run_data = open_design_cli(config, ["automation", "run", automation_id], daemon_url)
         conversation_id = (run_data or {}).get("conversationId") if ok else None
         if not conversation_id:
             detail = (run_data or {}).get("error") if isinstance(run_data, dict) else None
             msg = "Não consegui disparar a tarefa no Open Design."
-            return False, f"{msg} ({detail})" if detail else msg
+            return _finish(False, f"{msg} ({detail})" if detail else msg)
 
         deadline = time.time() + timeout_s
         final_status = "running"
+        waited_s = 0
         while time.time() < deadline:
             ok, runs_data = open_design_cli(config, ["automation", "runs", automation_id, "--limit", "1"], daemon_url)
             runs = (runs_data or {}).get("runs", []) if ok else []
@@ -530,12 +771,15 @@ def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -
                 final_status = runs[0].get("status", "running")
                 if final_status not in ("queued", "running"):
                     break
+            if section:
+                section.tool_call(f"gerando a prévia... ({waited_s}s)")
             time.sleep(5)
+            waited_s += 5
         else:
-            return False, f"Open Design não terminou em {timeout_s // 60} min (ainda '{final_status}')."
+            return _finish(False, f"Open Design não terminou em {timeout_s // 60} min (ainda '{final_status}').")
 
         if final_status != "succeeded":
-            return False, f"A tarefa no Open Design terminou com status '{final_status}'."
+            return _finish(False, f"A tarefa no Open Design terminou com status '{final_status}'.")
 
         req = urllib.request.Request(
             f"{daemon_url}/api/projects/{project_id}/conversations/{conversation_id}/messages"
@@ -545,7 +789,7 @@ def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -
 
         assistant_msgs = [m for m in messages if m.get("role") == "assistant" and m.get("content")]
         if not assistant_msgs:
-            return False, "Open Design terminou mas não devolveu nenhum texto de resposta."
+            return _finish(False, "Open Design terminou mas não devolveu nenhum texto de resposta.")
 
         text = assistant_msgs[-1]["content"].strip()
 
@@ -562,7 +806,7 @@ def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600) -
 
         if resolved.get("web_url"):
             text += f"\n\n🔗 Prévia ao vivo: {resolved['web_url']}/projects/{project_id}"
-        return True, text
+        return _finish(True, text)
     finally:
         os.unlink(prompt_path)
         if automation_id:
@@ -624,6 +868,7 @@ def print_help():
     table.add_row("/design",              "Abre o Open Design ligado à pasta atual (prévia visual ao vivo)")
     table.add_row("/modo chat",           "Respostas limpas tipo chat, sem narração técnica de tool calls")
     table.add_row("/modo tecnico",        "Volta a mostrar tudo em tempo real (padrão)")
+    table.add_row("/detalhe <nível>",     "minimal | normal | full — quanto do trabalho ao vivo aparece na tela")
     table.add_row("/status",              "Mostra agente ativo e pasta do projeto")
     table.add_row("/limpar",              "Limpa a tela")
     table.add_row("/sair  ou  /exit",     "Encerra o Orquestra")
@@ -731,6 +976,16 @@ _DEEPSEEK_FALLBACK = [
     ("deepseek-v4-flash", "Deepseek V4 Flash (Rápido e barato)"),
 ]
 
+# Codex CLI não tem um endpoint de listagem de modelos confiável hoje (ver
+# VALIDACAO_OPEN_DESIGN/memória do projeto: "nenhum id de modelo verificado
+# ainda") — "" como primeira opção é o padrão seguro (não passa -m, deixa o
+# Codex usar o que já está configurado pra conta).
+_CODEX_FALLBACK = [
+    ("", "Padrão do Codex (não força modelo)"),
+    ("gpt-5.1-codex", "GPT-5.1 Codex     (recomendado p/ código)"),
+    ("gpt-5.1",       "GPT-5.1           (uso geral)"),
+]
+
 def _fetch_agy_models() -> list[tuple[str, str]]:
     """Busca os modelos disponíveis no Antigravity em tempo real."""
     try:
@@ -793,6 +1048,11 @@ def _fetch_deepseek_models() -> list[tuple[str, str]]:
             pass
     return _DEEPSEEK_FALLBACK
 
+def _fetch_codex_models() -> list[tuple[str, str]]:
+    """Sem endpoint de listagem confiável no Codex CLI — lista fixa, com
+    'padrão' como primeira opção segura (ver _CODEX_FALLBACK)."""
+    return _CODEX_FALLBACK
+
 _DIALOG_STYLE = PTStyle.from_dict({
     "dialog": "bg:#1e1e2e",
     "dialog.body": "bg:#1e1e2e fg:#cdd6f4",
@@ -804,146 +1064,149 @@ _DIALOG_STYLE = PTStyle.from_dict({
     "radio-list .selected": "bg:#313244 fg:#89b4fa bold",
 })
 
+_FAMILIA_CHOICES = [
+    ("gemini",   "💚 Gemini / Antigravity  (agy)    — Rápido e barato"),
+    ("claude",   "💞 Claude Nativo          (claude) — Sonnet, Opus"),
+    ("deepseek", "💙 DeepSeek               (via proxy claude) — V4 Pro/Flash"),
+    ("codex",    "🤖 OpenAI / Codex         (codex)  — GPT-5.1 Codex"),
+]
+
+_SLOT_LABELS = {
+    "orquestrador": "Orquestrador",
+    "claude": "Operário Claude",
+    "agy": "Operário Antigravity",
+    "deepseek": "Operário DeepSeek",
+    "codex": "Operário Codex",
+}
+
+
+def _apply_familia(target: dict, familia: str, modelo: str):
+    """Aplica a família/modelo escolhidos num role/worker — qualquer um dos
+    dois formatos (config['roles']['orquestrador'] ou config['workers'][tag])
+    aceita qualquer uma das 4 famílias, não só a combinação original. Isso é
+    o que permite trocar a 'gasolina' de qualquer operário se uma assinatura
+    específica der problema, sem depender de reescrever config na mão."""
+    if familia == "gemini":
+        target["binary"] = "agy"
+        target["model"] = modelo
+        target.pop("env_file", None)
+    elif familia == "claude":
+        target["binary"] = "claude"
+        target["model"] = modelo
+        target.pop("env_file", None)
+    elif familia == "deepseek":
+        target["binary"] = "claude"
+        target["model"] = modelo
+        target["env_file"] = str(DEEPSEEK_ENV)
+    else:  # codex
+        target["binary"] = "codex"
+        target["model"] = modelo  # pode ser "" — _build_worker_cmd só passa -m se não for vazio
+        target.pop("env_file", None)
+
+
 def interactive_agent_selection(config: dict):
-    """Menu para trocar o modelo do Orquestrador ou dos Operários (Claude, Agy, DeepSeek)."""
+    """Menu para trocar o modelo/provedor de QUALQUER agente — Orquestrador
+    ou qualquer Operário (Claude, Antigravity, DeepSeek, Codex). Todo agente
+    aceita qualquer uma das 4 famílias (Gemini/Claude/DeepSeek/OpenAI), pra
+    dar redundância real: se uma assinatura específica falhar, dá pra trocar
+    qualquer operário pra outro provedor sem editar JSON na mão.
 
-    workers = config.get("workers", {})
-    orch = config.get("roles", {}).get("orquestrador", {})
+    Navegação em 3 passos com "voltar" de verdade: cancelar em qualquer passo
+    (família ou modelo) volta pra tela inicial (escolha de agente) em vez de
+    fechar o menu inteiro — só sai mesmo cancelando NA tela inicial, ou depois
+    de confirmar uma troca."""
 
-    # ─── Passo 1: Quem configurar? ───
     def _modelo_label(d: dict) -> str:
         m = d.get("model") or d.get("binary", "?")
         return m[:30] if m else "padrão"
 
-    slot_choices = [
-        ("orquestrador", f"🎼  Orquestrador          [{_modelo_label(orch)}]  — chat principal"),
-        ("claude",       f"💞  Operário Claude        [{_modelo_label(workers.get('claude', {}))}]  — codificação pesada"),
-        ("agy",          f"💚  Operário Antigravity   [{_modelo_label(workers.get('agy', {}))}]  — pesquisa e análise"),
-        ("deepseek",     f"💙  Operário DeepSeek      [{_modelo_label(workers.get('deepseek', {}))}]  — via claude-deepseek"),
-    ]
-    slot = radiolist_dialog(
-        title="\n  🎼  Orquestra — Trocar Inteligência",
-        text="Passo 1 de 2  ──  O que você quer reconfigurar?",
-        values=slot_choices,
-        style=_DIALOG_STYLE,
-        ok_text="Próximo →",
-        cancel_text="Cancelar",
-    ).run()
-    if slot is None:
-        console.print("[dim]✓ Nenhuma alteração feita.[/dim]")
-        return
+    step = "slot"
+    slot = familia = None
 
-    # Operário DeepSeek sempre vai para deepseek (sem escolha de família)
-    if slot == "deepseek":
-        console.print("[dim]⏳ Buscando modelos DeepSeek...[/dim]", end="")
-        model_choices = _fetch_deepseek_models()
-        console.print("\r                                        \r", end="")
-        if not model_choices:
-            console.print("[bold red]✗ Não foi possível carregar os modelos DeepSeek.[/bold red]")
+    while True:
+        if step == "slot":
+            workers = config.get("workers", {})
+            orch = config.get("roles", {}).get("orquestrador", {})
+            slot_choices = [
+                ("orquestrador", f"🎼  Orquestrador          [{_modelo_label(orch)}]  — chat principal"),
+                ("claude",       f"💞  Operário Claude        [{_modelo_label(workers.get('claude', {}))}]  — codificação pesada"),
+                ("agy",          f"💚  Operário Antigravity   [{_modelo_label(workers.get('agy', {}))}]  — pesquisa e análise"),
+                ("deepseek",     f"💙  Operário DeepSeek      [{_modelo_label(workers.get('deepseek', {}))}]  — via claude-deepseek"),
+                ("codex",        f"🤖  Operário Codex         [{_modelo_label(workers.get('codex', {}))}]  — via Codex CLI (OpenAI)"),
+            ]
+            slot = radiolist_dialog(
+                title="\n  🎼  Orquestra — Trocar Inteligência",
+                text="Passo 1 de 3  ──  O que você quer reconfigurar?",
+                values=slot_choices,
+                style=_DIALOG_STYLE,
+                ok_text="Próximo →",
+                cancel_text="X Sair",
+            ).run()
+            if slot is None:
+                console.print("[dim]✓ Nenhuma alteração feita.[/dim]")
+                return
+            step = "familia"
+
+        elif step == "familia":
+            slot_label = _SLOT_LABELS.get(slot, slot)
+            familia = radiolist_dialog(
+                title="\n  🎼  Orquestra — Trocar Inteligência",
+                text=f"Passo 2 de 3  ──  Qual provedor para o {slot_label}?",
+                values=_FAMILIA_CHOICES,
+                style=_DIALOG_STYLE,
+                ok_text="Próximo →",
+                cancel_text="← Voltar",
+            ).run()
+            if familia is None:
+                step = "slot"
+                continue
+            step = "modelo"
+
+        elif step == "modelo":
+            console.print("[dim]⏳ Buscando modelos...[/dim]", end="")
+            if familia == "gemini":
+                model_choices = _fetch_agy_models()
+            elif familia == "claude":
+                model_choices = _fetch_claude_models()
+            elif familia == "deepseek":
+                model_choices = _fetch_deepseek_models()
+            else:
+                model_choices = _fetch_codex_models()
+            console.print("\r                                        \r", end="")
+
+            if not model_choices:
+                console.print("[bold red]✗ Não foi possível carregar os modelos desse provedor. Voltando...[/bold red]")
+                step = "slot"
+                continue
+
+            slot_label = _SLOT_LABELS.get(slot, slot)
+            modelo = radiolist_dialog(
+                title="\n  🎼  Orquestra — Trocar Inteligência",
+                text=f"Passo 3 de 3  ──  Qual modelo para o {slot_label}?",
+                values=model_choices,
+                style=_DIALOG_STYLE,
+                ok_text="✔ Confirmar",
+                cancel_text="← Voltar",
+            ).run()
+            if modelo is None:
+                step = "slot"
+                continue
+
+            # ─── Salva ───
+            if slot == "orquestrador":
+                target = config.setdefault("roles", {}).setdefault("orquestrador", {})
+            else:
+                target = config.setdefault("workers", {}).setdefault(slot, {})
+            _apply_familia(target, familia, modelo)
+
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+
+            console.print(
+                f"\n[bold green]✓ {slot_label} configurado![/bold green] "
+                f"Modelo: [bold]{modelo or '(padrão do provedor)'}[/bold] via [dim]{familia.capitalize()}[/dim]\n"
+            )
             return
-        modelo = radiolist_dialog(
-            title="\n  🎼  Orquestra — Operário DeepSeek",
-            text="Passo 2 de 2  ──  Qual modelo DeepSeek?",
-            values=model_choices,
-            style=_DIALOG_STYLE,
-            ok_text="✔ Confirmar",
-            cancel_text="← Voltar",
-        ).run()
-        if modelo is None:
-            console.print("[dim]✓ Nenhuma alteração feita.[/dim]")
-            return
-        config.setdefault("workers", {})["deepseek"]["model"] = modelo
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        console.print(f"\n[bold green]✓ Operário DeepSeek configurado![/bold green] Modelo: [bold]{modelo}[/bold]\n")
-        return
-
-    # Para Orquestrador, Claude e Agy: escolhe a família
-    if slot in ("claude",):
-        familia_choices = [
-            ("claude",   "💞 Claude Nativo   — Sonnet, Opus"),
-        ]
-    elif slot == "agy":
-        familia_choices = [
-            ("gemini",   "💚 Gemini / Antigravity (agy)"),
-        ]
-    else:  # orquestrador: todas as opções
-        familia_choices = [
-            ("gemini",   "💚 Gemini / Antigravity  (agy) — Rápido e barato"),
-            ("claude",   "💞 Claude Nativo          (claude) — Sonnet, Opus"),
-            ("deepseek", "💙 Deepseek               — V4 Pro, V4 Flash"),
-        ]
-
-    if len(familia_choices) == 1:
-        familia = familia_choices[0][0]
-    else:
-        familia = radiolist_dialog(
-            title="\n  🎼  Orquestra — Trocar Inteligência",
-            text=f"Passo 1.5 de 2  ──  Qual provedor?",
-            values=familia_choices,
-            style=_DIALOG_STYLE,
-            ok_text="Próximo →",
-            cancel_text="← Voltar",
-        ).run()
-        if familia is None:
-            console.print("[dim]✓ Nenhuma alteração feita.[/dim]")
-            return
-
-    # ─── Passo 2: Modelo ───
-    console.print("[dim]⏳ Buscando modelos...[/dim]", end="")
-    if familia == "gemini":
-        model_choices = _fetch_agy_models()
-    elif familia == "claude":
-        model_choices = _fetch_claude_models()
-    else:
-        model_choices = _fetch_deepseek_models()
-    console.print("\r                                        \r", end="")
-
-    if not model_choices:
-        console.print("[bold red]✗ Não foi possível carregar os modelos. Tente novamente.[/bold red]")
-        return
-
-    slot_label = {"orquestrador": "Orquestrador", "claude": "Operário Claude", "agy": "Operário Agy"}.get(slot, slot)
-    modelo = radiolist_dialog(
-        title="\n  🎼  Orquestra — Trocar Inteligência",
-        text=f"Passo 2 de 2  ──  Qual modelo para o {slot_label}?",
-        values=model_choices,
-        style=_DIALOG_STYLE,
-        ok_text="✔ Confirmar",
-        cancel_text="← Voltar",
-    ).run()
-    if modelo is None:
-        console.print("[dim]✓ Nenhuma alteração feita.[/dim]")
-        return
-
-    # ─── Salva ───
-    if slot == "orquestrador":
-        if familia == "gemini":
-            config["roles"]["orquestrador"]["binary"] = "agy"
-            config["roles"]["orquestrador"]["model"] = modelo
-            config["roles"]["orquestrador"].pop("env_file", None)
-        elif familia == "claude":
-            config["roles"]["orquestrador"]["binary"] = "claude"
-            config["roles"]["orquestrador"]["model"] = modelo
-            config["roles"]["orquestrador"].pop("env_file", None)
-        else:
-            config["roles"]["orquestrador"]["binary"] = "claude"
-            config["roles"]["orquestrador"]["model"] = modelo
-            config["roles"]["orquestrador"]["env_file"] = str(DEEPSEEK_ENV)
-    elif slot == "claude":
-        config.setdefault("workers", {})["claude"]["model"] = modelo
-        config["workers"]["claude"]["binary"] = "claude"
-    elif slot == "agy":
-        config.setdefault("workers", {})["agy"]["model"] = modelo
-        config["workers"]["agy"]["binary"] = "agy"
-
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-    console.print(
-        f"\n[bold green]✓ {slot_label} configurado![/bold green] "
-        f"Modelo: [bold]{modelo}[/bold] via [dim]{familia.capitalize()}[/dim]\n"
-    )
 
 
 def launch_interactive(config: dict) -> int:
@@ -1076,13 +1339,102 @@ def _chat_clean_text(text: str) -> str:
 
 
 def _print_chat_bubble(label: str, icon: str, color: str, text: str):
+    """Mensagem 'de chat' sem caixa/borda — cabeçalho colorido + texto liso
+    indentado por baixo, no mesmo estilo visual do Claude Code/OpenCode
+    (nunca painéis com moldura pra cada mensagem, que fica mais 'app de
+    chat de celular' do que terminal de verdade)."""
     clean = _chat_clean_text(text)
     if not clean:
         return
-    console.print(Panel(
-        Markdown(clean), title=f"{icon} {label}", title_align="left",
-        border_style=color, box=box.ROUNDED, padding=(0, 1),
-    ))
+    with _console_lock:
+        console.print(f"[{color}]⏺[/{color}] [bold {color}]{icon} {label}[/bold {color}]")
+        console.print(Padding(Markdown(clean), (0, 0, 0, 2)))
+        console.print()
+
+
+def _detail_level(config: dict) -> str:
+    """minimal | normal | full — nível de detalhe do streaming ao vivo de um
+    operário. Substitui o antigo binário quiet/chat_mode: em NENHUM nível o
+    operário fica em silêncio total (minimal ainda mostra o texto sendo
+    gerado ao vivo, só omite tool calls). `ui.detail`, se presente, manda;
+    senão mapeia o `ui.mode` legado pra manter compatibilidade com configs
+    já existentes (chat→minimal, tecnico→full)."""
+    ui = config.get("ui", {})
+    detail = ui.get("detail")
+    if detail in ("minimal", "normal", "full"):
+        return detail
+    mode = ui.get("mode", "tecnico")
+    if mode == "chat":
+        return "minimal"
+    if mode == "tecnico":
+        return "full"
+    return "normal"
+
+
+class LiveSection:
+    """Uma seção de trabalho de um operário, impressa de forma incremental
+    (append-only) no MESMO terminal — nunca abre pane/janela nova. Simula o
+    efeito de 'painel que abre e fecha' com prints estruturados em vez de
+    redesenho in-place (rich.live.Live nunca rodou concorrente com o prompt
+    neste projeto; console.print de thread de fundo já roda em produção sem
+    problema — ver plano da reforma). Cada seção é prefixada por ícone/label
+    e protegida por _console_lock, então várias seções em paralelo entrelaçam
+    de forma legível em vez de quebrar linhas no meio."""
+
+    def __init__(self, label: str, icon: str, color: str):
+        self.label = label
+        self.icon = icon
+        self.color = color
+        self._line_open = False
+        self._start = None
+
+    def open(self):
+        self._start = time.time()
+        with _console_lock:
+            console.print(f"[{self.color}]⏺[/{self.color}] [bold {self.color}]{self.icon} {self.label}[/bold {self.color}]")
+
+    def end_line(self):
+        """Fecha uma linha de streaming em andamento (delta sem \\n no final),
+        se houver uma aberta. Idempotente."""
+        with _console_lock:
+            if self._line_open:
+                console.print()
+                self._line_open = False
+
+    def write(self, text: str, end: str = "\n", prefix: bool = True):
+        """Escreve texto vindo do operário (fala/delta), indentado sob o
+        marcador ⏺ da seção — sem repetir ícone/label a cada parágrafo (estilo
+        Claude Code/OpenCode: um cabeçalho, depois o texto flui liso, sem
+        caixa). Com end="", acumula na mesma linha (streaming token-a-token)."""
+        if not text:
+            return
+        with _console_lock:
+            if prefix and not self._line_open:
+                console.print("  ", end="")
+            console.print(text, end=end)
+            self._line_open = (end == "")
+
+    def tool_call(self, text: str):
+        """Anúncio de 1 linha pra uma chamada de ferramenta/passo (nível
+        normal/full) ou erro (sempre, em qualquer nível — erro nunca é
+        escondido). Formato "⎿" combina com o marcador ⏺ do open()."""
+        self.end_line()
+        with _console_lock:
+            console.print(f"  [dim]⎿ {text}[/dim]")
+
+    def close(self, ok: bool, error_detail: str = "", changes_summary: str = ""):
+        elapsed = time.time() - self._start if self._start else 0.0
+        self.end_line()
+        with _console_lock:
+            if ok:
+                console.print(f"  [dim green]⎿ ✓ concluído em {elapsed:.0f}s[/dim green]")
+            else:
+                console.print(f"  [dim red]⎿ ✗ erro[/dim red]")
+                if error_detail:
+                    console.print(f"    [dim]{error_detail[-1500:]}[/dim]")
+            if changes_summary:
+                console.print(f"  [dim]⎿ 📝 {changes_summary}[/dim]")
+        console.print()
 
 
 def _auto_open_links(text: str):
@@ -1102,11 +1454,11 @@ def _auto_open_links(text: str):
         pass
 
 
-def _narrate_claude_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
-                          quiet: bool = False):
-    """Processa uma linha de stream-json do `claude` e narra em tempo real.
+def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    """Processa uma linha de stream-json do `claude` e narra ao vivo na LiveSection.
     Preenche state['final_text']/state['is_error'] quando o evento 'result' chega.
-    Com quiet=True (modo chat), não imprime nada — só preenche o state."""
+    minimal: só o texto de fala. normal: + anúncio de 1 linha por tool call.
+    full: + preview do resultado de cada tool call (comportamento técnico de sempre)."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
@@ -1115,30 +1467,37 @@ def _narrate_claude_line(line: str, console: Console, label: str, icon: str, col
     etype = d.get("type")
 
     if etype == "assistant":
-        if not quiet:
-            for block in d.get("message", {}).get("content", []):
-                btype = block.get("type")
-                if btype == "text" and block.get("text", "").strip():
-                    console.print(f"[{color}]{icon} {label}:[/{color}] {block['text'].strip()}")
-                elif btype == "tool_use":
-                    tool_name = block.get("name", "?")
-                    console.print(f"[{color}]{icon} {label} 🔧[/{color}] {tool_name}({_preview(block.get('input', {}))})")
+        for block in d.get("message", {}).get("content", []):
+            btype = block.get("type")
+            if btype == "text" and block.get("text", "").strip():
+                text = block["text"].strip()
+                if detail != "full":
+                    # Colapsa blocos de código grandes (mesma limpeza que já
+                    # existia pras bolhas de chat) — sem isso, uma análise que
+                    # cita trechos de código real vira uma parede de código
+                    # cru no meio da conversa, em vez de ficar legível.
+                    text = _chat_clean_text(text)
+                if text:
+                    section.write(text)
+            elif btype == "tool_use" and detail in ("normal", "full"):
+                tool_name = block.get("name", "?")
+                section.tool_call(f"{tool_name}({_preview(block.get('input', {}))})")
 
     elif etype == "user":
-        if not quiet:
+        if detail == "full":
             for block in d.get("message", {}).get("content", []):
                 if block.get("type") == "tool_result":
-                    console.print(f"[dim]  ↳ resultado: {_preview(block.get('content', ''))}[/dim]")
+                    section.write(f"↳ resultado: {_preview(block.get('content', ''))}", prefix=False)
 
     elif etype == "result":
         state["final_text"] = d.get("result", "") or ""
         state["is_error"] = bool(d.get("is_error"))
 
 
-def _narrate_agy_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
-                       quiet: bool = False):
-    """Processa uma linha de stream-json do `agy` e narra em tempo real.
-    Com quiet=True (modo chat), não imprime nada — só preenche o state."""
+def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    """Processa uma linha de stream-json do `agy` e narra ao vivo na LiveSection
+    (streaming token-a-token real, mostrado em qualquer nível de detalhe —
+    era descartado em modo chat antes desta reforma)."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
@@ -1153,24 +1512,32 @@ def _narrate_agy_line(line: str, console: Console, label: str, icon: str, color:
         delta = upd.get("text_delta")
 
         if step_type == "agent_response" and delta:
-            if not quiet:
-                if state.get("_last_stream_idx") != step_idx:
-                    console.print(f"[{color}]{icon} {label}:[/{color}] ", end="")
-                console.print(delta, end="")
+            if detail == "full":
+                section.write(delta, end="")
+            elif not state.get("_responding_announced"):
+                # Em minimal/normal não mostramos o delta cru — o texto vem
+                # token a token, sem contexto suficiente pra saber se está no
+                # meio de um bloco de código (diferente do claude, que manda
+                # blocos de texto já completos). Só avisa que está
+                # respondendo; a versão limpa/colapsada aparece no 'result'.
+                section.tool_call("respondendo...")
+                state["_responding_announced"] = True
             state["_last_stream_idx"] = step_idx
         elif step_type not in ("agent_response", "user_input", "checkpoint") and upd.get("state") == "ACTIVE":
             key = f"_announced_{step_idx}"
             if not state.get(key):
-                if not quiet:
-                    console.print(f"\n[{color}]{icon} {label} 🔧[/{color}] {step_type}...")
+                if detail in ("normal", "full"):
+                    section.tool_call(f"{step_type}...")
                 state[key] = True
 
     elif event == "result":
         res = d.get("result", {})
         state["final_text"] = res.get("response", "") or ""
         state["is_error"] = res.get("status") != "SUCCESS"
-        if not quiet:
-            console.print()  # fecha a linha do streaming de texto
+        if detail == "full":
+            section.end_line()
+        elif state["final_text"] and not state["is_error"]:
+            section.write(_chat_clean_text(state["final_text"]))
 
 
 def _codex_clean_error_msg(raw) -> str:
@@ -1194,17 +1561,17 @@ def _codex_clean_error_msg(raw) -> str:
     return str(raw)
 
 
-def _narrate_codex_line(line: str, console: Console, label: str, icon: str, color: str, state: dict,
-                         quiet: bool = False):
+def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
     """Parser (best-effort) do --json do Codex CLI — schema próprio (thread.started/
     turn.started/item.completed/turn.completed), diferente do stream-json do Claude
-    e do formato do Agy. Só narra em modo técnico; o texto final de sucesso não
-    depende disso — vem do arquivo passado via -o/--output-last-message, lido
-    depois em _run_worker_headless (mais confiável que garimpar o item certo aqui).
-    Em caso de erro, porém, o Codex nunca escreve esse arquivo — a única fonte da
-    causa real é este stream (o erro aparece no stdout como JSON, não no stderr),
-    então aqui SIM capturamos a mensagem de erro em state["final_text"] pra ela
-    chegar no resumo salvo no histórico / repassado ao orquestrador."""
+    e do formato do Agy. Tool calls só narram em normal/full; o texto final de
+    sucesso não depende disso — vem do arquivo passado via -o/--output-last-message,
+    lido depois em _run_worker_headless (mais confiável que garimpar o item certo
+    aqui). Em caso de erro, porém, o Codex nunca escreve esse arquivo — a única
+    fonte da causa real é este stream (o erro aparece no stdout como JSON, não no
+    stderr), então aqui SIM capturamos a mensagem de erro em state["final_text"]
+    pra ela chegar no resumo salvo no histórico / repassado ao orquestrador. Erros
+    são sempre narrados ao vivo, em qualquer nível de detalhe — nunca escondidos."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
@@ -1220,24 +1587,140 @@ def _narrate_codex_line(line: str, console: Console, label: str, icon: str, colo
             msg = _codex_clean_error_msg(item.get("message"))
             if msg:
                 state["final_text"] = f"[Codex] {msg}"
-            if not quiet:
-                console.print(f"[bold red]{icon} {label} ⚠ {msg or 'erro'}[/bold red]")
-        elif not quiet:
-            console.print(f"[dim]{icon} {label} 🔧 {item_type or 'executando'}...[/dim]")
+            section.tool_call(f"⚠ {msg or 'erro'}")
+        elif detail in ("normal", "full"):
+            section.tool_call(f"{item_type or 'executando'}...")
     elif ev_type == "error":
         state["is_error"] = True
         msg = _codex_clean_error_msg(d.get("message"))
         if msg:
             state["final_text"] = f"[Codex] {msg}"
-        if not quiet:
-            console.print(f"[bold red]{icon} {label} ⚠ {msg or 'erro'}[/bold red]")
+        section.tool_call(f"⚠ {msg or 'erro'}")
     elif ev_type == "turn.failed":
         state["is_error"] = True
         msg = _codex_clean_error_msg((d.get("error") or {}).get("message") if isinstance(d.get("error"), dict) else d.get("error"))
         if msg and not state.get("final_text"):
             state["final_text"] = f"[Codex] {msg}"
-        if not quiet:
-            console.print(f"[bold red]{icon} {label}: turno falhou.[/bold red]")
+        section.tool_call("turno falhou.")
+
+
+def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
+    """Monta o comando de streaming pro PRÓPRIO orquestrador (decisão inicial do
+    turno e _orchestrator_react) — mesmo padrão de _build_worker_cmd, mas SEM
+    flags de escrita/permissão: o orquestrador só decide e conversa, nunca mexe
+    em arquivos (isso é sempre delegado a um operário via <DELEGATE>/<PIPELINE>).
+    Retorna (cmd, binary)."""
+    binary = role.get("binary", "agy")
+    model = role.get("model")
+
+    if binary == "agy":
+        cmd = ["agy", "-p", prompt, "--output-format", "stream-json"]
+        if model:
+            cmd.extend(["--model", model])
+    else:
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+
+    return cmd, binary
+
+
+def _capture_orchestrator_result(line: str, is_agy: bool, state: dict):
+    """Extrai só final_text/is_error do stream-json de uma chamada do próprio
+    orquestrador — sem narrar nada ao vivo (o heartbeat de
+    _run_orchestrator_stream já cobre a visibilidade; o texto completo é
+    mostrado depois, formatado, por quem chamou — narrar aqui repetiria a
+    mesma fala duas vezes na tela)."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if is_agy:
+        if d.get("event") == "result":
+            res = d.get("result", {})
+            state["final_text"] = res.get("response", "") or ""
+            state["is_error"] = res.get("status") != "SUCCESS"
+    else:
+        if d.get("type") == "result":
+            state["final_text"] = d.get("result", "") or ""
+            state["is_error"] = bool(d.get("is_error"))
+
+
+def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection", timeout_s: int) -> tuple:
+    """Roda uma chamada do PRÓPRIO orquestrador (decisão inicial do turno ou
+    _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
+    silêncio total + spinner genérico de antes da reforma — e com um timeout
+    de verdade (mata o processo se passar de timeout_s), a mesma garantia que
+    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok)."""
+    state = {"final_text": "", "is_error": False}
+    is_agy = (binary == "agy")
+
+    try:
+        proc = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+    except FileNotFoundError:
+        section.close(ok=False, error_detail=f"binário '{binary}' não encontrado")
+        return "", False
+
+    stop_heartbeat = threading.Event()
+
+    def _heartbeat():
+        waited = 0
+        while not stop_heartbeat.wait(5):
+            waited += 5
+            section.tool_call(f"pensando... ({waited}s)")
+
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
+    timed_out = {"flag": False}
+
+    def _kill_on_timeout():
+        timed_out["flag"] = True
+        proc.kill()
+
+    timer = threading.Timer(timeout_s, _kill_on_timeout)
+    timer.start()
+
+    stderr_lines = []
+
+    def _drain_stderr():
+        for l in proc.stderr:
+            stderr_lines.append(l)
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                _capture_orchestrator_result(line, is_agy, state)
+    finally:
+        timer.cancel()
+        stop_heartbeat.set()
+
+    proc.wait()
+
+    if timed_out["flag"]:
+        section.close(ok=False, error_detail=f"não respondeu em {timeout_s}s (timeout)")
+        return "", False
+
+    if not state["final_text"] and proc.returncode != 0:
+        detail = "".join(stderr_lines[-20:]).strip() or "processo terminou sem resposta"
+        section.close(ok=False, error_detail=detail)
+        return "", False
+
+    if state["is_error"]:
+        # O processo pode sair com código 0 mesmo reportando erro no envelope
+        # JSON (is_error/status) — sem checar isso, um erro "educado" do
+        # modelo seria tratado como resposta válida e tentaria ser escaneado
+        # por <DELEGATE>/<PIPELINE> como se fosse texto normal.
+        detail = state["final_text"] or "".join(stderr_lines[-20:]).strip() or "o modelo reportou erro"
+        section.close(ok=False, error_detail=detail)
+        return "", False
+
+    section.close(ok=True)
+    return state["final_text"].strip(), True
 
 
 def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
@@ -1247,8 +1730,6 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
     vazia) em qualquer falha/timeout — quem chama trata isso como "sem reação"
     e cai de volta no comportamento antigo (bolha crua)."""
     role = config.get("roles", {}).get("orquestrador", {})
-    binary = role.get("binary", "agy")
-    model = role.get("model")
 
     projeto = Path(get_project_dir()).name
     prompt = (
@@ -1259,40 +1740,37 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
         "e natural — como se você estivesse continuando a conversa, não repetindo "
         "o resultado inteiro. Resuma o que foi feito e destaque só o que importa. "
         "Termine perguntando se o usuário quer ajustar algo ou seguir para outra coisa. "
-        "Responda só com o texto da sua fala, sem tags e sem formatação especial."
+        "Responda só com o texto da sua fala, sem tags e sem formatação especial.\n\n"
+        "Se (e SÓ se) esse resultado revelar algo genuinamente reutilizável no futuro — uma "
+        "preferência clara do usuário, um fato específico do projeto, ou uma lição sobre o que "
+        "funcionou/não funcionou — termine sua resposta numa linha própria, à parte, no formato "
+        "'LIÇÃO: <frase curta>'. Não force isso: a maioria das respostas não precisa de nenhuma "
+        "lição. Essa linha não aparece pro usuário, só fica guardada pra você mesmo no futuro."
     )
 
-    cmd = [binary]
-    if binary == "agy" and model:
-        cmd.extend(["--model", model])
-    if binary == "claude":
-        cmd.extend(["-p", prompt])
-    else:
-        cmd.extend(["--print", prompt])
+    cmd, binary = _build_orchestrator_cmd(role, prompt)
 
     env = os.environ.copy()
     env_file = role.get("env_file")
     if env_file:
         env.update(load_env_file(env_file))
 
-    try:
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=100)
-    except subprocess.TimeoutExpired:
+    section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
+    section.open()
+    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100)
+    if not ok:
         return ""
 
-    if result.returncode != 0:
-        return ""
-
-    output = result.stdout.strip()
-    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text or '')
     return clean.strip()
 
 
-def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, color: str,
-                          console: Console, is_agy: bool, quiet: bool = False,
-                          is_codex: bool = False, output_file: str | None = None):
-    """Roda um operário headless, narrando eventos em tempo real (ou em silêncio,
-    se quiet=True — modo chat). Retorna (final_text, is_error, error_detail).
+def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection", is_agy: bool,
+                          detail: str = "normal", is_codex: bool = False, output_file: str | None = None):
+    """Roda um operário headless, narrando eventos ao vivo na LiveSection — em
+    NENHUM nível de detalhe fica em silêncio total (ver _detail_level). Abre e
+    fecha a seção aqui mesmo, já com o resumo de erro embutido no fechamento.
+    Retorna (final_text, is_error, error_detail).
 
     output_file: quando informado (Codex), depois que o processo termina o
     conteúdo desse arquivo (-o/--output-last-message) sobrescreve o final_text
@@ -1300,7 +1778,14 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
     --json do Codex é best-effort."""
     state = {"final_text": "", "is_error": False}
     stderr_lines = []
+    # Snapshot pra avisar, ao fechar a seção, quais arquivos reais foram tocados —
+    # mesma técnica já usada no Open Design (_git_dirty_files), estendida aqui pra
+    # claude/agy/codex/deepseek. None se `cwd` não for um repo git.
+    files_before = _git_dirty_files(cwd)
 
+    # A seção já deve estar aberta (section.open()) por quem chamou — isso permite
+    # abrir várias seções juntas, como um bloco, antes de disparar as threads dos
+    # workers (ver Requisito de paralelismo empilhado no plano da reforma).
     try:
         proc = subprocess.Popen(
             cmd, cwd=cwd, env=env,
@@ -1308,6 +1793,7 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
             text=True, bufsize=1,
         )
     except FileNotFoundError as e:
+        section.close(ok=False, error_detail=f"binário não encontrado: {e}")
         return "", True, f"binário não encontrado: {e}"
 
     def _drain_stderr():
@@ -1326,9 +1812,10 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
     for line in proc.stdout:
         line = line.strip()
         if line:
-            parser(line, console, label, icon, color, state, quiet=quiet)
+            parser(line, section, state, detail=detail)
 
     proc.wait()
+    section.end_line()
 
     if output_file:
         try:
@@ -1354,6 +1841,23 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, label: str, icon: str, 
     else:
         error_detail = ""
 
+    changes_summary = ""
+    if files_before is not None:
+        files_after = _git_dirty_files(cwd)
+        touched = (files_after or set()) - files_before
+        if touched:
+            changes_summary = f"Arquivos alterados: {', '.join(sorted(touched))}"
+            try:
+                diff_stat = subprocess.run(
+                    ["git", "diff", "--stat"], cwd=cwd, capture_output=True, text=True, timeout=10,
+                )
+                if diff_stat.returncode == 0 and diff_stat.stdout.strip():
+                    changes_summary += f"\n{diff_stat.stdout.strip()[:800]}"
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    section.close(ok=not state["is_error"], error_detail=error_detail, changes_summary=changes_summary)
+
     return state["final_text"], state["is_error"], error_detail
 
 
@@ -1361,35 +1865,41 @@ DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DO
 PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECASE)
 
 
+# Defaults de label/ícone/cor/binary por tag histórica — usados só quando o
+# config não sobrescreve nada. Tag desconhecida cai no default do "claude".
+_WORKER_TAG_DEFAULTS = {
+    "deepseek": ("claude", "DeepSeek", "💙", "blue"),
+    "claude":   ("claude", "Claude Code", "💻", "cyan"),
+    "agy":      ("agy", "Antigravity", "💚", "green"),
+}
+
+
 def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     """Resolve qual operário real usar a partir da tag do <DELEGATE>/<PIPELINE>.
-    Retorna (worker_config, actual_binary, label, icon, color). As três tags
-    históricas (claude/agy/deepseek) mantêm exatamente o comportamento de sempre;
-    qualquer tag nova que já exista em config["workers"] (ex.: "codex") usa o
-    binary/label/icon/color definidos lá, sem precisar mexer em código — só o
-    binary precisa de um branch dedicado em _build_worker_cmd se a CLI dele não
-    seguir o padrão -p/--print + stream-json do claude/agy (caso do codex)."""
+    Retorna (worker_config, actual_binary, label, icon, color).
+
+    IMPORTANTE: o `binary`/`label`/`icon`/`color` salvos em config["workers"][tag]
+    SEMPRE têm prioridade sobre o default da tag — isso é o que faz o menu
+    `/agentes trocar` conseguir trocar a "família" (Gemini/Claude/DeepSeek/
+    Codex) de QUALQUER operário, inclusive os 3 históricos (claude/agy/
+    deepseek). Antes desta correção, esses 3 ignoravam completamente o que
+    estava salvo em config e sempre usavam o binary/label fixo no código —
+    trocar a família desses 3 no menu não tinha efeito nenhum na prática."""
     workers = config.get("workers", {})
     tag = target_binary_tag.lower()
 
-    if tag == "deepseek":
-        worker = workers.get("deepseek", {})
-        return worker, "claude", "DeepSeek", "💙", "blue"
-    if tag == "claude":
-        worker = workers.get("claude", {})
-        return worker, "claude", "Claude Code", "💻", "cyan"
-    if tag == "agy":
-        worker = workers.get("agy", {})
-        return worker, "agy", "Antigravity", "💚", "green"
-    if tag in workers:
-        worker = workers[tag]
-        actual_binary = worker.get("binary", "claude")
-        return (worker, actual_binary,
-                worker.get("label", tag.capitalize()),
-                worker.get("icon", "🤖"),
-                worker.get("color", "white"))
+    worker = workers[tag] if tag in workers else workers.get("claude", {})
+    default_binary, default_label, default_icon, default_color = _WORKER_TAG_DEFAULTS.get(
+        tag, ("claude", tag.capitalize(), "🤖", "white")
+    )
 
-    return workers.get("claude", {}), "claude", "Claude Code", "💻", "cyan"
+    return (
+        worker,
+        worker.get("binary", default_binary),
+        worker.get("label", default_label),
+        worker.get("icon", default_icon),
+        worker.get("color", default_color),
+    )
 
 
 def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tuple:
@@ -1433,7 +1943,7 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
     return cmd, worker_env, output_file
 
 
-def _run_pipeline(config: dict, steps: list, chat_mode: bool):
+def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
     """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
     orquestrador): a resposta de cada etapa vira contexto pra próxima instrução,
     e ao final o orquestrador sintetiza tudo pro usuário revisar/implementar.
@@ -1461,15 +1971,14 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool):
                 f"Sua tarefa agora:\n{instruction}"
             )
 
-        if chat_mode:
-            console.print(f"[dim]🔗 Pipeline — etapa {idx}/{total}: {label} está analisando...[/dim]")
-        else:
-            console.print(f"[bold yellow]⚡ Pipeline — Etapa {idx}/{total}: {label} começou a trabalhar...[/bold yellow]")
+        console.print(f"[dim]🔗 Pipeline — etapa {idx}/{total}: {label}[/dim]")
 
         cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, full_instruction)
+        section = LiveSection(label, icon, color)
+        section.open()
         final_text, is_error, error_detail = _run_worker_headless(
-            cmd, worker_env, get_project_dir(), label, icon, color, console,
-            actual_binary == "agy", quiet=chat_mode,
+            cmd, worker_env, get_project_dir(), section,
+            actual_binary == "agy", detail=detail,
             is_codex=(actual_binary == "codex"), output_file=output_file,
         )
         if output_file:
@@ -1479,18 +1988,17 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool):
                 pass
 
         if is_error:
-            detail = error_detail or "(sem detalhes de stderr)"
             console.print(f"[bold red]⚠ Pipeline parou na etapa {idx} ({label}) por erro.[/bold red]")
-            console.print(f"[dim]{detail[-1500:]}[/dim]")
-            summary = f"[Pipeline interrompido na etapa {idx}/{total} — erro do {label}]:\n{detail[-1500:]}"
+            detail_text = error_detail or "(sem detalhes de stderr)"
+            summary = f"[Pipeline interrompido na etapa {idx}/{total} — erro do {label}]:\n{detail_text[-1500:]}"
             save_chat_message("orquestrador", "assistant", summary)
+            _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "error")
             return
 
         captured = final_text.strip()
         step_summaries.append((label, captured))
         save_chat_message("orquestrador", "assistant", f"[Pipeline etapa {idx}/{total} — {label}]:\n{captured[:4000]}")
-        if not chat_mode:
-            console.print(f"[bold green]✓ Etapa {idx}/{total} ({label}) concluída.[/bold green]")
+        _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "success")
         previous_result = captured
 
     combined = "\n\n".join(f"--- {lbl} ---\n{txt[:3000]}" for lbl, txt in step_summaries)
@@ -1498,6 +2006,9 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool):
 
     if chat_mode:
         comment = _orchestrator_react(config, f"o pipeline {chain_desc}", combined)
+        comment, lesson = _extract_lesson(comment)
+        if lesson:
+            _store_lesson(get_project_id(), "lesson", lesson, source=f"pipeline {chain_desc}")
         if comment:
             save_chat_message("orquestrador", "assistant", comment)
             orch_role = config.get("roles", {}).get("orquestrador", {})
@@ -1518,6 +2029,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool):
 
 def main():
     config = load_config()
+    _init_memory_db()
 
     print_banner()
 
@@ -1544,7 +2056,12 @@ def main():
                 '<ansigreen><b>orquestra</b></ansigreen>'
                 '<ansiwhite> → </ansiwhite>'
             )
-            with patch_stdout():
+            # raw=True é essencial aqui: o padrão (raw=False) REMOVE/ESCAPA
+            # sequências de escape vt100 de qualquer coisa impressa por uma
+            # thread de fundo enquanto o prompt está ativo — é isso que fazia
+            # todo output colorido do Rich (Rule, Panel, Markdown) vazar como
+            # texto literal tipo "?[36m" na tela, em vez de virar cor de verdade.
+            with patch_stdout(raw=True):
                 raw = session.prompt(prompt_text).strip()
         except (KeyboardInterrupt, EOFError):
             handle_safe_exit(config)
@@ -1594,6 +2111,23 @@ def main():
                 console.print("[bold green]💬 Modo chat ativado — respostas limpas, sem narração técnica.[/bold green]")
             else:
                 console.print("[bold green]🔧 Modo técnico ativado — narração completa de tool calls.[/bold green]")
+
+        elif low.startswith("/detalhe") or low.startswith("/detail"):
+            parts = raw.split(maxsplit=1)
+            if len(parts) == 1:
+                atual = _detail_level(config)
+                console.print(f"[yellow]Nível de detalhe atual: {atual}. Uso: /detalhe minimal | normal | full[/yellow]")
+                continue
+
+            requested = parts[1].strip().lower()
+            if requested not in ("minimal", "normal", "full"):
+                console.print(f"[bold red]Nível desconhecido: '{requested}'. Use minimal, normal ou full.[/bold red]")
+                continue
+
+            config.setdefault("ui", {})["detail"] = requested
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            console.print(f"[bold green]🔎 Nível de detalhe ajustado para: {requested}[/bold green]")
 
         elif low.startswith("/agente") or low.startswith("/agent"):
             parts = raw.split(maxsplit=1)
@@ -1688,13 +2222,18 @@ def main():
             
             save_chat_message(role_name, "user", raw)
             history = load_chat_history(role_name)
-            
+            memory_context = _load_memory_context(get_project_id())
+            memory_block = f"Fatos e lições conhecidos (memória de longo prazo, não é o histórico da conversa):\n{memory_context}\n\n" if memory_context else ""
+
             context_str = (
                 f"Você é o Orquestra, o assistente inteligente do projeto '{projeto}'.\n"
                 f"Hoje é {agora}. Você está no terminal do usuário, na pasta '{get_project_dir()}'.\n"
                 "Seu objetivo é conversar naturalmente, lembrar o contexto, tirar dúvidas e gerenciar o projeto.\n"
                 "REGRA DE OURO: Você NÃO DEVE inventar código, alucinar ou chutar o que não sabe com certeza.\n"
                 "Quando precisar executar uma tarefa prática (ler/escrever código, rodar comandos, acessar web), DELEGUE para um operário.\n"
+                "IMPORTANTE: antes de qualquer bloco <DELEGATE>/<PIPELINE>, escreva sempre 1-2 frases em "
+                "português explicando o que você vai fazer e por quê. Nunca emita blocos de delegação sem "
+                "esse texto de intenção antes deles — é isso que o usuário vê enquanto o operário trabalha.\n"
                 "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
                 "<DELEGATE binary=\"claude\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
                 "Use binary=\"claude\" para codificação, binary=\"agy\" para pesquisa e análise rápida, "
@@ -1731,6 +2270,7 @@ def main():
                 "etapa você mesmo vai comentar o resultado consolidado pro usuário revisar e decidir se "
                 "implementa. binary=\"open-design\" ainda não é suportado dentro de <PIPELINE>. Você pode "
                 "emitir <PIPELINE> e <DELEGATE> soltos na mesma resposta, se fizer sentido.\n\n"
+                f"{memory_block}"
                 "Histórico da Conversa:\n"
             )
             for msg in history[-20:]:
@@ -1738,65 +2278,53 @@ def main():
                 context_str += f"{prefix}: {msg['content']}\n"
             
             prompt = f"{context_str}\n\nResponda ao usuário agora:"
-            
-            cmd = [binary]
-            if binary == "agy" and model:
-                cmd.extend(["--model", model])
-            if binary == "claude":
-                cmd.extend(["-p", prompt])
-            else:
-                cmd.extend(["--print", prompt])
-            
+
+            cmd, cmd_binary = _build_orchestrator_cmd(role, prompt)
+
             env = os.environ.copy()
             env_file = role.get("env_file")
             if env_file:
                 env.update(load_env_file(env_file))
-                
+
             # Até 2 tentativas: o `agy`/modelo às vezes volta com stdout vazio por
             # instabilidade momentânea (não é timeout nem erro de processo) — nesse
             # caso específico vale a pena tentar mais uma vez antes de desistir.
-            result = None
+            # Diferente de timeout/erro de processo (aí não vale a pena retentar,
+            # aborta direto — a LiveSection já mostrou o motivo ao fechar).
             clean_output = ""
+            hard_fail = False
             for attempt in range(2):
-                status_label = (f"⏳ {icon} {role_name.capitalize()} está pensando e orquestrando..." if attempt == 0
-                                 else f"⏳ {icon} {role_name.capitalize()} voltou sem resposta, tentando de novo...")
-                with console.status(f"[bold {color}]{status_label}[/bold {color}]", spinner="dots"):
-                    try:
-                        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=150)
-                    except subprocess.TimeoutExpired:
-                        console.print(f"[bold red]⚠ {icon} {role_name.capitalize()} não respondeu em 150s (timeout) — provável instabilidade do modelo '{model}'.[/bold red]")
-                        console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
-                        result = None
-                        break
+                section = LiveSection(role_name.capitalize(), icon, color)
+                section.open()
+                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150)
 
-                if result.returncode != 0:
-                    console.print(f"[bold red]⚠ Erro ao processar no {role_name}[/bold red]")
-                    if result.stderr:
-                        print(result.stderr.strip())
-                    result = None
+                if not ok:
+                    hard_fail = True
                     break
 
-                output = result.stdout.strip()
-                # Se usar claude via -p, o claude pode cuspir um monte de lixo visual,
-                # mas vamos tratar da mesma forma.
-                clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', output)
+                clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text or '').strip()
                 if clean_output:
                     break
 
                 if attempt == 0:
                     console.print(f"[dim]⚠ {icon} {role_name.capitalize()} voltou vazio na 1ª tentativa — tentando de novo...[/dim]")
-                    if result.stderr and result.stderr.strip():
-                        console.print(f"[dim]stderr: {result.stderr.strip()[:500]}[/dim]")
 
-            if result is None:
+            if hard_fail:
+                console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
                 continue
 
             if not clean_output:
                 console.print(f"[bold red]⚠ {icon} {role_name.capitalize()} voltou sem resposta (2 tentativas) — provável instabilidade momentânea do modelo '{model}'.[/bold red]")
-                if result.stderr and result.stderr.strip():
-                    console.print(f"[dim]stderr: {result.stderr.strip()[:1000]}[/dim]")
                 console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
                 continue
+
+            # O streaming JSON já entrega texto limpo (campo estruturado, não stdout
+            # bruto de terminal) — sem o "lixo visual" de ANSI que o `-p` síncrono
+            # antigo podia trazer. `output` (usado no ramo sem delegação, abaixo)
+            # e `clean_output` (usado no scan de <DELEGATE>/<PIPELINE>) são o mesmo
+            # texto agora; mantidos como dois nomes só por compatibilidade com o
+            # resto do bloco.
+            output = clean_output
             
             # Busca blocos <PIPELINE> primeiro (cadeias sequenciais) e tira eles
             # do texto antes de procurar <DELEGATE> soltos — senão os DELEGATE
@@ -1813,10 +2341,32 @@ def main():
             # Busca TODAS as tags de delegação soltas (paralelas)
             delegate_matches = list(DELEGATE_RE.finditer(clean_output_no_pipeline))
             chat_mode = config.get("ui", {}).get("mode") == "chat"
+            detail_level = _detail_level(config)
 
             if delegate_matches or pipeline_steps_list:
                 # Exibe a resposta removendo TODAS as tags para o usuário ver
                 user_output = re.sub(r'<DELEGATE.*?</DELEGATE>', '', output_no_pipeline, flags=re.DOTALL | re.IGNORECASE).strip()
+
+                if not user_output:
+                    # Fallback: garante uma frase de intenção mesmo se o LLM não escrever
+                    # nada fora das tags — nunca dispara delegação em silêncio total.
+                    intent_parts = []
+                    if delegate_matches:
+                        labels = []
+                        for m in delegate_matches:
+                            tag = m.group(1).lower()
+                            if tag in ("open-design", "opendesign", "open_design"):
+                                labels.append("Open Design")
+                            else:
+                                labels.append(_resolve_worker(config, tag)[2])
+                        if len(labels) == 1:
+                            intent_parts.append(f"Vou pedir para {labels[0]} cuidar disso.")
+                        else:
+                            intent_parts.append(f"Vou acionar {len(labels)} operários em paralelo: {', '.join(labels)}.")
+                    for steps in pipeline_steps_list:
+                        chain = " → ".join(_resolve_worker(config, tag)[2] for tag, _ in steps)
+                        intent_parts.append(f"Vou rodar isso em pipeline: {chain}.")
+                    user_output = " ".join(intent_parts)
 
                 save_chat_message(role_name, "assistant", clean_output)
                 if user_output:
@@ -1826,23 +2376,36 @@ def main():
                         console.print(f"\n[bold {color}]{icon} {role_name.capitalize()}:[/bold {color}]\n{user_output}\n")
                     _auto_open_images(user_output)
 
+                # Duas passadas: primeiro resolve e ABRE todas as LiveSection desta
+                # rodada, uma atrás da outra, na thread principal — os cabeçalhos
+                # aparecem juntos, como um bloco (efeito de "pilha" pedido no
+                # paralelismo). Só depois disparamos as threads que efetivamente
+                # rodam os workers. Open Design fica de fora deste agrupamento
+                # (lifecycle próprio, tratado na Fase 3 da reforma).
+                pending_workers = []
                 for idx, match in enumerate(delegate_matches):
                     target_binary_tag = match.group(1).lower()
                     delegate_instruction = match.group(2).strip()
 
                     if target_binary_tag in ("open-design", "opendesign", "open_design"):
-                        if chat_mode:
-                            console.print(f"[dim]🎨 Open Design está cuidando da prévia (Tarefa {idx+1})...[/dim]")
-                        else:
-                            console.print(f"[bold magenta]🎨 Open Design (Tarefa {idx+1}) começou a gerar a prévia...[/bold magenta]")
+                        # open_design_run_task não passa por _run_worker_headless (é
+                        # polling HTTP, não subprocess streaming) — mas usa a mesma
+                        # LiveSection, com heartbeats durante o polling, pra nunca
+                        # ficar em silêncio total enquanto gera a prévia.
+                        od_section = LiveSection("Open Design", "🎨", "magenta")
+                        od_section.open()
 
-                        def _open_design_lifecycle(instruction, cfg, chat_mode):
-                            ok, text = open_design_run_task(cfg, instruction)
+                        def _open_design_lifecycle(instruction, cfg, chat_mode, section):
+                            ok, text = open_design_run_task(cfg, instruction, section=section)
+                            _record_agent_performance(get_project_id(), "Open Design", _infer_task_kind(instruction), "success" if ok else "error")
                             if ok:
                                 summary = f"[Resposta do Open Design]:\n{text[:4000]}"
                                 save_chat_message("orquestrador", "assistant", summary)
                                 if chat_mode:
                                     comment = _orchestrator_react(cfg, "Open Design", text) if text else ""
+                                    comment, lesson = _extract_lesson(comment)
+                                    if lesson:
+                                        _store_lesson(get_project_id(), "lesson", lesson, source="Open Design")
                                     if comment:
                                         save_chat_message("orquestrador", "assistant", comment)
                                         orch_role = cfg.get("roles", {}).get("orquestrador", {})
@@ -1854,16 +2417,16 @@ def main():
                                         _print_chat_bubble("Open Design", "🎨", "magenta", text)
                                     _auto_open_links(text)
                                 else:
-                                    console.print("[bold green]✓ Open Design terminou — resposta salva no contexto do Orquestra[/bold green]")
                                     console.print(f"[magenta]{text}[/magenta]")
                                 _auto_open_images(text)
                             else:
-                                console.print(f"[bold red]⚠ Open Design falhou: {text}[/bold red]")
+                                # A LiveSection já mostrou o erro ao fechar — só falta
+                                # salvar o resumo no histórico do orquestrador.
                                 save_chat_message("orquestrador", "assistant", f"[Erro do Open Design]: {text}")
 
                         threading.Thread(
                             target=_open_design_lifecycle,
-                            args=(delegate_instruction, config, chat_mode),
+                            args=(delegate_instruction, config, chat_mode, od_section),
                             daemon=True
                         ).start()
                         continue
@@ -1875,66 +2438,71 @@ def main():
                     worker, actual_binary, label, icon, color = _resolve_worker(config, target_binary_tag)
                     cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, delegate_instruction)
 
+                    section = LiveSection(label, icon, color)
+                    section.open()
+                    pending_workers.append((cmd, worker_env, output_file, label, icon, color, actual_binary, section, delegate_instruction))
+
+                def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, is_agy, chat_mode, detail, task_kind, is_codex=False, output_file=None):
+                    final_text, is_error, error_detail = _run_worker_headless(
+                        w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
+                        is_codex=is_codex, output_file=output_file,
+                    )
+                    if output_file:
+                        try:
+                            os.unlink(output_file)
+                        except OSError:
+                            pass
+
+                    _record_agent_performance(get_project_id(), lbl, task_kind, "error" if is_error else "success")
+
+                    if is_error:
+                        # A LiveSection já mostrou o erro e o detalhe ao fechar —
+                        # só falta salvar o resumo no histórico do orquestrador.
+                        detail_text = error_detail or "(sem detalhes de stderr)"
+                        summary = f"[Erro do {lbl}]:\n{(final_text or '').strip()}\n{detail_text[-1500:]}".strip()
+                        save_chat_message("orquestrador", "assistant", summary)
+                        return
+
+                    captured = final_text.strip()
+                    if captured:
+                        summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
+                        save_chat_message("orquestrador", "assistant", summary)
                     if chat_mode:
-                        console.print(f"[dim]{icon} {label} está cuidando disso...[/dim]")
-                    else:
-                        console.print(f"[bold yellow]⚡ {label} (Tarefa {idx+1}) começou a trabalhar...[/bold yellow]")
-
-                    def _worker_lifecycle(w_cmd, w_env, lbl, ic, col, is_agy, chat_mode, is_codex=False, output_file=None):
-                        final_text, is_error, error_detail = _run_worker_headless(
-                            w_cmd, w_env, get_project_dir(), lbl, ic, col, console, is_agy, quiet=chat_mode,
-                            is_codex=is_codex, output_file=output_file,
-                        )
-                        if output_file:
-                            try:
-                                os.unlink(output_file)
-                            except OSError:
-                                pass
-
-                        if is_error:
-                            console.print(f"[bold red]⚠ {lbl} terminou com erro.[/bold red]")
-                            detail = error_detail or "(sem detalhes de stderr)"
-                            console.print(f"[dim]{detail[-1500:]}[/dim]")
-                            summary = f"[Erro do {lbl}]:\n{(final_text or '').strip()}\n{detail[-1500:]}".strip()
-                            save_chat_message("orquestrador", "assistant", summary)
-                            return
-
-                        captured = final_text.strip()
-                        if captured:
-                            summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
-                            save_chat_message("orquestrador", "assistant", summary)
-                        if chat_mode:
-                            comment = _orchestrator_react(config, lbl, captured) if captured else ""
-                            if comment:
-                                save_chat_message("orquestrador", "assistant", comment)
-                                orch_role = config.get("roles", {}).get("orquestrador", {})
-                                _print_chat_bubble(
-                                    "Orquestra", orch_role.get("icon", "🎼"),
-                                    orch_role.get("color", "cyan"), comment,
-                                )
-                            else:
-                                _print_chat_bubble(lbl, ic, col, captured or "(sem resposta de texto)")
-                                console.print("[dim]Quer que eu ajuste mais alguma coisa?[/dim]")
+                        comment = _orchestrator_react(config, lbl, captured) if captured else ""
+                        comment, lesson = _extract_lesson(comment)
+                        if lesson:
+                            _store_lesson(get_project_id(), "lesson", lesson, source=lbl)
+                        if comment:
+                            save_chat_message("orquestrador", "assistant", comment)
+                            orch_role = config.get("roles", {}).get("orquestrador", {})
+                            _print_chat_bubble(
+                                "Orquestra", orch_role.get("icon", "🎼"),
+                                orch_role.get("color", "cyan"), comment,
+                            )
                         else:
-                            console.print(f"[bold green]✓ {lbl} terminou — resposta salva no contexto do Orquestra[/bold green]")
+                            _print_chat_bubble(lbl, ic, col, captured or "(sem resposta de texto)")
+                            console.print("[dim]Quer que eu ajuste mais alguma coisa?[/dim]")
+                    else:
+                        console.print(f"[bold green]✓ {lbl} terminou — resposta salva no contexto do Orquestra[/bold green]")
 
+                # Só agora, com todos os cabeçalhos das seções já abertos juntos
+                # (passo acima), disparamos as threads que efetivamente rodam
+                # os workers — efeito de "pilha declarada de uma vez".
+                for w_cmd, w_env, w_output_file, w_label, w_icon, w_color, w_binary, w_section, w_instruction in pending_workers:
                     threading.Thread(
                         target=_worker_lifecycle,
-                        args=(cmd, worker_env, label, icon, color, actual_binary == "agy", chat_mode),
-                        kwargs={"is_codex": actual_binary == "codex", "output_file": output_file},
+                        args=(w_cmd, w_env, w_section, w_label, w_icon, w_color, w_binary == "agy", chat_mode, detail_level, _infer_task_kind(w_instruction)),
+                        kwargs={"is_codex": w_binary == "codex", "output_file": w_output_file},
                         daemon=True
                     ).start()
 
                 for p_idx, steps in enumerate(pipeline_steps_list, start=1):
                     chain_desc = " → ".join(_resolve_worker(config, tag)[2] for tag, _ in steps)
-                    if chat_mode:
-                        console.print(f"[dim]🔗 Pipeline {p_idx} iniciado: {chain_desc}[/dim]")
-                    else:
-                        console.print(f"[bold yellow]🔗 Pipeline {p_idx} iniciado ({len(steps)} etapas: {chain_desc})...[/bold yellow]")
+                    console.print(f"[dim]🔗 Pipeline {p_idx} iniciado: {chain_desc}[/dim]")
 
                     threading.Thread(
                         target=_run_pipeline,
-                        args=(config, steps, chat_mode),
+                        args=(config, steps, chat_mode, detail_level),
                         daemon=True
                     ).start()
 
