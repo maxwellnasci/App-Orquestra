@@ -2113,6 +2113,37 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
 
     return cmd, worker_env, output_file
 
+def _run_copilot_watchdog():
+    """Roda o Copilot em background para analisar mudanças de código recentes
+    em busca de bugs severos, sem travar o usuário."""
+    def _watchdog_thread():
+        # Verifica se realmente há arquivos modificados antes de invocar
+        diff_check = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=get_project_dir())
+        if not diff_check.stdout.strip():
+            return
+
+        cmd = [
+            "gh", "copilot", "-p",
+            "Você é o Cão de Guarda do Orquestra. Execute `git status` e `git diff` (incluindo untracked files) para ver as modificações recentes. Analise-as procurando por BUGS ou lógicas erradas. Seja direto: se achar bug, reporte com clareza. Se estiver 100% perfeito, responda APENAS 'Tudo certo'.",
+            "--no-ask-user"
+        ]
+        try:
+            res = subprocess.run(
+                cmd, cwd=get_project_dir(),
+                capture_output=True, text=True, timeout=60,
+                stdin=subprocess.DEVNULL
+            )
+            out = res.stdout.strip()
+            # Se a resposta indicar erro ou que está limpo, ignoramos silenciosamente
+            if "Tudo certo" in out and len(out) < 50:
+                return
+            if res.returncode == 0 and out:
+                # Usa rich console via patch_stdout para imprimir em cima do prompt sem quebrar a linha de digitação
+                console.print(f"\n[bold yellow]🐕 [Watchdog Copilot][/bold yellow]\n{out}\n")
+        except Exception:
+            pass # Falhas de timeout ou erro de binário são silenciosas no watchdog
+
+    threading.Thread(target=_watchdog_thread, daemon=True).start()
 
 def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
     """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
@@ -2171,6 +2202,9 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
 
         if not is_error and changes_summary:
             new_status = "⚠️ Aguardando Aprovação"
+            # Dispara o cão de guarda na última etapa se houver mudanças
+            if idx == total:
+                _run_copilot_watchdog()
         else:
             new_status = "✅ Concluído"
         update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
@@ -2806,6 +2840,7 @@ def main():
                     
                     if not is_error and changes_summary:
                         new_status = "⚠️ Aguardando Aprovação"
+                        _run_copilot_watchdog()
                     else:
                         new_status = "❌ Erro" if is_error else "✅ Concluído"
                     update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
