@@ -1041,25 +1041,48 @@ def edit_config():
 
 # Modelos fixos de fallback (atualize aqui se sair modelo novo)
 _CLAUDE_FALLBACK = [
-    ("claude-sonnet-5",       "Claude Sonnet 5       (Recomendado)"),
-    ("claude-opus-5",         "Claude Opus 5         (Máxima qualidade)"),
-    ("claude-fable-5",        "Claude Fable 5        (Alta complexidade)"),
-    ("claude-haiku-4-5-20251001", "Claude Haiku 4.5  (Rápido e barato)"),
+    # ── Modelos confirmados na conta via feature flags (tengu_velvet_mallet_*: True) ──
+    # Primeiro = padrão sugerido quando a API não responde
+    ("claude-sonnet-5",            "claude-sonnet-5              (Sonnet 5 — Padrão recomendado) ✦"),
+    ("claude-opus-5",              "claude-opus-5                (Opus 5 — Máxima inteligência)"),
+    ("claude-fable-5",             "claude-fable-5               (Fable 5 — Tarefas longas/difíceis)"),
+    ("claude-opus-4.8",            "claude-opus-4.8              (Opus 4.8 — Alta qualidade)"),
+    ("claude-opus-4.7",            "claude-opus-4.7              (Opus 4.7)"),
+    ("claude-sonnet-4.6",          "claude-sonnet-4.6            (Sonnet 4.6 — Estável)"),
+    ("claude-haiku-4-5-20251001",  "claude-haiku-4-5-20251001   (Haiku 4.5 — Rápido e econômico)"),
 ]
 
+
 _DEEPSEEK_FALLBACK = [
-    ("deepseek-v4-pro",   "Deepseek V4 Pro   (Mais capaz)"),
-    ("deepseek-v4-flash", "Deepseek V4 Flash (Rápido e barato)"),
+    ("deepseek-v4-pro",              "deepseek-v4-pro               (V4 Pro — Mais capaz)"),
+    ("deepseek-v4-flash",            "deepseek-v4-flash             (V4 Flash — Rápido e barato)"),
+    ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp  (V4 Flash Vision — Experimental)"),
 ]
 
 # Codex CLI não tem um endpoint de listagem de modelos confiável hoje (ver
 # VALIDACAO_OPEN_DESIGN/memória do projeto: "nenhum id de modelo verificado
 # ainda") — "" como primeira opção é o padrão seguro (não passa -m, deixa o
 # Codex usar o que já está configurado pra conta).
+_COPILOT_FALLBACK = [
+    ("claude-haiku-4.5",     "claude-haiku-4.5       (Haiku 4.5 — Padrão atual)"),
+    ("claude-sonnet-4.6",    "claude-sonnet-4.6      (Sonnet 4.6 — Pesquisa)"),
+    ("claude-sonnet-5",      "claude-sonnet-5        (Sonnet 5 — Poder Máximo)"),
+    ("claude-opus-5",        "claude-opus-5          (Opus 5 — Ultra Qualidade)"),
+    ("gpt-5.6-terra",        "gpt-5.6-terra          (Terra — GPT padrão)"),
+    ("gpt-5.6-sol",          "gpt-5.6-sol            (Sol — GPT Alta cap.)"),
+    ("gpt-5.5",              "gpt-5.5                (GPT-5.5 — Geral)"),
+    ("gpt-5.4-mini",         "gpt-5.4-mini           (Mini — Rápido)"),
+]
+
 _CODEX_FALLBACK = [
-    ("", "Padrão do Codex (não força modelo)"),
-    ("gpt-5.1-codex", "GPT-5.1 Codex     (recomendado p/ código)"),
-    ("gpt-5.1",       "GPT-5.1           (uso geral)"),
+    ("",              "Padrão (usa gpt-5.6-terra configurado)"),
+    ("gpt-5.6-terra", "gpt-5.6-terra    (Terra — Padrão atual da conta)"),
+    ("gpt-5.6-sol",   "gpt-5.6-sol      (Sol — Alta capacidade)"),
+    ("gpt-5.6-luna",  "gpt-5.6-luna     (Luna — Balanceado)"),
+    ("gpt-5.5",       "gpt-5.5          (GPT-5.5 — Uso geral)"),
+    ("gpt-5.4",       "gpt-5.4          (GPT-5.4 — Uso geral)"),
+    ("gpt-5.4-mini",  "gpt-5.4-mini     (Mini — Rápido)"),
+    ("gpt-5-mini",    "gpt-5-mini        (5 Mini — Rápido)"),
 ]
 
 def _fetch_agy_models() -> list[tuple[str, str]]:
@@ -1129,6 +1152,40 @@ def _fetch_codex_models() -> list[tuple[str, str]]:
     'padrão' como primeira opção segura (ver _CODEX_FALLBACK)."""
     return _CODEX_FALLBACK
 
+
+def _fetch_copilot_models() -> list[tuple[str, str]]:
+    """Busca modelos disponíveis no GitHub Copilot via API em tempo real.
+    Usa o token do 'gh auth token'. Fallback para lista fixa se falhar."""
+    try:
+        result = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=5)
+        token = result.stdout.strip()
+        if not token:
+            return _COPILOT_FALLBACK
+        req = urllib.request.Request(
+            "https://api.githubcopilot.com/models",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Copilot-Integration-Id": "vscode-chat",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+            raw = data.get("data", data if isinstance(data, list) else [])
+            # Filter to only useful chat/code models, exclude embeddings, internal agents, exec-agents
+            skip_prefixes = ("text-embedding", "copilot-search", "exec-agent", "trajectory", "mai-code-1-flash-picker")
+            models = []
+            for m in raw:
+                mid = m.get("id", "") if isinstance(m, dict) else str(m)
+                if mid and not any(mid.startswith(p) for p in skip_prefixes):
+                    models.append((mid, f"{mid}"))
+            if models:
+                # Put claude-haiku-4.5 first (current default)
+                models.sort(key=lambda x: (0 if x[0] == "claude-haiku-4.5" else 1, x[0]))
+                return [(mid, f"{mid:<45}") for mid, _ in models]
+    except Exception:
+        pass
+    return _COPILOT_FALLBACK
+
 _DIALOG_STYLE = PTStyle.from_dict({
     "dialog": "bg:#1e1e2e",
     "dialog.body": "bg:#1e1e2e fg:#cdd6f4",
@@ -1141,18 +1198,20 @@ _DIALOG_STYLE = PTStyle.from_dict({
 })
 
 _FAMILIA_CHOICES = [
-    ("gemini",   "💚 Gemini / Antigravity  (agy)    — Rápido e barato"),
-    ("claude",   "💞 Claude Nativo          (claude) — Sonnet, Opus"),
-    ("deepseek", "💙 DeepSeek               (via proxy claude) — V4 Pro/Flash"),
-    ("codex",    "🤖 OpenAI / Codex         (codex)  — GPT-5.1 Codex"),
+    ("claude",   "💞 Claude Code            (claude) — Anthropic"),
+    ("codex",    "🤖 Codex                  (codex)  — OpenAI"),
+    ("deepseek", "💙 Claude-DeepSeek        (claude) — DeepSeek V4"),
+    ("gemini",   "💚 Antigravity            (agy)    — Google"),
+    ("copilot",  "🤖 Copilot                (copilot)— GitHub"),
 ]
 
 _SLOT_LABELS = {
     "orquestrador": "Orquestrador",
-    "claude": "Operário Claude",
-    "agy": "Operário Antigravity",
-    "deepseek": "Operário DeepSeek",
-    "codex": "Operário Codex",
+    "implementador": "Implementador (Claude)",
+    "arquiteto": "Arquiteto (DeepSeek)",
+    "pesquisador": "Pesquisador (Copilot/Agy)",
+    "designer": "Designer (Agy)",
+    "analista": "Analista (Codex/GPT)",
 }
 
 
@@ -1174,6 +1233,10 @@ def _apply_familia(target: dict, familia: str, modelo: str):
         target["binary"] = "claude"
         target["model"] = modelo
         target["env_file"] = str(DEEPSEEK_ENV)
+    elif familia == "copilot":
+        target["binary"] = "copilot"
+        target["model"] = modelo
+        target.pop("env_file", None)
     else:  # codex
         target["binary"] = "codex"
         target["model"] = modelo  # pode ser "" — _build_worker_cmd só passa -m se não for vazio
@@ -1204,11 +1267,12 @@ def interactive_agent_selection(config: dict):
             workers = config.get("workers", {})
             orch = config.get("roles", {}).get("orquestrador", {})
             slot_choices = [
-                ("orquestrador", f"🎼  Orquestrador          [{_modelo_label(orch)}]  — chat principal"),
-                ("claude",       f"💞  Operário Claude        [{_modelo_label(workers.get('claude', {}))}]  — codificação pesada"),
-                ("agy",          f"💚  Operário Antigravity   [{_modelo_label(workers.get('agy', {}))}]  — pesquisa e análise"),
-                ("deepseek",     f"💙  Operário DeepSeek      [{_modelo_label(workers.get('deepseek', {}))}]  — via claude-deepseek"),
-                ("codex",        f"🤖  Operário Codex         [{_modelo_label(workers.get('codex', {}))}]  — via Codex CLI (OpenAI)"),
+                ("orquestrador", f"🎼  Orquestrador (Chefe)          [{_modelo_label(orch)}]"),
+                ("implementador",f"🔨  Implementador (Código)        [{_modelo_label(workers.get('implementador', {}))}]"),
+                ("arquiteto",    f"🏛️  Arquiteto (Revisão/Segurança) [{_modelo_label(workers.get('arquiteto', {}))}]"),
+                ("pesquisador",  f"🔎  Pesquisador (Busca/Docs)      [{_modelo_label(workers.get('pesquisador', {}))}]"),
+                ("designer",     f"🎨  Designer (Visual/UI)          [{_modelo_label(workers.get('designer', {}))}]"),
+                ("analista",     f"🧠  Analista (Solucionador/Dados) [{_modelo_label(workers.get('analista', {}))}]"),
             ]
             slot = radiolist_dialog(
                 title="\n  🎼  Orquestra — Trocar Inteligência",
@@ -1246,6 +1310,8 @@ def interactive_agent_selection(config: dict):
                 model_choices = _fetch_claude_models()
             elif familia == "deepseek":
                 model_choices = _fetch_deepseek_models()
+            elif familia == "copilot":
+                model_choices = _fetch_copilot_models()
             else:
                 model_choices = _fetch_codex_models()
             console.print("\r                                        \r", end="")
@@ -1570,6 +1636,23 @@ def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail:
         state["is_error"] = bool(d.get("is_error"))
 
 
+def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    try:
+        data = json.loads(line)
+        if "type" in data:
+            if data["type"] == "assistant.message_delta":
+                delta = data.get("data", {}).get("delta", "")
+                if delta:
+                    state["final_text"] += delta
+                    section.append_output(delta)
+            elif data["type"] == "assistant.message":
+                # Fallback if there is no delta but full text
+                pass
+            elif data["type"] == "error":
+                state["is_error"] = True
+    except json.JSONDecodeError:
+        pass
+
 def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
     """Processa uma linha de stream-json do `agy` e narra ao vivo na LiveSection
     (streaming token-a-token real, mostrado em qualquer nível de detalhe —
@@ -1732,6 +1815,7 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
     try:
         proc = subprocess.Popen(
             cmd, env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -1842,7 +1926,7 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
 
 
 def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection", is_agy: bool,
-                          detail: str = "normal", is_codex: bool = False, output_file: str | None = None):
+                          detail: str = "normal", is_codex: bool = False, is_copilot: bool = False, output_file: str | None = None):
     """Roda um operário headless, narrando eventos ao vivo na LiveSection — em
     NENHUM nível de detalhe fica em silêncio total (ver _detail_level). Abre e
     fecha a seção aqui mesmo, já com o resumo de erro embutido no fechamento.
@@ -1865,6 +1949,7 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
     try:
         proc = subprocess.Popen(
             cmd, cwd=cwd, env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
         )
@@ -1880,6 +1965,8 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 
     if is_codex:
         parser = _narrate_codex_line
+    elif is_copilot:
+        parser = _narrate_copilot_line
     elif is_agy:
         parser = _narrate_agy_line
     else:
@@ -1944,9 +2031,11 @@ PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECAS
 # Defaults de label/ícone/cor/binary por tag histórica — usados só quando o
 # config não sobrescreve nada. Tag desconhecida cai no default do "claude".
 _WORKER_TAG_DEFAULTS = {
-    "deepseek": ("claude", "DeepSeek", "💙", "blue"),
-    "claude":   ("claude", "Claude Code", "💻", "cyan"),
-    "agy":      ("agy", "Antigravity", "💚", "green"),
+    "implementador": ("claude", "Implementador", "🔨", "cyan"),
+    "arquiteto":   ("claude", "Arquiteto", "🏛️", "blue"),
+    "pesquisador": ("copilot", "Pesquisador", "🔎", "yellow"),
+    "designer":    ("agy", "Designer", "🎨", "green"),
+    "analista":    ("codex", "Analista", "🧠", "magenta"),
 }
 
 
@@ -1964,7 +2053,7 @@ def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     workers = config.get("workers", {})
     tag = target_binary_tag.lower()
 
-    worker = workers[tag] if tag in workers else workers.get("claude", {})
+    worker = workers[tag] if tag in workers else workers.get("implementador", {})
     default_binary, default_label, default_icon, default_color = _WORKER_TAG_DEFAULTS.get(
         tag, ("claude", tag.capitalize(), "🤖", "white")
     )
@@ -2005,6 +2094,12 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
                "-o", output_file]
         if worker_model:
             cmd.extend(["-m", worker_model])
+    elif actual_binary == "copilot":
+        cmd = ["gh", "copilot", "-p", instruction,
+               "--output-format", "json",
+               "--no-ask-user"]
+        if worker_model:
+            cmd.extend(["--model", worker_model])
     else:
         cmd = ["claude", "-p", instruction,
                "--output-format", "stream-json", "--verbose",
@@ -2057,7 +2152,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         final_text, is_error, error_detail, changes_summary = _run_worker_headless(
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
-            is_codex=(actual_binary == "codex"), output_file=output_file,
+            is_codex=(actual_binary == "codex"), is_copilot=(actual_binary == "copilot"), output_file=output_file,
         )
         if output_file:
             try:
@@ -2465,10 +2560,11 @@ def main():
                 "português explicando o que você vai fazer e por quê. Nunca emita blocos de delegação sem "
                 "esse texto de intenção antes deles — é isso que o usuário vê enquanto o operário trabalha.\n"
                 "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
-                "<DELEGATE binary=\"claude\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
-                "Use binary=\"claude\" para codificação, binary=\"agy\" para pesquisa e análise rápida, "
-                "binary=\"deepseek\" quando o usuário pedir a visão específica do DeepSeek, ou "
-                "binary=\"codex\" quando o usuário pedir a visão específica do Codex (OpenAI).\n"
+                "<DELEGATE binary=\"implementador\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
+                "Use binary=\"implementador\" para codificação e refatoração pesada, "
+                "binary=\"pesquisador\" para pesquisa rápida e varredura de diretórios, "
+                "binary=\"arquiteto\" para revisão, arquitetura e segurança da informação, "
+                "binary=\"analista\" para problemas lógicos profundos e troubleshooting complexo.\n"
                 "Use binary=\"open-design\" para gerar uma PRÉVIA VISUAL de verdade — renderizada e navegável, "
                 "não uma descrição em texto nem uma imagem estática. Ele lê o projeto de verdade na pasta atual "
                 "(design system, componentes, paleta reais) e devolve uma prévia fiel ao visual já existente.\n\n"
@@ -2490,9 +2586,9 @@ def main():
                 "resultado do outro). Em vez disso, envolva os blocos <DELEGATE>, na ORDEM em que devem rodar, "
                 "dentro de um único bloco <PIPELINE>:\n"
                 "<PIPELINE>\n"
-                "<DELEGATE binary=\"agy\">(o que a 1ª etapa deve analisar)</DELEGATE>\n"
-                "<DELEGATE binary=\"deepseek\">(o que a 2ª etapa deve fazer)</DELEGATE>\n"
-                "<DELEGATE binary=\"claude\">(o que a 3ª etapa deve fazer)</DELEGATE>\n"
+                "<DELEGATE binary=\"pesquisador\">(o que a 1ª etapa deve analisar)</DELEGATE>\n"
+                "<DELEGATE binary=\"arquiteto\">(o que a 2ª etapa deve revisar)</DELEGATE>\n"
+                "<DELEGATE binary=\"implementador\">(o que a 3ª etapa deve implementar)</DELEGATE>\n"
                 "</PIPELINE>\n"
                 "Cada etapa roda só depois que a anterior termina, e recebe automaticamente o resultado da "
                 "etapa anterior como contexto — você não precisa (nem deve) copiar esse resultado na instrução, "
@@ -2672,14 +2768,35 @@ def main():
 
                     section = LiveSection(label, icon, color)
                     section.open()
-                    pending_workers.append((cmd, worker_env, output_file, label, icon, color, actual_binary, section, delegate_instruction))
+                    pending_workers.append((cmd, worker_env, output_file, label, icon, color, actual_binary, section, delegate_instruction, target_binary_tag))
 
-                def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, is_agy, chat_mode, detail, task_kind, is_codex=False, output_file=None, delegate_instruction=""):
+                def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, actual_binary, chat_mode, detail, task_kind, tag, config, output_file=None, delegate_instruction=""):
                     task_id = create_task(delegate_instruction, lbl)
+                    is_agy = actual_binary == "agy"
+                    is_codex = actual_binary == "codex"
+                    is_copilot = actual_binary == "copilot"
                     final_text, is_error, error_detail, changes_summary = _run_worker_headless(
                         w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
-                        is_codex=is_codex, output_file=output_file,
+                        is_codex=is_codex, is_copilot=is_copilot, output_file=output_file,
                     )
+                    
+                    if is_error and ("429" in (error_detail or "") or "credit" in (error_detail or "").lower() or "quota" in (error_detail or "").lower()):
+                        console.print(f"[bold yellow]⚠️ Failover Automático: {lbl} atingiu limite/erro. Tentando fallback...[/bold yellow]")
+                        # Simple fallback: if claude->copilot, deepseek->claude, codex->copilot, agy->copilot, copilot->claude
+                        fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude"}
+                        fb_bin = fb_map.get(actual_binary, "copilot")
+                        fb_worker = {"binary": fb_bin, "model": ""}
+                        fb_cmd, fb_env, fb_out = _build_worker_cmd(fb_worker, fb_bin, delegate_instruction)
+                        final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+                            fb_cmd, fb_env, get_project_dir(), section, fb_bin == "agy", detail=detail,
+                            is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"), output_file=fb_out,
+                        )
+                        if fb_out:
+                            try:
+                                os.unlink(fb_out)
+                            except OSError:
+                                pass
+
                     if output_file:
                         try:
                             os.unlink(output_file)
@@ -2731,7 +2848,7 @@ def main():
                     threading.Thread(
                         target=_worker_lifecycle,
                         args=(w_cmd, w_env, w_section, w_label, w_icon, w_color, w_binary == "agy", chat_mode, detail_level, _infer_task_kind(w_instruction)),
-                        kwargs={"is_codex": w_binary == "codex", "output_file": w_output_file},
+                        kwargs={"is_codex": w_binary == "codex", "is_copilot": w_binary == "copilot", "output_file": w_output_file, "delegate_instruction": w_instruction},
                         daemon=True
                     ).start()
 
