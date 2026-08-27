@@ -1637,6 +1637,10 @@ def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail:
 
 
 def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    """Processa uma linha de saída do `gh copilot -p`.
+    O Copilot retorna texto puro (não JSON), linha a linha.
+    Acumula o texto e atualiza a LiveSection ao vivo."""
+    # Tenta JSON primeiro (casos especiais do protocolo interno)
     try:
         data = json.loads(line)
         if "type" in data:
@@ -1645,13 +1649,25 @@ def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail
                 if delta:
                     state["final_text"] += delta
                     section.append_output(delta)
-            elif data["type"] == "assistant.message":
-                # Fallback if there is no delta but full text
-                pass
             elif data["type"] == "error":
                 state["is_error"] = True
+        return  # Era JSON válido, processado acima
     except json.JSONDecodeError:
         pass
+
+    # Texto puro — formato real que o `gh copilot -p` envia
+    # Ignora linhas de metadados como "AI Credits", "Tokens", "Resume", "Changes"
+    skip_prefixes = ("AI Credits", "Tokens", "Resume", "Changes ", "Log:", "\u25cf", "│", "└")
+    if line.startswith(skip_prefixes):
+        if detail == "full":
+            section.tool_call(line[:80])
+        return
+
+    # É conteúdo de resposta real
+    state["final_text"] += line + "\n"
+    if detail in ("normal", "full"):
+        section.append_output(line)
+
 
 def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
     """Processa uma linha de stream-json do `agy` e narra ao vivo na LiveSection
@@ -2095,8 +2111,10 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
         if worker_model:
             cmd.extend(["-m", worker_model])
     elif actual_binary == "copilot":
+        # gh copilot -p retorna texto puro por padrão.
+        # Não suporta --output-format json (flag só existe no Copilot agent CLI nativo,
+        # não no wrapper `gh copilot`). Usar sem essa flag e parsear como texto.
         cmd = ["gh", "copilot", "-p", instruction,
-               "--output-format", "json",
                "--no-ask-user"]
         if worker_model:
             cmd.extend(["--model", worker_model])
