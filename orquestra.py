@@ -2125,7 +2125,7 @@ def _run_copilot_watchdog():
         cmd = [
             "gh", "copilot", "-p",
             "Você é o Cão de Guarda do Orquestra. Execute `git status` e `git diff` (incluindo untracked files) para ver as modificações recentes. Analise-as procurando por BUGS ou lógicas erradas. Seja direto: se achar bug, reporte com clareza. Se estiver 100% perfeito, responda APENAS 'Tudo certo'.",
-            "--no-ask-user", "--model", "gpt-4o"
+            "--no-ask-user", "--model", "auto"
         ]
         try:
             res = subprocess.run(
