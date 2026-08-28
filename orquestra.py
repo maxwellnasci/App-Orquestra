@@ -1648,7 +1648,7 @@ def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail
                 delta = data.get("data", {}).get("delta", "")
                 if delta:
                     state["final_text"] += delta
-                    section.append_output(delta)
+                    section.write(delta, end="")
             elif data["type"] == "error":
                 state["is_error"] = True
         return  # Era JSON válido, processado acima
@@ -1666,7 +1666,7 @@ def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail
     # É conteúdo de resposta real
     state["final_text"] += line + "\n"
     if detail in ("normal", "full"):
-        section.append_output(line)
+        section.write(line)
 
 
 def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
@@ -2897,11 +2897,11 @@ def main():
                 # Só agora, com todos os cabeçalhos das seções já abertos juntos
                 # (passo acima), disparamos as threads que efetivamente rodam
                 # os workers — efeito de "pilha declarada de uma vez".
-                for w_cmd, w_env, w_output_file, w_label, w_icon, w_color, w_binary, w_section, w_instruction in pending_workers:
+                for w_cmd, w_env, w_output_file, w_label, w_icon, w_color, w_binary, w_section, w_instruction, w_tag in pending_workers:
                     threading.Thread(
                         target=_worker_lifecycle,
-                        args=(w_cmd, w_env, w_section, w_label, w_icon, w_color, w_binary == "agy", chat_mode, detail_level, _infer_task_kind(w_instruction)),
-                        kwargs={"is_codex": w_binary == "codex", "is_copilot": w_binary == "copilot", "output_file": w_output_file, "delegate_instruction": w_instruction},
+                        args=(w_cmd, w_env, w_section, w_label, w_icon, w_color, w_binary, chat_mode, detail_level, _infer_task_kind(w_instruction), w_tag, config),
+                        kwargs={"output_file": w_output_file, "delegate_instruction": w_instruction},
                         daemon=True
                     ).start()
 
