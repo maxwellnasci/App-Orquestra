@@ -1723,40 +1723,122 @@ class LiveSection:
 
 
 
+# ── Orquestra Bridge Server ────────────────────────────────────────────────
+# Micro servidor HTTP que roda em background dentro do próprio Orquestra.
+# Resolve o problema de extensões do Cursor não carregarem por falta de
+# assinatura. Agora o Orquestra é o servidor e chama o CLI do Cursor.
+
+_BRIDGE_PORT = 49152
+_bridge_server_thread = None
+
+def _start_bridge_server():
+    """Inicia o servidor bridge HTTP em uma thread daemon."""
+    global _bridge_server_thread
+    if _bridge_server_thread and _bridge_server_thread.is_alive():
+        return
+
+    import http.server
+    import socketserver
+
+    class BridgeHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass  # Silencia logs HTTP
+
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'Orquestra Bridge Active')
+
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
+            try:
+                payload = json.loads(body)
+                action = payload.get('action')
+                cursor_bin = shutil.which('cursor')
+                if not cursor_bin:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+
+                if action == 'diff':
+                    f1 = payload.get('file1', '')
+                    f2 = payload.get('file2', '')
+                    # Grava um arquivo .diff legível e abre no Cursor
+                    result = subprocess.run(
+                        ['diff', '-u', f1, f2],
+                        capture_output=True, text=True
+                    )
+                    diff_path = Path(tempfile.gettempdir()) / 'orquestra_review.diff'
+                    diff_path.write_text(result.stdout or '(sem diferenças)', encoding='utf-8')
+                    subprocess.Popen(
+                        [cursor_bin, str(diff_path)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                elif action == 'open':
+                    fp = payload.get('file', '')
+                    subprocess.Popen(
+                        [cursor_bin, fp],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'OK')
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+
+    def _run():
+        try:
+            with socketserver.TCPServer(('127.0.0.1', _BRIDGE_PORT), BridgeHandler) as httpd:
+                httpd.serve_forever()
+        except OSError:
+            pass  # Porta já em uso (outra instância rodando)
+
+    _bridge_server_thread = threading.Thread(target=_run, daemon=True, name='orquestra-bridge')
+    _bridge_server_thread.start()
+
+
 def _auto_open_in_cursor(file_paths: list[str], cwd=None):
-    """Abre arquivos no editor Cursor, usando a Bridge Nativa HTTP se disponível, ou fallback para CLI."""
+    """Abre arquivos no Cursor via Bridge HTTP local (porta 49152), com fallback para CLI."""
     if not file_paths: return
-    
+
     payload = None
     if file_paths[0] == "-d" and len(file_paths) >= 3:
         payload = {"action": "diff", "file1": file_paths[1], "file2": file_paths[2]}
-    elif file_paths[0] != "-d":
+    else:
         fp = file_paths[0]
         if cwd and not os.path.isabs(fp) and fp != ".":
             fp = os.path.join(cwd, fp)
-        # Se for ".", a bridge "open" com o dir atual abrirá o workspace
         if fp == ".":
             fp = cwd or os.getcwd()
         payload = {"action": "open", "file": fp}
-        
+
     if payload:
         try:
             req = urllib.request.Request(
-                "http://127.0.0.1:49152", 
+                f"http://127.0.0.1:{_BRIDGE_PORT}",
                 data=json.dumps(payload).encode('utf-8'),
                 headers={'Content-Type': 'application/json'},
                 method='POST'
             )
-            with urllib.request.urlopen(req, timeout=1.0) as response:
-                if response.status == 200:
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                if resp.status == 200:
                     return
         except Exception:
             pass
 
+    # Fallback: CLI direta
     if not shutil.which("cursor"):
         return
     try:
-        subprocess.Popen(["cursor"] + file_paths, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["cursor"] + file_paths, cwd=cwd,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
@@ -2465,6 +2547,9 @@ def main():
     global _last_plan
     config = load_config()
     _init_memory_db()
+
+    # Sobe o servidor bridge ANTES de qualquer chamada a _auto_open_in_cursor
+    _start_bridge_server()
 
     # Cria ou limpa o arquivo de log do projeto
     log_path = Path(get_project_dir()) / LOG_FILE_NAME
