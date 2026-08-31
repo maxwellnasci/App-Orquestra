@@ -49,17 +49,17 @@ def _get_salt_path(project_dir: str) -> Path:
 
 
 def _update_gitignore(project_dir: str):
-    """Garante que o .orquestra_vault e o salt nunca sejam enviados ao Git."""
+    """Adiciona as entradas necessárias ao .gitignore do projeto se não existirem."""
     gitignore = Path(project_dir) / ".gitignore"
     existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    added = []
-    for entry in GITIGNORE_ENTRIES:
-        if entry not in existing:
-            added.append(entry)
-    if added:
+    
+    entries = [".orquestra_vault", ".orquestra_salt", ".orquestra_logs.md"]
+    to_add = [e for e in entries if e not in existing]
+    
+    if to_add:
         with open(gitignore, "a", encoding="utf-8") as f:
-            f.write("\n# Orquestra — arquivos de segurança (nunca enviar ao Git)\n")
-            for entry in added:
+            f.write("\n# Orquestra\n")
+            for entry in to_add:
                 f.write(f"{entry}\n")
 
 

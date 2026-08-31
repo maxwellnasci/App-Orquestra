@@ -130,11 +130,9 @@ DEFAULT_CONFIG = {
             "label": "Operário Codex",
             "description": "Abertura no painel lateral via Codex CLI (OpenAI)"
         }
-    },
-    "ui": {
-        "mode": "tecnico"
     }
 }
+
 
 console = Console()
 
@@ -143,6 +141,17 @@ console = Console()
 # no meio — sem isso, deltas de texto de dois operários podem se entrelaçar
 # caractere a caractere na tela.
 _console_lock = threading.RLock()
+
+# Arquivo de log para o "Modo Cursor" (Terminal Limpo)
+LOG_FILE_NAME = ".orquestra_logs.md"
+_log_lock = threading.RLock()
+
+def _append_log(text: str):
+    """Escreve texto no arquivo de log de forma thread-safe."""
+    log_path = Path(get_project_dir()) / LOG_FILE_NAME
+    with _log_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(text)
 
 # Último plano gerado pelo Orquestrador (exibido via /plano)
 _last_plan: str = ""
@@ -1520,6 +1529,11 @@ def _auto_open_images(text: str):
         console.print(f"[dim]🖼  Abrindo imagem(ns) no visualizador: {', '.join(opened)}[/dim]")
 
 
+def _detail_level(config: dict) -> str:
+    """Nível de verbosidade fixo em normal para o modo Cursor."""
+    return "normal"
+
+
 # ─────────────────────────────────────────────────────────
 # Modo chat — renderização limpa (bolhas), sem narração técnica
 # ─────────────────────────────────────────────────────────
@@ -1557,25 +1571,6 @@ def _print_chat_bubble(label: str, icon: str, color: str, text: str):
         console.print()
 
 
-def _detail_level(config: dict) -> str:
-    """minimal | normal | full — nível de detalhe do streaming ao vivo de um
-    operário. Substitui o antigo binário quiet/chat_mode: em NENHUM nível o
-    operário fica em silêncio total (minimal ainda mostra o texto sendo
-    gerado ao vivo, só omite tool calls). `ui.detail`, se presente, manda;
-    senão mapeia o `ui.mode` legado pra manter compatibilidade com configs
-    já existentes (chat→minimal, tecnico→full)."""
-    ui = config.get("ui", {})
-    detail = ui.get("detail")
-    if detail in ("minimal", "normal", "full"):
-        return detail
-    mode = ui.get("mode", "tecnico")
-    if mode == "chat":
-        return "minimal"
-    if mode == "tecnico":
-        return "full"
-    return "normal"
-
-
 class LiveSection:
     """Uma seção de trabalho de um operário, impressa de forma incremental
     (append-only) no MESMO terminal — nunca abre pane/janela nova. Simula o
@@ -1590,56 +1585,40 @@ class LiveSection:
         self.label = label
         self.icon = icon
         self.color = color
-        self._line_open = False
         self._start = None
 
     def open(self):
         self._start = time.time()
         with _console_lock:
-            console.print(f"[{self.color}]⏺[/{self.color}] [bold {self.color}]{self.icon} {self.label}[/bold {self.color}]")
+            console.print(f"[{self.color}]⏳[/{self.color}] [bold {self.color}]{self.icon} {self.label}[/bold {self.color}] (trabalhando...)")
+        _append_log(f"\n## {self.icon} {self.label}\n\n")
 
     def end_line(self):
-        """Fecha uma linha de streaming em andamento (delta sem \\n no final),
-        se houver uma aberta. Idempotente."""
-        with _console_lock:
-            if self._line_open:
-                console.print()
-                self._line_open = False
+        pass
 
     def write(self, text: str, end: str = "\n", prefix: bool = True):
-        """Escreve texto vindo do operário (fala/delta), indentado sob o
-        marcador ⏺ da seção — sem repetir ícone/label a cada parágrafo (estilo
-        Claude Code/OpenCode: um cabeçalho, depois o texto flui liso, sem
-        caixa). Com end="", acumula na mesma linha (streaming token-a-token)."""
         if not text:
             return
-        with _console_lock:
-            if prefix and not self._line_open:
-                console.print("  ", end="")
-            console.print(text, end=end)
-            self._line_open = (end == "")
+        _append_log(text + end)
 
     def tool_call(self, text: str):
-        """Anúncio de 1 linha pra uma chamada de ferramenta/passo (nível
-        normal/full) ou erro (sempre, em qualquer nível — erro nunca é
-        escondido). Formato "⎿" combina com o marcador ⏺ do open()."""
-        self.end_line()
         with _console_lock:
             console.print(f"  [dim]⎿ {text}[/dim]")
+        _append_log(f"\n> ⎿ {text}\n\n")
 
     def close(self, ok: bool, error_detail: str = "", changes_summary: str = ""):
         elapsed = time.time() - self._start if self._start else 0.0
-        self.end_line()
         with _console_lock:
             if ok:
                 console.print(f"  [dim green]⎿ ✓ concluído em {elapsed:.0f}s[/dim green]")
             else:
-                console.print(f"  [dim red]⎿ ✗ erro[/dim red]")
+                console.print(f"  [dim red]⎿ ✗ erro ({elapsed:.0f}s)[/dim red]")
                 if error_detail:
                     console.print(f"    [dim]{error_detail[-1500:]}[/dim]")
             if changes_summary:
                 console.print(f"  [dim]⎿ 📝 {changes_summary}[/dim]")
-        console.print()
+        _append_log(f"\n\n**✓ Concluído em {elapsed:.0f}s**\n---\n")
+
 
 
 def _auto_open_links(text: str):
@@ -2225,8 +2204,6 @@ def _run_copilot_watchdog():
         except Exception:
             pass # Falhas de timeout ou erro de binário são silenciosas no watchdog
 
-    threading.Thread(target=_watchdog_thread, daemon=True).start()
-
 def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
     """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
     orquestrador): a resposta de cada etapa vira contexto pra próxima instrução,
@@ -2348,6 +2325,10 @@ def main():
     global _last_plan
     config = load_config()
     _init_memory_db()
+
+    # Cria ou limpa o arquivo de log do projeto
+    log_path = Path(get_project_dir()) / LOG_FILE_NAME
+    log_path.write_text("# Orquestra — Logs de Execução ao Vivo\n\nAbra este arquivo ao lado do seu terminal para ver os agentes trabalhando.\n\n", encoding="utf-8")
 
     print_banner()
 
@@ -2486,6 +2467,7 @@ def main():
                 console.print("[dim]Nenhum plano gerado ainda. Peça ao Orquestrador para planejar uma tarefa.[/dim]")
 
         elif low == "/tarefas":
+
             recent = get_recent_tasks()
             if not recent:
                 console.print("[dim]Nenhuma tarefa recente.[/dim]")
