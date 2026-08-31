@@ -157,15 +157,45 @@ def _append_log(text: str):
 _last_plan: str = ""
 
 
-def show_plan_viewer(plan_text: str) -> None:
-    """Exibe o plano em tela cheia no terminal. Fecha com ESC ou Enter."""
+_PLAN_STEP_RE = re.compile(
+    r'^\s*(?:\d+[\.\):]?\s*)?([A-Za-zÀ-ÿ_-]+)\s*(?:→|->|-|:)\s*(.+)$'
+)
+
+# Rich usa nomes de cor "puros" (cyan, blue...); o prompt_toolkit HTML() aceita
+# o prefixo ansi* garantido em qualquer terminal (8 cores padrão), sem depender
+# de suporte a truecolor — mantém a paleta idêntica à usada no resto do app
+# (_WORKER_TAG_DEFAULTS/config workers) sem risco de cor não reconhecida.
+_ANSI_COLOR_MAP = {
+    "cyan": "ansicyan", "blue": "ansiblue", "yellow": "ansiyellow",
+    "green": "ansigreen", "magenta": "ansimagenta", "red": "ansired",
+    "white": "ansiwhite",
+}
+
+
+def _model_label(worker: dict) -> str:
+    return worker.get("model") or worker.get("binary") or "padrão"
+
+
+def show_plan_viewer(plan_text: str, config: dict = None) -> None:
+    """Exibe o plano em tela cheia no terminal. Fecha com ESC, Enter ou Q.
+
+    Cada linha do plano ("N. papel → descrição") é interpretada e renderizada
+    com o mesmo ícone/cor/rótulo usados no resto do app para aquele papel
+    (via _resolve_worker), mais o modelo real configurado pra ele — assim o
+    usuário aprende, só de ler o plano, qual motor faz cada etapa antes de
+    aprovar. Linha que não bater com o formato esperado cai num fallback
+    (texto simples), pra nunca sumir conteúdo se o Orquestrador fugir do
+    padrão pedido no prompt."""
     from prompt_toolkit import Application
     from prompt_toolkit.layout import Layout
-    from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
+    from prompt_toolkit.layout.containers import Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.formatted_text import HTML
     import shutil
+    import html as html_mod
+
+    config = config or {}
 
     kb = KeyBindings()
 
@@ -176,37 +206,52 @@ def show_plan_viewer(plan_text: str) -> None:
     def _exit(event):
         event.app.exit()
 
-    # Monta o conteúdo formatado
     term_width = shutil.get_terminal_size((80, 24)).columns
-    separator = "─" * (term_width - 2)
+    separator = "─" * min(term_width - 2, 78)
 
-    lines_raw = plan_text.strip().splitlines()
-    body_lines = []
-    for line in lines_raw:
-        # Numeradas automaticamente se começar com dígito
-        stripped = line.strip()
-        if stripped:
-            body_lines.append(f"  {stripped}")
+    parts = [
+        "\n",
+        '  <b><style fg="ansicyan">📋  Plano de Execução</style></b>\n',
+        f'  <style fg="ansiwhite">{separator}</style>\n',
+        "\n",
+    ]
+
+    steps = []
+    for raw_line in plan_text.strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = _PLAN_STEP_RE.match(line)
+        if m:
+            steps.append(("step", m.group(1), m.group(2).strip()))
         else:
-            body_lines.append("")
+            steps.append(("raw", None, line))
 
-    body = "\n".join(body_lines)
+    for idx, (kind, tag, text) in enumerate(steps):
+        if idx > 0:
+            parts.append('  <style fg="ansiwhite">↓</style>\n')
+        if kind == "step":
+            worker, _binary, label, icon, color = _resolve_worker(config, tag.lower())
+            ansi_color = _ANSI_COLOR_MAP.get(color, "ansiwhite")
+            modelo = html_mod.escape(_model_label(worker))
+            desc = html_mod.escape(text)
+            parts.append(
+                f'  {icon}  <b><style fg="{ansi_color}">{label.upper()}</style></b>'
+                f'  <style fg="ansiwhite">·  {modelo}</style>\n'
+            )
+            parts.append(f'      {desc}\n\n')
+        else:
+            parts.append(f'  <style fg="ansiwhite">{html_mod.escape(text)}</style>\n')
 
-    content_text = (
-        f"\n"
-        f"  \u001b[1m\u001b[36m\U0001f4cb  Plano de Execução\u001b[0m\n"
-        f"  \u001b[2m{separator}\u001b[0m\n"
-        f"\n"
-        f"{body}\n"
-        f"\n"
-        f"  \u001b[2m{separator}\u001b[0m\n"
-        f"  \u001b[2m[ Enter ou ESC para fechar e voltar ao chat ]\u001b[0m\n"
-    )
+    parts.append(f'  <style fg="ansiwhite">{separator}</style>\n')
+    parts.append('  <style fg="ansiwhite">[ Enter ou ESC para fechar e voltar ao chat ]</style>\n')
+
+    content_text = "".join(parts)
 
     app = Application(
         layout=Layout(
             Window(
-                content=FormattedTextControl(text=content_text),
+                content=FormattedTextControl(text=HTML(content_text)),
                 wrap_lines=True,
             )
         ),
@@ -354,6 +399,16 @@ def _init_memory_db():
                     updated_at TEXT NOT NULL
                 )
             """)
+            # Migração: coluna com o snapshot do `git status --porcelain` ANTES
+            # do operário rodar. É o que permite /rejeitar isolar o rollback só
+            # nos arquivos desta tarefa em vez de arrasar a árvore inteira —
+            # ver _git_status_paths()/get_pending_tasks() e os handlers de
+            # /aprovar e /rejeitar mais abaixo.
+            try:
+                conn.execute("ALTER TABLE tasks ADD COLUMN pre_snapshot TEXT")
+                conn.commit()
+            except sqlite3.OperationalError:
+                pass  # coluna já existe (banco de uma sessão anterior)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS lessons (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -391,7 +446,7 @@ _TASK_KIND_KEYWORDS = {
 }
 
 
-def create_task(title: str, agent: str) -> int:
+def create_task(title: str, agent: str, pre_snapshot: str = None) -> int:
     pid = get_project_id()
     import datetime
     now = datetime.datetime.now().isoformat()
@@ -399,8 +454,8 @@ def create_task(title: str, agent: str) -> int:
         conn = sqlite3.connect(MEMORY_DB_FILE)
         try:
             cursor = conn.execute(
-                "INSERT INTO tasks (project_id, title, agent, status, result, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pid, title, agent, "⏳ Em execução", None, now, now)
+                "INSERT INTO tasks (project_id, title, agent, status, result, created_at, updated_at, pre_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (pid, title, agent, "⏳ Em execução", None, now, now, pre_snapshot)
             )
             conn.commit()
             return cursor.lastrowid
@@ -451,6 +506,53 @@ def get_task(task_id: int) -> dict:
             return dict(row) if row else None
         finally:
             conn.close()
+
+
+def get_pending_tasks() -> list:
+    """Tarefas do projeto atual com status 'Aguardando Aprovação' — usado por
+    /rejeitar para detectar tarefas irmãs (ex.: outra etapa de um mesmo
+    <PIPELINE>, ou outro <DELEGATE> paralelo) que também tocaram a árvore
+    e seriam destruídas por um git reset --hard cego."""
+    pid = get_project_id()
+    with _memory_db_lock:
+        conn = sqlite3.connect(MEMORY_DB_FILE)
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND status = ? ORDER BY id",
+                (pid, "⚠️ Aguardando Aprovação")
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+
+def _git_status_paths(cwd: str) -> set:
+    """Conjunto de caminhos com mudanças segundo `git status --porcelain`
+    (staged, unstaged e untracked). Base do snapshot antes/depois que permite
+    /aprovar e /rejeitar agirem só nos arquivos de UMA tarefa, em vez de
+    'git add .' / 'git reset --hard' na árvore inteira (que arrastaria junto
+    qualquer edição manual do usuário ou de outra tarefa ainda pendente)."""
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=cwd,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return set()
+    if res.returncode != 0:
+        return set()
+    paths = set()
+    for line in res.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:  # renome: "old -> new"
+            path = path.split(" -> ", 1)[1].strip()
+        path = path.strip('"')
+        if path:
+            paths.add(path)
+    return paths
 
 def _infer_task_kind(instruction: str) -> str:
     """Heurística simples por palavra-chave, sem chamada de LLM e sem mexer no
@@ -1621,12 +1723,12 @@ class LiveSection:
 
 
 
-def _auto_open_in_cursor(file_paths: list[str]):
+def _auto_open_in_cursor(file_paths: list[str], cwd=None):
     """Abre arquivos no editor Cursor, se instalado, sem travar o terminal."""
     if not shutil.which("cursor"):
         return
     try:
-        subprocess.Popen(["cursor"] + file_paths, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["cursor"] + file_paths, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
@@ -2247,7 +2349,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         section = LiveSection(label, icon, color)
         section.open()
         
-        task_id = create_task(instruction, label)
+        pre_snapshot = "\n".join(sorted(_git_status_paths(get_project_dir())))
+        task_id = create_task(instruction, label, pre_snapshot=pre_snapshot)
         final_text, is_error, error_detail, changes_summary = _run_worker_headless(
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
@@ -2345,13 +2448,22 @@ def main():
     print_banner()
 
     # ── Cofre de Segurança ──────────────────────────────────
-    _vault = VaultManager(get_project_dir())
-    if _vault.needs_setup():
-        _vault.setup_wizard()
-    else:
-        _vault.unlock_interactive()
-    # Injeta credenciais salvas como variáveis de ambiente da sessão
-    _vault.inject_env()
+    # VaultManager() levanta RuntimeError se 'cryptography' não estiver
+    # instalado — sem este try/except o Orquestra nem chegava a abrir
+    # (traceback cru) num ambiente que só não tinha essa dependência opcional.
+    _vault = None
+    try:
+        _vault = VaultManager(get_project_dir())
+        if _vault.needs_setup():
+            _vault.setup_wizard()
+        else:
+            _vault.unlock_interactive()
+        # Injeta credenciais salvas como variáveis de ambiente da sessão
+        _vault.inject_env()
+    except RuntimeError as e:
+        console.print(f"[bold red]⚠ Cofre de credenciais indisponível: {e}[/bold red]")
+        console.print("[dim]Continuando sem o cofre nesta sessão (comandos /senha* ficam desativados).[/dim]\n")
+        _vault = None
     # ────────────────────────────────────────────────────────
 
     orch = config.get("roles", {}).get("orquestrador", {})
@@ -2450,7 +2562,7 @@ def main():
         low = raw.lower()
 
         # ── Cofre de Segurança: intercepta /senha antes de qualquer agente ──
-        vault_resp = _vault.handle_command(raw)
+        vault_resp = _vault.handle_command(raw) if _vault else None
         if vault_resp is not None:
             # Apaga o comando do histórico do terminal (contém valor sensível)
             try:
@@ -2474,7 +2586,7 @@ def main():
 
         elif low == "/plano":
             if _last_plan:
-                show_plan_viewer(_last_plan)
+                show_plan_viewer(_last_plan, config)
             else:
                 console.print("[dim]Nenhum plano gerado ainda. Peça ao Orquestrador para planejar uma tarefa.[/dim]")
 
@@ -2502,10 +2614,22 @@ def main():
                     tid = int(parts[1])
                     task = get_task(tid)
                     if task and task['status'] == "⚠️ Aguardando Aprovação":
-                        subprocess.run(["git", "add", "."], cwd=get_project_dir(), capture_output=True)
-                        subprocess.run(["git", "commit", "-m", f"Orquestra: Tarefa #{tid} aprovada"], cwd=get_project_dir(), capture_output=True)
-                        update_task_status(tid, "✅ Aprovado (Commitado)", task['result'])
-                        console.print(f"[bold green]Tarefa #{tid} aprovada e salva no Git![/bold green]")
+                        # Comita só os arquivos que mudaram DEPOIS do snapshot desta
+                        # tarefa — nunca "git add .", que arrastaria junto qualquer
+                        # edição manual do usuário ou de outra tarefa ainda pendente
+                        # no mesmo repositório (ex.: outra etapa de PIPELINE, ou um
+                        # <DELEGATE> paralelo) pro mesmo commit.
+                        pre_paths = set((task.get('pre_snapshot') or "").splitlines())
+                        pre_paths.discard("")
+                        touched = _git_status_paths(get_project_dir()) - pre_paths
+                        if touched:
+                            subprocess.run(["git", "add", "--"] + sorted(touched), cwd=get_project_dir(), capture_output=True)
+                            subprocess.run(["git", "commit", "-m", f"Orquestra: Tarefa #{tid} aprovada"], cwd=get_project_dir(), capture_output=True)
+                            update_task_status(tid, "✅ Aprovado (Commitado)", task['result'])
+                            console.print(f"[bold green]Tarefa #{tid} aprovada e salva no Git![/bold green]")
+                        else:
+                            update_task_status(tid, "✅ Aprovado (sem mudanças novas)", task['result'])
+                            console.print(f"[yellow]Tarefa #{tid}: nenhuma mudança nova detectada desde o início da tarefa (pode já ter sido commitada).[/yellow]")
                     else:
                         console.print(f"[red]Tarefa #{tid} não está aguardando aprovação.[/red]")
                 except ValueError:
@@ -2520,10 +2644,33 @@ def main():
                     tid = int(parts[1])
                     task = get_task(tid)
                     if task and task['status'] == "⚠️ Aguardando Aprovação":
-                        subprocess.run(["git", "reset", "--hard"], cwd=get_project_dir(), capture_output=True)
-                        subprocess.run(["git", "clean", "-fd"], cwd=get_project_dir(), capture_output=True)
-                        update_task_status(tid, "❌ Rejeitado (Rollback)", task['result'])
-                        console.print(f"[bold red]Mudanças da Tarefa #{tid} revertidas com sucesso![/bold red]")
+                        # Rede de segurança: git reset --hard/clean -fd atinge a árvore
+                        # INTEIRA, não só os arquivos desta tarefa. Antes disso existia,
+                        # rejeitar uma tarefa também apagava qualquer edição manual do
+                        # usuário e qualquer outra tarefa/etapa de pipeline ainda
+                        # pendente no mesmo repositório — perda de trabalho silenciosa.
+                        pre_paths = set((task.get('pre_snapshot') or "").splitlines())
+                        pre_paths.discard("")
+                        other_pending = [t for t in get_pending_tasks() if t['id'] != tid]
+                        if pre_paths:
+                            console.print(
+                                f"[bold red]✗ Não posso reverter a Tarefa #{tid} com segurança: já havia "
+                                f"{len(pre_paths)} arquivo(s) modificado(s) ANTES dela rodar (edição manual sua ou "
+                                f"de outra tarefa). Um reset apagaria esse trabalho também. Reverta manualmente "
+                                f"com git (ex.: git diff / git checkout -- <arquivo>) escolhendo só o que quer descartar.[/bold red]"
+                            )
+                        elif other_pending:
+                            ids = ", ".join(f"#{t['id']}" for t in other_pending)
+                            console.print(
+                                f"[bold red]✗ Existe(m) outra(s) tarefa(s) aguardando aprovação no mesmo repositório "
+                                f"({ids}) — um reset apagaria o trabalho delas também. Resolva-as primeiro "
+                                f"(/aprovar ou /rejeitar) e só então rejeite a #{tid}.[/bold red]"
+                            )
+                        else:
+                            subprocess.run(["git", "reset", "--hard"], cwd=get_project_dir(), capture_output=True)
+                            subprocess.run(["git", "clean", "-fd"], cwd=get_project_dir(), capture_output=True)
+                            update_task_status(tid, "❌ Rejeitado (Rollback)", task['result'])
+                            console.print(f"[bold red]Mudanças da Tarefa #{tid} revertidas com sucesso![/bold red]")
                     else:
                         console.print(f"[red]Tarefa #{tid} não está aguardando aprovação.[/red]")
                 except ValueError:
@@ -2637,6 +2784,38 @@ def main():
             console.print("[dim]Abrindo projeto no Cursor...[/dim]")
             _auto_open_in_cursor(["."])
             
+        elif low.startswith("/diff"):
+            parts = low.split()
+            if len(parts) > 1:
+                try:
+                    tid = int(parts[1])
+                    task = get_task(tid)
+                    if task and task['status'] == "⚠️ Aguardando Aprovação":
+                        pre_paths = set((task.get('pre_snapshot') or "").splitlines())
+                        pre_paths.discard("")
+                        touched = list(_git_status_paths(get_project_dir()) - pre_paths)
+                        if touched:
+                            console.print(f"[dim]Abrindo diff de {len(touched)} arquivo(s)...[/dim]")
+                            for f in touched[:3]:
+                                f_path = Path(get_project_dir()) / f
+                                if not f_path.exists(): continue
+                                tmp_old = Path(tempfile.gettempdir()) / f"orq_old_{f_path.name}"
+                                res = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=get_project_dir(), capture_output=True)
+                                if res.returncode == 0:
+                                    tmp_old.write_bytes(res.stdout)
+                                    _auto_open_in_cursor(["-d", str(tmp_old), f], cwd=get_project_dir())
+                                else:
+                                    _auto_open_in_cursor([f], cwd=get_project_dir())
+                        else:
+                            console.print("[dim]Nenhum arquivo modificado nesta tarefa.[/dim]")
+                    else:
+                        console.print(f"[red]Tarefa #{tid} não encontrada ou não está pendente.[/red]")
+                except ValueError:
+                    console.print("[red]ID inválido.[/red]")
+            else:
+                console.print("[red]Uso: /diff [numero_tarefa][/red]")
+                
+
         elif low in ("/historico", "/history"):
             active_role = config.get("active_role", "")
             info = config.get("roles", {}).get(active_role, {})
@@ -2825,7 +3004,7 @@ def main():
                 # Mostra notificação limpa no chat e abre o visualizador automaticamente
                 console.print("\n[bold cyan]\U0001f4cb Plano criado — abrindo visualizador...[/bold cyan]")
                 console.print("[dim]  (use /plano para rever a qualquer momento)[/dim]\n")
-                show_plan_viewer(_last_plan)
+                show_plan_viewer(_last_plan, config)
             # ───────────────────────────────────────────────────────
 
             # Busca blocos <PIPELINE> primeiro (cadeias sequenciais) e tira eles
@@ -2947,7 +3126,8 @@ def main():
                     pending_workers.append((cmd, worker_env, output_file, label, icon, color, actual_binary, section, delegate_instruction, target_binary_tag))
 
                 def _worker_lifecycle(w_cmd, w_env, section, lbl, ic, col, actual_binary, chat_mode, detail, task_kind, tag, config, output_file=None, delegate_instruction=""):
-                    task_id = create_task(delegate_instruction, lbl)
+                    pre_snapshot = "\n".join(sorted(_git_status_paths(get_project_dir())))
+                    task_id = create_task(delegate_instruction, lbl, pre_snapshot=pre_snapshot)
                     is_agy = actual_binary == "agy"
                     is_codex = actual_binary == "codex"
                     is_copilot = actual_binary == "copilot"
@@ -2979,7 +3159,15 @@ def main():
                         except OSError:
                             pass
                     
-                    
+                    post_snapshot_set = _git_status_paths(get_project_dir())
+                    pre_snapshot_set = set(pre_snapshot.split('\n')) if pre_snapshot else set()
+                    modified_files = list(post_snapshot_set - pre_snapshot_set)
+                    if modified_files and not is_error:
+                        # Abre os arquivos modificados na tela do Cursor para o usuário ver
+                        for mf in modified_files[:3]:
+                            _auto_open_in_cursor([mf], cwd=get_project_dir())
+
+
                     if not is_error and changes_summary:
                         new_status = "⚠️ Aguardando Aprovação"
                         _run_copilot_watchdog()
