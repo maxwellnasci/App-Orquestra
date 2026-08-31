@@ -1780,10 +1780,23 @@ def _start_bridge_server():
                     )
                 elif action == 'open':
                     fp = payload.get('file', '')
-                    subprocess.Popen(
-                        [cursor_bin, fp],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                    )
+                    line = payload.get('line', 0)
+                    # Atualiza estado (Retrovisor)
+                    try:
+                        state_file = Path.home() / '.orquestra_cursor_state.json'
+                        state_file.write_text(json.dumps({'file': fp, 'line': line}), encoding='utf-8')
+                    except Exception:
+                        pass
+                    if line and line > 0:
+                        subprocess.Popen(
+                            [cursor_bin, '-g', f'{fp}:{line}'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                    else:
+                        subprocess.Popen(
+                            [cursor_bin, fp],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
 
                 self.send_response(200)
                 self.end_headers()
@@ -1841,6 +1854,49 @@ def _auto_open_in_cursor(file_paths: list[str], cwd=None):
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def _auto_open_in_cursor_at(filepath: str, line: int = 1):
+    """Abre um arquivo no Cursor e navega direto para a linha especificada (GPS)."""
+    payload = {"action": "open", "file": filepath, "line": line}
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{_BRIDGE_PORT}",
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=1.0) as resp:
+            if resp.status == 200:
+                return
+    except Exception:
+        pass
+    # Fallback CLI
+    cursor_bin = shutil.which('cursor')
+    if cursor_bin:
+        try:
+            subprocess.Popen(
+                [cursor_bin, '-g', f'{filepath}:{line}'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except OSError:
+            pass
+
+
+def _get_cursor_context() -> dict:
+    """Retrovisor: lê o arquivo e linha que o usuário está olhando no Cursor agora.
+
+    Retorna dict com 'file' e 'line', ou dict vazio se não souber.
+    """
+    try:
+        state_file = Path.home() / '.orquestra_cursor_state.json'
+        if state_file.exists():
+            data = json.loads(state_file.read_text(encoding='utf-8'))
+            return data
+    except Exception:
+        pass
+    return {}
+
 
 def _auto_open_links(text: str):
     """Modo chat: abre a prévia (última URL do texto — open_design_run_task sempre
@@ -2672,6 +2728,29 @@ def main():
         if injected_context:
             raw = raw + injected_context
 
+        # ── Câmbio Automático: injeta contexto do arquivo aberto no Cursor ────────
+        # Se o usuário não referenciou @arquivo nenhum, mas tem um arquivo aberto
+        # no Cursor, injetamos silenciosamente como contexto de fundo.
+        # Isso permite perguntas como "o que essa função faz?" sem precisar digitar @arquivo.
+        if not file_matches:
+            cursor_ctx = _get_cursor_context()
+            if cursor_ctx.get('file') and os.path.isfile(cursor_ctx['file']):
+                try:
+                    with open(cursor_ctx['file'], 'r', encoding='utf-8', errors='ignore') as _cf:
+                        _ctx_text = _cf.read()
+                    _ctx_fname = os.path.basename(cursor_ctx['file'])
+                    _ctx_line = cursor_ctx.get('line', 0)
+                    _ctx_note = f" (cursor na linha {_ctx_line})" if _ctx_line else ""
+                    raw = (
+                        raw
+                        + f"\n\n--- Arquivo aberto no Cursor{_ctx_note}: {cursor_ctx['file']} ---\n"
+                        + _ctx_text
+                        + "\n--- fim do contexto automático ---"
+                    )
+                    console.print(f"[dim]🔭 Contexto automático: {_ctx_fname}{_ctx_note}[/dim]")
+                except Exception:
+                    pass
+
         low = raw.lower()
 
         # ── Cofre de Segurança: intercepta /senha antes de qualquer agente ──
@@ -3276,9 +3355,26 @@ def main():
                     pre_snapshot_set = set(pre_snapshot.split('\n')) if pre_snapshot else set()
                     modified_files = list(post_snapshot_set - pre_snapshot_set)
                     if modified_files and not is_error:
-                        # Abre os arquivos modificados na tela do Cursor para o usuário ver
+                        # GPS: descobre a primeira linha modificada de cada arquivo
                         for mf in modified_files[:3]:
-                            _auto_open_in_cursor([mf], cwd=get_project_dir())
+                            mf_abs = str(Path(get_project_dir()) / mf)
+                            first_line = 1
+                            try:
+                                diff_out = subprocess.run(
+                                    ['git', 'diff', 'HEAD', '--', mf],
+                                    cwd=get_project_dir(), capture_output=True, text=True
+                                ).stdout
+                                for dl in diff_out.splitlines():
+                                    # Linhas de hunk: @@ -a,b +c,d @@ -> c é a linha nova
+                                    if dl.startswith('@@'):
+                                        import re as _re
+                                        m = _re.search(r'\+(\d+)', dl)
+                                        if m:
+                                            first_line = int(m.group(1))
+                                            break
+                            except Exception:
+                                pass
+                            _auto_open_in_cursor_at(mf_abs, first_line)
 
 
                     if not is_error and changes_summary:
