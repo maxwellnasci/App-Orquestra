@@ -1621,6 +1621,15 @@ class LiveSection:
 
 
 
+def _auto_open_in_cursor(file_paths: list[str]):
+    """Abre arquivos no editor Cursor, se instalado, sem travar o terminal."""
+    if not shutil.which("cursor"):
+        return
+    try:
+        subprocess.Popen(["cursor"] + file_paths, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
 def _auto_open_links(text: str):
     """Modo chat: abre a prévia (última URL do texto — open_design_run_task sempre
     acrescenta '🔗 Prévia ao vivo: <url>' no fim) direto no navegador, sem o usuário
@@ -2329,6 +2338,9 @@ def main():
     # Cria ou limpa o arquivo de log do projeto
     log_path = Path(get_project_dir()) / LOG_FILE_NAME
     log_path.write_text("# Orquestra — Logs de Execução ao Vivo\n\nAbra este arquivo ao lado do seu terminal para ver os agentes trabalhando.\n\n", encoding="utf-8")
+    
+    # Abre o log automaticamente no Cursor no boot (silencioso se não tiver cursor)
+    _auto_open_in_cursor([str(log_path)])
 
     print_banner()
 
@@ -2467,6 +2479,7 @@ def main():
                 console.print("[dim]Nenhum plano gerado ainda. Peça ao Orquestrador para planejar uma tarefa.[/dim]")
 
         elif low == "/tarefas":
+
 
             recent = get_recent_tasks()
             if not recent:
@@ -2620,6 +2633,10 @@ def main():
 
 
 
+        elif low in ("/cursor", "/editor"):
+            console.print("[dim]Abrindo projeto no Cursor...[/dim]")
+            _auto_open_in_cursor(["."])
+            
         elif low in ("/historico", "/history"):
             active_role = config.get("active_role", "")
             info = config.get("roles", {}).get(active_role, {})
