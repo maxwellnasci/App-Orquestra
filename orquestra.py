@@ -144,6 +144,68 @@ console = Console()
 # caractere a caractere na tela.
 _console_lock = threading.RLock()
 
+# Último plano gerado pelo Orquestrador (exibido via /plano)
+_last_plan: str = ""
+
+
+def show_plan_viewer(plan_text: str) -> None:
+    """Exibe o plano em tela cheia no terminal. Fecha com ESC ou Enter."""
+    from prompt_toolkit import Application
+    from prompt_toolkit.layout import Layout
+    from prompt_toolkit.layout.containers import HSplit, Window, FloatContainer, Float
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.formatted_text import HTML
+    import shutil
+
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    @kb.add("enter")
+    @kb.add("q")
+    @kb.add("Q")
+    def _exit(event):
+        event.app.exit()
+
+    # Monta o conteúdo formatado
+    term_width = shutil.get_terminal_size((80, 24)).columns
+    separator = "─" * (term_width - 2)
+
+    lines_raw = plan_text.strip().splitlines()
+    body_lines = []
+    for line in lines_raw:
+        # Numeradas automaticamente se começar com dígito
+        stripped = line.strip()
+        if stripped:
+            body_lines.append(f"  {stripped}")
+        else:
+            body_lines.append("")
+
+    body = "\n".join(body_lines)
+
+    content_text = (
+        f"\n"
+        f"  \u001b[1m\u001b[36m\U0001f4cb  Plano de Execução\u001b[0m\n"
+        f"  \u001b[2m{separator}\u001b[0m\n"
+        f"\n"
+        f"{body}\n"
+        f"\n"
+        f"  \u001b[2m{separator}\u001b[0m\n"
+        f"  \u001b[2m[ Enter ou ESC para fechar e voltar ao chat ]\u001b[0m\n"
+    )
+
+    app = Application(
+        layout=Layout(
+            Window(
+                content=FormattedTextControl(text=content_text),
+                wrap_lines=True,
+            )
+        ),
+        key_bindings=kb,
+        full_screen=True,
+    )
+    app.run()
+
 
 def load_config() -> dict:
     CHAT_HISTORY_DIR.mkdir(exist_ok=True)
@@ -2043,6 +2105,7 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 
 DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DOTALL | re.IGNORECASE)
 PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECASE)
+PLANO_RE   = re.compile(r'<PLANO>(.*?)</PLANO>', re.DOTALL | re.IGNORECASE)
 
 
 # Defaults de label/ícone/cor/binary por tag histórica — usados só quando o
@@ -2282,6 +2345,7 @@ class AtFileCompleter(Completer):
                 pass
 
 def main():
+    global _last_plan
     config = load_config()
     _init_memory_db()
 
@@ -2414,7 +2478,13 @@ def main():
 
         elif low in ("/ajuda", "/help", "/?"):
             print_help()
-            
+
+        elif low == "/plano":
+            if _last_plan:
+                show_plan_viewer(_last_plan)
+            else:
+                console.print("[dim]Nenhum plano gerado ainda. Peça ao Orquestrador para planejar uma tarefa.[/dim]")
+
         elif low == "/tarefas":
             recent = get_recent_tasks()
             if not recent:
@@ -2634,9 +2704,15 @@ def main():
                 f"Você é o Orquestra, o assistente inteligente do projeto '{projeto}'.\n"
                 f"Hoje é {agora}. Você está no terminal do usuário, na pasta '{get_project_dir()}'.\n"
                 "ESTILO DE COMUNICAÇÃO: Seja direto e objetivo. Respostas curtas. Sem enrolação.\n"
-                "Antes de executar qualquer tarefa prática, apresente UM PLANO RESUMIDO ao usuário\n"
-                "(máximo 5 linhas) e aguarde a confirmação — a menos que o usuário peça explicitamente\n"
-                "para executar já. O plano deve mostrar quais agentes serão chamados e em que ordem.\n"
+                "Antes de executar qualquer tarefa prática, gere um PLANO RESUMIDO usando obrigatoriamente a tag:\n"
+                "<PLANO>\n"
+                "1. pesquisador → [o que ele vai fazer]\n"
+                "2. implementador → [o que ele vai fazer]\n"
+                "3. arquiteto → [o que ele vai revisar]\n"
+                "</PLANO>\n"
+                "O conteúdo entre <PLANO> e </PLANO> abre automaticamente numa tela cheia separada para o usuário ler — "
+                "o chat fica limpo. Sempre aguarde a confirmação do usuário antes de emitir <DELEGATE>/<PIPELINE>, "
+                "a menos que o usuário já tenha dito explicitamente para executar.\n"
                 "REGRA DE OURO: Você NÃO DEVE inventar código, alucinar ou chutar o que não sabe com certeza.\n"
                 "Quando precisar executar uma tarefa prática (ler/escrever código, rodar comandos, acessar web), DELEGUE para um operário.\n"
                 "IMPORTANTE: antes de qualquer bloco <DELEGATE>/<PIPELINE>, escreva sempre 1-2 frases em "
@@ -2739,7 +2815,20 @@ def main():
             # texto agora; mantidos como dois nomes só por compatibilidade com o
             # resto do bloco.
             output = clean_output
-            
+
+            # ── Extrai e exibe plano (tag <PLANO>) ─────────────────────────
+            plano_match = PLANO_RE.search(clean_output)
+            if plano_match:
+                _last_plan = plano_match.group(1).strip()
+                # Remove a tag <PLANO> do texto que será exibido no chat
+                clean_output = PLANO_RE.sub('', clean_output).strip()
+                output = clean_output
+                # Mostra notificação limpa no chat e abre o visualizador automaticamente
+                console.print("\n[bold cyan]\U0001f4cb Plano criado — abrindo visualizador...[/bold cyan]")
+                console.print("[dim]  (use /plano para rever a qualquer momento)[/dim]\n")
+                show_plan_viewer(_last_plan)
+            # ───────────────────────────────────────────────────────
+
             # Busca blocos <PIPELINE> primeiro (cadeias sequenciais) e tira eles
             # do texto antes de procurar <DELEGATE> soltos — senão os DELEGATE
             # de dentro de um pipeline seriam contados de novo como paralelos.
