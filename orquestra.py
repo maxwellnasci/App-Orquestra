@@ -17,6 +17,7 @@ import tempfile
 import urllib.request
 import urllib.error
 from pathlib import Path
+from vault import VaultManager
 
 from rich.console import Console
 from rich.panel import Panel
@@ -2286,6 +2287,16 @@ def main():
 
     print_banner()
 
+    # ── Cofre de Segurança ──────────────────────────────────
+    _vault = VaultManager(get_project_dir())
+    if _vault.needs_setup():
+        _vault.setup_wizard()
+    else:
+        _vault.unlock_interactive()
+    # Injeta credenciais salvas como variáveis de ambiente da sessão
+    _vault.inject_env()
+    # ────────────────────────────────────────────────────────
+
     orch = config.get("roles", {}).get("orquestrador", {})
     modelo_atual = orch.get("model", orch.get("binary", "?"))
     console.print(f"  modelo: [dim]{modelo_atual}[/dim]  ·  [dim]/agentes trocar[/dim] para mudar  ·  [dim]/ajuda[/dim] para comandos\n")
@@ -2380,6 +2391,23 @@ def main():
             raw = raw + injected_context
 
         low = raw.lower()
+
+        # ── Cofre de Segurança: intercepta /senha antes de qualquer agente ──
+        vault_resp = _vault.handle_command(raw)
+        if vault_resp is not None:
+            # Apaga o comando do histórico do terminal (contém valor sensível)
+            try:
+                hist_file = HISTORY_FILE
+                if hist_file.exists():
+                    lines = hist_file.read_text(encoding="utf-8", errors="replace").splitlines()
+                    # Remove a última linha que contém /senha com valor
+                    if lines and raw.strip() in lines[-1]:
+                        hist_file.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+            console.print(f"🔐 [bold green]{vault_resp}[/bold green]")
+            continue
+        # ────────────────────────────────────────────────────
 
         if low in ("/sair", "/exit", "/quit", "exit", "quit"):
             handle_safe_exit(config)
@@ -2605,7 +2633,10 @@ def main():
             context_str = (
                 f"Você é o Orquestra, o assistente inteligente do projeto '{projeto}'.\n"
                 f"Hoje é {agora}. Você está no terminal do usuário, na pasta '{get_project_dir()}'.\n"
-                "Seu objetivo é conversar naturalmente, lembrar o contexto, tirar dúvidas e gerenciar o projeto.\n"
+                "ESTILO DE COMUNICAÇÃO: Seja direto e objetivo. Respostas curtas. Sem enrolação.\n"
+                "Antes de executar qualquer tarefa prática, apresente UM PLANO RESUMIDO ao usuário\n"
+                "(máximo 5 linhas) e aguarde a confirmação — a menos que o usuário peça explicitamente\n"
+                "para executar já. O plano deve mostrar quais agentes serão chamados e em que ordem.\n"
                 "REGRA DE OURO: Você NÃO DEVE inventar código, alucinar ou chutar o que não sabe com certeza.\n"
                 "Quando precisar executar uma tarefa prática (ler/escrever código, rodar comandos, acessar web), DELEGUE para um operário.\n"
                 "IMPORTANTE: antes de qualquer bloco <DELEGATE>/<PIPELINE>, escreva sempre 1-2 frases em "
@@ -2613,10 +2644,15 @@ def main():
                 "esse texto de intenção antes deles — é isso que o usuário vê enquanto o operário trabalha.\n"
                 "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
                 "<DELEGATE binary=\"implementador\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
-                "Use binary=\"implementador\" para codificação e refatoração pesada, "
-                "binary=\"pesquisador\" para pesquisa rápida e varredura de diretórios, "
-                "binary=\"arquiteto\" para revisão, arquitetura e segurança da informação, "
+                "Use binary=\"implementador\" para codificação e refatoração pesada (usa DeepSeek V4 Pro), "
+                "binary=\"pesquisador\" para pesquisa rápida e varredura (usa Copilot — também é o Cão de Guarda de segurança), "
+                "binary=\"arquiteto\" para revisão, arquitetura e segurança da informação (usa DeepSeek), "
                 "binary=\"analista\" para problemas lógicos profundos e troubleshooting complexo.\n"
+                "SEGURANÇA: O agente Copilot (pesquisador) atua como Cão de Guarda automático após cada código gerado — "
+                "ele verifica silenciosamente se há bugs, e SÓ aparece na tela se encontrar algo errado. "
+                "Isso garante qualidade em cada implementação.\n"
+                "COFRE DE SENHAS: O usuário pode usar /senha NOME valor para salvar credenciais de forma segura. "
+                "Quando o usuário mencionar que precisa configurar uma API key ou senha, lembre-o de usar /senha.\n"
                 "Use binary=\"open-design\" para gerar uma PRÉVIA VISUAL de verdade — renderizada e navegável, "
                 "não uma descrição em texto nem uma imagem estática. Ele lê o projeto de verdade na pasta atual "
                 "(design system, componentes, paleta reais) e devolve uma prévia fiel ao visual já existente.\n\n"
