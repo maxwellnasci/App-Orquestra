@@ -1724,7 +1724,35 @@ class LiveSection:
 
 
 def _auto_open_in_cursor(file_paths: list[str], cwd=None):
-    """Abre arquivos no editor Cursor, se instalado, sem travar o terminal."""
+    """Abre arquivos no editor Cursor, usando a Bridge Nativa HTTP se disponível, ou fallback para CLI."""
+    if not file_paths: return
+    
+    payload = None
+    if file_paths[0] == "-d" and len(file_paths) >= 3:
+        payload = {"action": "diff", "file1": file_paths[1], "file2": file_paths[2]}
+    elif file_paths[0] != "-d":
+        fp = file_paths[0]
+        if cwd and not os.path.isabs(fp) and fp != ".":
+            fp = os.path.join(cwd, fp)
+        # Se for ".", a bridge "open" com o dir atual abrirá o workspace
+        if fp == ".":
+            fp = cwd or os.getcwd()
+        payload = {"action": "open", "file": fp}
+        
+    if payload:
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:49152", 
+                data=json.dumps(payload).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=1.0) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            pass
+
     if not shutil.which("cursor"):
         return
     try:
@@ -2803,7 +2831,7 @@ def main():
                                 res = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=get_project_dir(), capture_output=True)
                                 if res.returncode == 0:
                                     tmp_old.write_bytes(res.stdout)
-                                    _auto_open_in_cursor(["-d", str(tmp_old), f], cwd=get_project_dir())
+                                    _auto_open_in_cursor(["-d", str(tmp_old), str(f_path)], cwd=get_project_dir())
                                 else:
                                     _auto_open_in_cursor([f], cwd=get_project_dir())
                         else:
