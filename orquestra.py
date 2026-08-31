@@ -2825,7 +2825,7 @@ def main():
 
             # Busca TODAS as tags de delegação soltas (paralelas)
             delegate_matches = list(DELEGATE_RE.finditer(clean_output_no_pipeline))
-            chat_mode = config.get("ui", {}).get("mode") == "chat"
+            chat_mode = True
             detail_level = _detail_level(config)
 
             if delegate_matches or pipeline_steps_list:
