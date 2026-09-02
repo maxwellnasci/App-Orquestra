@@ -996,8 +996,13 @@ def open_design_resolve_project(config: dict) -> dict | None:
 def _is_noise_path(p: str) -> bool:
     """Artefatos que o operário gera de passagem (rodar testes, importar) e que
     não interessam na aprovação — nunca entram no changes_summary/commit."""
+    base = p.rsplit("/", 1)[-1].lower()
     return ("__pycache__" in p or p.endswith((".pyc", ".pyo"))
-            or p.endswith((".orquestra_logs.md", ".pytest_cache")) or "/.pytest_cache/" in p)
+            or p.endswith((".orquestra_logs.md", ".orquestra_preview.html",
+                           ".orquestra_preview.png", ".pytest_cache"))
+            or "/.pytest_cache/" in p
+            # rascunhos de prévia que o Open Design às vezes deixa cair na pasta
+            or (base.endswith(".html") and "preview" in base))
 
 
 def _git_dirty_files(project_dir: str) -> set | None:
@@ -1053,6 +1058,10 @@ def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600,
         "REAIS daqui (paleta, componentes, tipografia, telas existentes) antes de "
         "responder, para que a prévia reaproveite o visual já existente em vez de "
         "inventar um estilo novo do zero.\n\n"
+        "REGRA: NÃO edite os arquivos existentes do projeto e NÃO crie arquivos soltos "
+        "na pasta. O ÚNICO arquivo que você pode escrever na pasta do projeto é o "
+        "`.orquestra_preview.html` explicitamente pedido na tarefa (se pedido). "
+        "Qualquer prévia intermediária fica no seu próprio workspace de Design Files.\n\n"
         f"Tarefa pedida pelo usuário:\n{instruction}"
     )
 

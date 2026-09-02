@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .orquestra_logs.md
+.orquestra_preview.html
+.orquestra_preview.png
+*preview*.html
 .orquestra_vault
 .orquestra_salt
 .orquestra_cursor_state.json

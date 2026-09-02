@@ -228,6 +228,23 @@ class OrquestraTUI(App):
         width: 1fr;
     }
 
+    #idea-panel.featured {
+        width: 3fr;
+    }
+
+    #idea-image {
+        height: 3fr;
+        overflow: auto;
+        align: center top;
+        background: black;
+        padding: 1;
+    }
+
+    #idea-md {
+        height: 1fr;
+        overflow-y: auto;
+    }
+
     #status-indicator {
         margin: 1 0;
         text-align: left;
@@ -319,10 +336,10 @@ class OrquestraTUI(App):
 
             with Vertical(id="idea-panel", classes="panel hidden"):
                 yield Label("🎨 IDEA STUDIO", classes="panel-title")
+                yield Container(id="idea-image")
                 yield Markdown(
-                    "# Idea Studio\n\n"
-                    "As prévias visuais geradas pelo **Open Design** aparecem aqui — "
-                    "com o link da prévia ao vivo (abre no navegador).",
+                    "As prévias visuais do **Open Design** são renderizadas aqui, "
+                    "dentro do Orquestra — sem abrir navegador.",
                     id="idea-md",
                 )
 
@@ -464,6 +481,7 @@ class OrquestraTUI(App):
             panel = self.query_one(panel_id)
             panel.toggle_class("hidden")
             if panel.has_class("hidden"):
+                panel.remove_class("featured")
                 event.button.remove_class("active")
                 event.button.label = base_label
             else:
@@ -892,20 +910,58 @@ class OrquestraTUI(App):
         else:
             self.call_from_thread(self._re_enable_input)
 
-    # ── Open Design (prévia visual) ─────────────────────────────────────────
+    # ── Open Design (prévia visual dentro do Orquestra) ─────────────────────
+
+    _CHROME = None
+
+    def _chrome_bin(self):
+        import shutil as _sh
+        if self._CHROME is None:
+            self._CHROME = (_sh.which("chromium") or _sh.which("google-chrome")
+                            or _sh.which("google-chrome-stable") or _sh.which("chromium-browser") or "")
+        return self._CHROME
+
+    def _shot(self, target: str, width: int = 1400, height: int = 1000):
+        """Renderiza uma URL ou um arquivo HTML local para PNG com o Chrome headless.
+        Retorna o caminho do PNG ou None. Roda numa thread (bloqueante)."""
+        import subprocess as _sp, tempfile
+        chrome = self._chrome_bin()
+        if not chrome:
+            return None
+        fd, png = tempfile.mkstemp(prefix="orq_preview_", suffix=".png")
+        os.close(fd)
+        try:
+            _sp.run([chrome, "--headless", "--no-sandbox", "--disable-gpu",
+                     "--hide-scrollbars", "--force-color-profile=srgb",
+                     "--virtual-time-budget=5000",
+                     f"--window-size={width},{height}", f"--screenshot={png}", target],
+                    capture_output=True, timeout=50)
+            if os.path.getsize(png) > 800:
+                return png
+        except Exception:
+            pass
+        try:
+            os.unlink(png)
+        except OSError:
+            pass
+        return None
 
     @work(thread=True)
     def _run_open_design(self, instruction: str) -> None:
-        """Gera uma prévia visual real via Open Design e mostra na aba Idea Studio.
-        Não escreve nos arquivos do projeto — é só prévia (o open_design_run_task
-        avisa em destaque se algo for tocado)."""
+        """Gera uma prévia visual real via Open Design, RENDERIZA dentro da aba
+        Idea Studio (Chrome headless → imagem no terminal) e não abre navegador."""
         import re as _re
-        import subprocess as _sp
-        import shutil as _sh
         import orquestra
 
+        cwd = orquestra.get_project_dir()
+        preview_file = Path(cwd) / ".orquestra_preview.html"
+        try:
+            preview_file.unlink()
+        except OSError:
+            pass
+
         log = self.query_one("#chat-log", RichLog)
-        self.call_from_thread(log.write, "\n[bold magenta]🎨 Open Design[/bold magenta] gerando a prévia (pode levar 1-3 min)...\n")
+        self.call_from_thread(log.write, "\n[bold magenta]🎨 Open Design[/bold magenta] gerando a prévia (1-3 min)...\n")
 
         def on_status(text):
             def _u():
@@ -916,15 +972,22 @@ class OrquestraTUI(App):
                     lbl.update(""); lbl.add_class("hidden")
             self.call_from_thread(_u)
 
+        # Pede ao Open Design pra também salvar o HTML final autossuficiente aqui,
+        # pra eu renderizar a prévia LIMPA (sem a interface do Open Design em volta).
+        instruction_plus = (
+            f"{instruction}\n\nIMPORTANTE: além da prévia normal, salve uma cópia "
+            f"COMPLETA e AUTOSSUFICIENTE do HTML final da prévia (todo o CSS embutido "
+            f"em <style> ou inline, sem depender de arquivos externos) em: {preview_file}"
+        )
+
         config = orquestra.load_config()
         section = _TUILiveSection("Open Design", lambda t: None, lambda *a: None, on_status)
         section.open()
-        ok, text = orquestra.open_design_run_task(config, instruction, section=section, timeout_s=360)
+        ok, text = orquestra.open_design_run_task(config, instruction_plus, section=section, timeout_s=360)
         on_status("")
 
         orquestra.save_chat_message("orquestrador", "assistant",
                                     f"[{'Prévia do Open Design' if ok else 'Erro do Open Design'}]:\n{text[:4000]}")
-
         if not ok:
             self.call_from_thread(log.write, f"\n[bold red]⚠ Open Design falhou:[/bold red] {text[:600]}\n")
             self.call_from_thread(self._re_enable_input)
@@ -932,35 +995,55 @@ class OrquestraTUI(App):
 
         urls = _re.findall(r'https?://\S+', text)
         preview_url = urls[-1].rstrip('.,;)') if urls else ""
+        # tira a linha do link do texto mostrado (a prévia aparece renderizada, não como link)
+        clean = _re.sub(r'\n*🔗 Prévia ao vivo:.*', '', text).strip()
+        self.call_from_thread(log.write, f"\n[bold magenta]🎨 Open Design[/bold magenta] {clean[:1200]}\n")
 
-        self.call_from_thread(log.write, f"\n[bold magenta]🎨 Open Design[/bold magenta] {text[:1200]}\n")
+        # 1ª escolha: o HTML autossuficiente local (prévia limpa). Fallback: a URL ao vivo.
+        self.call_from_thread(log.write, "\n[dim]🖼  Renderizando a prévia dentro do Orquestra...[/dim]\n")
+        png = None
+        if preview_file.is_file():
+            png = self._shot(preview_file.as_uri())
+        if not png and preview_url:
+            png = self._shot(preview_url, height=1600)
 
-        def _show_idea():
-            md = self.query_one("#idea-md", Markdown)
-            body = f"# Prévia gerada\n\n{text}"
-            if preview_url:
-                body += f"\n\n---\n\n**[▶ Abrir prévia ao vivo]({preview_url})**"
-            md.update(body)
+        def _show_idea(png_path):
+            self.query_one("#idea-md", Markdown).update(clean or "# Prévia gerada")
+            box = self.query_one("#idea-image", Container)
+            for w in list(box.children):
+                w.remove()
+            if png_path:
+                try:
+                    from textual_image.widget import Image as TImage
+                    box.mount(TImage(png_path))
+                except Exception as e:
+                    box.mount(Label(f"(não consegui renderizar a imagem: {e})"))
+            else:
+                box.mount(Label("(Chrome headless indisponível — sem prévia renderizada)"))
             panel = self.query_one("#idea-panel")
-            if panel.has_class("hidden"):
-                panel.remove_class("hidden")
-                btn = self.query_one("#btn-idea")
-                btn.add_class("active"); btn.label = "🎨 Idea Studio [✓]"
-        self.call_from_thread(_show_idea)
-
-        if preview_url and _sh.which("xdg-open"):
+            panel.remove_class("hidden")
+            panel.add_class("featured")   # a prévia toma a maior parte da tela
+            btn = self.query_one("#btn-idea")
+            btn.add_class("active"); btn.label = "🎨 Idea Studio [✓]"
+        # guarda uma cópia PNG na pasta do projeto — se o terminal renderizar mal
+        # (qterminal etc.), dá pra abrir num visualizador de imagem (não é navegador).
+        if png:
             try:
-                _sp.Popen(["xdg-open", preview_url], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                self.call_from_thread(log.write, f"\n[dim]🔗 Abrindo no navegador: {preview_url}[/dim]\n")
+                import shutil as _sh2
+                dest = Path(cwd) / ".orquestra_preview.png"
+                _sh2.copyfile(png, dest)
+                self.call_from_thread(log.write,
+                    f"\n[dim]✅ Prévia renderizada na aba 🎨 Idea Studio  ·  cópia em {dest.name}[/dim]\n")
             except OSError:
-                pass
+                self.call_from_thread(log.write, "\n[dim]✅ Prévia renderizada na aba 🎨 Idea Studio.[/dim]\n")
+        self.call_from_thread(_show_idea, png)
 
-        # linkedDirs NÃO é read-only: o Open Design às vezes escreve nos arquivos
-        # reais mesmo em "prévia". Se mexeu, cai no mesmo gate de aprovação.
-        dirty = orquestra._git_dirty_files(orquestra.get_project_dir())
+        # .orquestra_preview.html é artefato (gitignored, _is_noise_path) — não conta
+        # como alteração. Se o Open Design mexeu em OUTRO arquivo real, cai no gate.
+        dirty = orquestra._git_dirty_files(cwd)
         if dirty:
             self.call_from_thread(log.write,
-                f"\n[dim]Arquivos alterados pelo Open Design: {', '.join(sorted(dirty))}[/dim]\n")
+                f"\n[yellow]⚠ Open Design alterou arquivos reais:[/yellow] {', '.join(sorted(dirty))}\n")
             self._pending_changes = ", ".join(sorted(dirty))
             self.call_from_thread(self._show_action_bar)
         else:
