@@ -114,19 +114,23 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
 `load_config()` migra automaticamente configs v1 (orquestrador em `agy`/`claude`,
 operários com nomes soltos, `ollama_api_key` em texto puro).
 
-### Cérebros do Orquestrador (`binary="brain"`)
+### Como o Orquestrador roda
 
-`orchestrator_brain.py` fala com o modelo por chat completions puro (zero
-ferramentas). Qualquer empresa serve — MENOS Copilot (não tem API de chat direto).
-O botão `Orq:` no topo lista todos; se faltar a chave, o Orquestrador avisa no chat.
+Ele sempre roda em **modo plano / read-only** — pode LER pra dar contexto melhor,
+mas nunca escreve arquivo nem roda comando que altera nada (implementar é sempre
+delegado). O botão `Orq:` no topo escolhe o modelo e o `_orch_route()` decide o motor:
 
-| provider | credencial | funciona sem configurar? |
+| Modelo escolhido | binary | Como conecta |
 |---|---|---|
-| `deepseek` | `~/.claude-deepseek-env` (`ANTHROPIC_API_KEY`) ou `/senha DEEPSEEK_API_KEY` | ✅ (se o env existir) |
-| `ollama-cloud` | `kimi provider list --json` | ✅ (se o `kimi` estiver configurado) |
-| `anthropic` | `/senha ANTHROPIC_API_KEY sk-ant-...` | precisa da chave |
-| `openai` | `/senha OPENAI_API_KEY sk-...` | precisa da chave |
-| `gemini` | `/senha GEMINI_API_KEY ...` (Google AI Studio — não é o login do `agy`) | precisa da chave |
+| `gemini-*` | `agy` | **login do Antigravity CLI** (`agy --mode plan`) |
+| `claude-*` | `claude` | **login do Claude Code** (`claude --permission-mode plan`) |
+| `gpt-*` (grupo Codex) | `codex` | **login do Codex CLI** (`codex exec --sandbox read-only`) |
+| `deepseek-v4-*` | `brain` | `~/.claude-deepseek-env` ou `/senha DEEPSEEK_API_KEY` |
+| `kimi-*`, `gpt-oss`, ... | `brain` | `kimi provider list` (Ollama Cloud) |
+| Anthropic/OpenAI/Gemini via API própria | `brain` | `/senha ANTHROPIC_API_KEY` etc. |
+
+Ou seja: **as contas já logadas no terminal (agy/claude/codex) funcionam sem API key.**
+`load_config()` conserta combinações inválidas (ex: `binary=brain provider=copilot`).
 
 ### Motores dos operários (`binary=`)
 

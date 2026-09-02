@@ -46,19 +46,25 @@ _w, b, *_ = orquestra._resolve_worker(cfg, "tag-desconhecida-xyz")
 check(b == "claude", "tag desconhecida → fallback operador/claude")
 
 
-# ── _build_orchestrator_cmd: ZERO ferramentas ──────────────────────────────
+# ── _build_orchestrator_cmd: read-only, usa a conta logada ─────────────────
 print("_build_orchestrator_cmd")
 role = cfg["roles"]["orquestrador"]
-ocmd, obin = orquestra._build_orchestrator_cmd(role, "Histórico da Conversa:\nx")
+ocmd, obin, oof = orquestra._build_orchestrator_cmd(role, "Histórico da Conversa:\nx")
 check(obin == "brain", "orquestrador default → binary 'brain'")
 check("orchestrator_brain.py" in " ".join(ocmd), "chama orchestrator_brain.py")
 check("--provider" in ocmd and "deepseek" in ocmd, "passa --provider deepseek")
-for banned in ("--dangerously-skip-permissions", "--add-dir", "--project", "bypassPermissions"):
+for banned in ("--dangerously-skip-permissions", "--project", "bypassPermissions"):
     check(banned not in " ".join(ocmd), f"NÃO contém {banned}")
 
-acmd, abin = orquestra._build_orchestrator_cmd({"binary": "agy", "model": "gemini-3.6-flash-high"}, "p")
-check("--dangerously-skip-permissions" not in acmd and "--add-dir" not in acmd,
-      "fallback agy também sem flags de ferramenta")
+acmd, abin, _ = orquestra._build_orchestrator_cmd({"binary": "agy", "model": "gemini-3.6-flash-high"}, "p")
+check("--mode" in acmd and "plan" in acmd, "orquestrador via agy usa --mode plan (read-only)")
+check("--dangerously-skip-permissions" not in acmd, "agy orquestrador sem skip-permissions")
+
+ccmd, cbin, _ = orquestra._build_orchestrator_cmd({"binary": "claude", "model": "claude-sonnet-5"}, "p")
+check("plan" in ccmd and "bypassPermissions" not in ccmd, "orquestrador via claude usa --permission-mode plan")
+
+xcmd, xbin, xof = orquestra._build_orchestrator_cmd({"binary": "codex", "model": "gpt-5.6-terra"}, "p")
+check(xbin == "codex" and "read-only" in xcmd and xof is not None, "orquestrador via codex: exec read-only + output file")
 
 
 # ── _build_worker_cmd ──────────────────────────────────────────────────────
@@ -105,21 +111,32 @@ tmp = Path(tempfile.mkdtemp())
 orig_cfg = orquestra.CONFIG_FILE
 try:
     orquestra.CONFIG_FILE = tmp / ".orquestra.json"
+    # config quebrada: brain com provider inválido (foi o bug real do usuário)
     v1 = {
         "active_role": "orquestrador",
-        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "roles": {"orquestrador": {"binary": "brain", "provider": "copilot", "model": "gpt-5.6-terra"}},
         "workers": {"claude": {"binary": "claude"}},
         "ollama_api_key": "SEGREDO",
         "ui": {"mode": "chat"},
     }
     orquestra.CONFIG_FILE.write_text(json.dumps(v1), encoding="utf-8")
     c1 = orquestra.load_config()
-    check(c1["roles"]["orquestrador"]["binary"] == "brain", "orquestrador migrado p/ brain")
+    o1 = c1["roles"]["orquestrador"]
+    check(o1["binary"] == "codex" and "provider" not in o1,
+          "provider inválido 'copilot' + modelo gpt → re-roteado p/ codex (login)")
     check("ollama_api_key" not in c1, "ollama_api_key removida da config")
     check("operador" in c1["workers"] and "revisor" in c1["workers"], "workers novos semeados")
     check(c1["ui"].get("detail") == "normal", "ui.detail preenchido")
     c2 = orquestra.load_config()
-    check(c2["roles"]["orquestrador"]["binary"] == "brain", "2ª carga idempotente")
+    check(c2["roles"]["orquestrador"]["binary"] == "codex", "2ª carga idempotente")
+
+    # config válida via CLI logada (agy) — NÃO deve ser mexida
+    orquestra.CONFIG_FILE.write_text(json.dumps({
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "workers": {}, "ui": {},
+    }), encoding="utf-8")
+    c3 = orquestra.load_config()
+    check(c3["roles"]["orquestrador"]["binary"] == "agy", "orquestrador via agy (login) preservado")
     od = c1.get("open_design")
     from pathlib import Path as _P
     if _P(orquestra.DEFAULT_CONFIG["open_design"]["repo_path"]).is_dir():

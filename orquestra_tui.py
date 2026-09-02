@@ -495,6 +495,24 @@ class OrquestraTUI(App):
             return "openai"
         return "ollama-cloud"  # kimi, gpt-oss, nemotron, glm, qwen, minimax...
 
+    def _orch_route(self, model: str) -> tuple:
+        """Modelo escolhido pro Orquestrador → (binary, provider). Usa a CLI logada
+        no terminal quando dá (Gemini→agy, Claude→claude, GPT→codex); DeepSeek e
+        Ollama vão pelo chat API (binary 'brain')."""
+        m = model.lower()
+        grp = self._model_provider.get(model, "")
+        if m.startswith("gemini") or grp == "gemini":
+            return "agy", ""
+        if m.startswith("claude") or any(x in m for x in ("sonnet", "opus")) or grp == "anthropic":
+            return "claude", ""
+        if m.startswith("deepseek-v4") or m == "deepseek-chat" or grp == "deepseek":
+            return "brain", "deepseek"
+        if grp == "ollama-cloud" or any(x in m for x in ("kimi", "gpt-oss", "nemotron", "glm", "qwen", "minimax", "gemma")):
+            return "brain", "ollama-cloud"
+        if m.startswith(("gpt-", "o1", "o3", "o4")) or grp == "openai":
+            return "codex", ""   # usa o login do codex CLI
+        return "brain", "ollama-cloud"
+
     def _check_brain_key(self, provider: str) -> None:
         """Avisa no chat se o cérebro escolhido precisa de uma chave que não está no ambiente."""
         import os
@@ -516,9 +534,13 @@ class OrquestraTUI(App):
         else:
             target = config.setdefault("workers", {}).setdefault(slot, {})
         target.update(fields)
-        if "deepseek-v4" in str(fields.get("model", "")) and fields.get("binary") == "claude":
+        if slot == "orquestrador" and fields.get("binary") != "brain":
+            target.pop("provider", None)   # agy/claude/codex não usam provider
+        _model = str(fields.get("model", ""))
+        _wants_ds_env = "deepseek-v4" in _model and fields.get("binary") == "claude"
+        if _wants_ds_env:
             target["env_file"] = str(orquestra.DEEPSEEK_ENV)
-        elif slot != "orquestrador" and fields.get("binary") != "claude":
+        elif fields.get("binary") in ("agy", "codex", "brain") or (slot != "orquestrador" and fields.get("binary") != "claude"):
             target.pop("env_file", None)
         with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -548,21 +570,29 @@ class OrquestraTUI(App):
 
         # Seleção de Modelos
         if event.button.id == "btn-sel-orq":
-            # O Orquestrador fala com o modelo por CHAT PURO (zero ferramentas) —
-            # todas as empresas servem, MENOS Copilot (não tem API de chat direto).
+            # O Orquestrador roda em MODO PLANO (read-only). Gemini→login do agy,
+            # Claude→login do claude, GPT→login do codex, DeepSeek/Kimi→chat API.
+            # Copilot fica fora (não tem chat direto nem plan-mode utilizável).
             brains = {k: v for k, v in self.grouped_models.items() if "Copilot" not in k}
+            btn = event.button
+
             def update_orq(selected: str | None):
-                if selected:
-                    self._orq_model = selected
-                    self._orq_binary = "brain"
-                    self._orq_provider = (self._model_provider.get(selected)
-                                          or self._brain_provider_from_model(selected))
-                    event.button.label = f"Orq: {shorten_name(selected)}"
-                    self._persist_agent("orquestrador", binary="brain",
-                                        provider=self._orq_provider, model=selected)
-                    self._check_brain_key(self._orq_provider)
+                if not selected:
+                    return
+                b, prov = self._orch_route(selected)
+                self._orq_model, self._orq_binary, self._orq_provider = selected, b, prov
+                btn.label = f"Orq: {shorten_name(selected)}"
+                fields = {"binary": b, "model": selected}
+                fields["provider"] = prov if b == "brain" else None
+                self._persist_agent("orquestrador", **{k: v for k, v in fields.items() if v is not None})
+                if b == "brain":
+                    self._check_brain_key(prov)
+                elif b in ("agy", "claude", "codex"):
+                    self.query_one("#chat-log", RichLog).write(
+                        f"\n[dim]🎼 Orquestrador via [bold]{b}[/bold] (conta logada no terminal), modo plano.[/dim]\n")
+
             self.push_screen(
-                ModelSelectionModal("Orquestrador — chat puro, sem ferramentas", brains or self.grouped_models),
+                ModelSelectionModal("Orquestrador — modo plano (só lê, planeja e delega)", brains or self.grouped_models),
                 update_orq)
 
         elif event.button.id == "btn-sel-op":
@@ -774,14 +804,17 @@ class OrquestraTUI(App):
         memory = orquestra._load_memory_context(orquestra.get_project_id())
         full_prompt = orquestra.build_orchestrator_prompt(config, history, memory)
 
-        cmd, binary = orquestra._build_orchestrator_cmd(orq_role, full_prompt)
+        cmd, binary, ofile = orquestra._build_orchestrator_cmd(orq_role, full_prompt)
         env = os.environ.copy()
+        ef = orq_role.get("env_file")
+        if ef:
+            env.update(orquestra.load_env_file(ef))
 
         self.call_from_thread(log.write, f"\n[dim]🎼 Orquestrador ({shorten_name(self._orq_model)}) pensando...[/dim]\n")
 
         section = _TUILiveSection("Orquestrador", lambda t: None, lambda *a: None, on_status)
         section.open()
-        final_text, ok = orquestra._run_orchestrator_stream(cmd, env, binary, section, timeout_s=150)
+        final_text, ok = orquestra._run_orchestrator_stream(cmd, env, binary, section, timeout_s=150, output_file=ofile)
         on_status("")
 
         if not ok or not final_text:

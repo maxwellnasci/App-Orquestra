@@ -277,20 +277,33 @@ def load_config() -> dict:
 
     needs_save = False
 
-    # ── Migração v1 → v2 (arquitetura de 3 agentes) ──────────────────────────
-    # v1: orquestrador rodava via `agy`/`claude` (com ferramentas) e os operários
-    # tinham nomes soltos (implementador/arquiteto/...). v2: orquestrador vira
-    # `brain` (chat puro, zero ferramentas) e os operários viram operador/revisor/
-    # cao_guarda. Preserva o modelo que o usuário tenha escolhido, quando dá.
+    # ── Sanidade do Orquestrador ────────────────────────────────────────────
+    # O Orquestrador roda em MODO PLANO / read-only, via:
+    #  - binary "brain"  → chat API (provider: deepseek | ollama-cloud | anthropic | openai | gemini)
+    #  - binary "agy" | "claude" | "codex" → a CLI logada no terminal, sem escrita
+    # Conserta configs quebradas (ex: provider "copilot", que o brain não fala).
     orq = cfg.get("roles", {}).get("orquestrador", {})
-    if orq.get("binary") in ("agy", "claude", "ollama-cloud"):
-        legado_modelo = orq.get("model", "")
-        cfg.setdefault("roles", {})["orquestrador"] = dict(DEFAULT_CONFIG["roles"]["orquestrador"])
-        console.print(
-            "[dim]⚙  Config migrada: o Orquestrador agora é um estrategista sem ferramentas "
-            f"(era {orq.get('binary')}/{legado_modelo or 'padrão'}). Use /agentes trocar para ajustar.[/dim]"
-        )
-        needs_save = True
+    if orq:
+        b = orq.get("binary", "brain")
+        m = (orq.get("model") or "").lower()
+        p = orq.get("provider", "")
+        _fixed = None
+        if b == "brain" and p not in ("deepseek", "ollama-cloud", "anthropic", "openai", "gemini"):
+            # provider inválido — re-roteia pelo nome do modelo
+            if m.startswith("gemini"):
+                orq["binary"] = "agy"; orq.pop("provider", None); _fixed = "agy (login do Antigravity)"
+            elif m.startswith("claude"):
+                orq["binary"] = "claude"; orq.pop("provider", None); _fixed = "claude (login do Claude Code)"
+            elif m.startswith(("gpt-", "o1", "o3", "o4")):
+                orq["binary"] = "codex"; orq.pop("provider", None); _fixed = "codex (login do Codex)"
+            elif m.startswith("deepseek"):
+                orq["provider"] = "deepseek"; _fixed = "brain/deepseek"
+            else:
+                orq["binary"] = "brain"; orq["provider"] = "ollama-cloud"
+                orq["model"] = "gpt-oss:120b"; _fixed = "brain/ollama-cloud (gpt-oss:120b)"
+        if _fixed:
+            console.print(f"[dim]⚙  Orquestrador reconfigurado ({p or b} → {_fixed}) — era uma combinação que não conecta.[/dim]")
+            needs_save = True
 
     # ollama_api_key em texto puro nunca foi usado (o brain lê do provider) — remove
     if "ollama_api_key" in cfg:
@@ -2241,36 +2254,50 @@ _BRAIN_DIR = Path(__file__).resolve().parent
 
 def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
     """Monta o comando pro PRÓPRIO orquestrador (decisão do turno e
-    _orchestrator_react). O padrão é binary="brain" → orchestrator_brain.py:
-    chat completions PURO, zero ferramentas por construção — o estrategista não
-    consegue ler/escrever/rodar nada, só planeja e delega.
+    _orchestrator_react). Retorna (cmd, binary, output_file).
 
-    `agy`/`claude` são aceitos como fallback, mas SEM nenhuma flag de
-    ferramenta/permissão (spike confirmou que eles executam comandos mesmo em
-    --mode plan / --disallowedTools, então nesse modo o Orquestrador PODE furar
-    o papel — use só se o brain estiver indisponível). Retorna (cmd, binary)."""
+    Dois caminhos, os dois SEM permissão de escrita (o estrategista lê/conversa/
+    planeja, mas NÃO implementa — isso é sempre delegado):
+
+    - binary="brain"  → orchestrator_brain.py: chat completions puro (DeepSeek,
+      Ollama Cloud, Anthropic/OpenAI/Gemini via API key). Zero ferramentas.
+    - binary="agy"/"claude"/"codex" → a CLI JÁ LOGADA no terminal, em modo
+      PLANO / read-only (--mode plan / --permission-mode plan / --sandbox
+      read-only). Pode ler pra dar contexto melhor, mas não escreve arquivo
+      nem roda comando que altera nada. É assim que se conversa usando a conta
+      logada (agy/claude/codex) sem precisar de API key separada."""
     binary = role.get("binary", "brain")
     model = role.get("model")
 
     if binary in ("brain", "ollama-cloud"):
         provider = role.get("provider") or ("ollama-cloud" if binary == "ollama-cloud" else "deepseek")
-        cmd = ["python3", str(_BRAIN_DIR / "orchestrator_brain.py"), "-p", prompt,
-               "--provider", provider]
+        cmd = ["python3", str(_BRAIN_DIR / "orchestrator_brain.py"), "-p", prompt, "--provider", provider]
         if model:
             cmd.extend(["--model", model])
-        return cmd, "brain"
+        return cmd, "brain", None
 
     if binary == "agy":
-        cmd = ["agy", "-p", prompt, "--output-format", "stream-json"]
+        cmd = ["agy", "-p", prompt, "--output-format", "stream-json",
+               "--mode", "plan", "--add-dir", get_project_dir()]
         if model:
             cmd.extend(["--model", model])
-        return cmd, "agy"
+        return cmd, "agy", None
 
-    # claude (fallback)
-    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if binary == "codex":
+        fd, output_file = tempfile.mkstemp(prefix="orquestra_orch_", suffix=".txt")
+        os.close(fd)
+        cmd = ["codex", "exec", prompt, "--json", "--sandbox", "read-only",
+               "--skip-git-repo-check", "-o", output_file]
+        if model:
+            cmd.extend(["-m", model])
+        return cmd, "codex", output_file
+
+    # claude — modo plano = read-only, usa o login do claude
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
+           "--permission-mode", "plan"]
     if model:
         cmd.extend(["--model", model])
-    return cmd, "claude"
+    return cmd, "claude", None
 
 
 _ORCH_SYSTEM = """Você é o Orquestra — o ESTRATEGISTA que coordena o projeto '{projeto}'.
@@ -2360,28 +2387,35 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
     return "".join(parts)
 
 
-def _capture_orchestrator_result(line: str, is_agy: bool, state: dict):
-    """Extrai só final_text/is_error do stream-json de uma chamada do próprio
-    orquestrador — sem narrar nada ao vivo (o heartbeat de
-    _run_orchestrator_stream já cobre a visibilidade; o texto completo é
-    mostrado depois, formatado, por quem chamou — narrar aqui repetiria a
-    mesma fala duas vezes na tela)."""
+def _capture_orchestrator_result(line: str, kind: str, state: dict):
+    """Extrai só final_text/is_error do stream de uma chamada do orquestrador.
+    kind: 'agy' (agy/brain — envelope {"event":"result"}), 'codex' (schema
+    thread/turn/item), ou 'claude' ({"type":"result"})."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         return
-    if is_agy:
+    if kind == "agy":
         if d.get("event") == "result":
             res = d.get("result", {})
             state["final_text"] = res.get("response", "") or ""
             state["is_error"] = res.get("status") != "SUCCESS"
+    elif kind == "codex":
+        t = d.get("type", "")
+        if t == "item.completed":
+            item = d.get("item") or {}
+            if item.get("type") == "agent_message":
+                state["final_text"] = item.get("text", "") or state["final_text"]
+        elif t in ("turn.failed", "error"):
+            state["is_error"] = True
     else:
         if d.get("type") == "result":
             state["final_text"] = d.get("result", "") or ""
             state["is_error"] = bool(d.get("is_error"))
 
 
-def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection", timeout_s: int) -> tuple:
+def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection",
+                             timeout_s: int, output_file: str | None = None) -> tuple:
     """Roda uma chamada do PRÓPRIO orquestrador (decisão inicial do turno ou
     _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
     silêncio total + spinner genérico de antes da reforma — e com um timeout
@@ -2389,7 +2423,7 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
     subprocess.run(timeout=...) dava antes. Retorna (final_text, ok)."""
     state = {"final_text": "", "is_error": False}
     # brain/ollama-cloud emitem o mesmo envelope {"event":"result",...} que o agy
-    is_agy = (binary in ("agy", "ollama-cloud", "brain"))
+    kind = "agy" if binary in ("agy", "ollama-cloud", "brain") else ("codex" if binary == "codex" else "claude")
 
     try:
         proc = subprocess.Popen(
@@ -2434,12 +2468,27 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
         for line in proc.stdout:
             line = line.strip()
             if line:
-                _capture_orchestrator_result(line, is_agy, state)
+                _capture_orchestrator_result(line, kind, state)
     finally:
         timer.cancel()
         stop_heartbeat.set()
 
     proc.wait()
+
+    # Codex: a resposta final confiável vem do arquivo -o, não do stream.
+    if output_file:
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                ftext = f.read().strip()
+            if ftext:
+                state["final_text"] = ftext
+        except OSError:
+            pass
+        finally:
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
 
     if timed_out["flag"]:
         section.close(ok=False, error_detail=f"não respondeu em {timeout_s}s (timeout)")
@@ -2488,7 +2537,7 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
         "lição. Essa linha não aparece pro usuário, só fica guardada pra você mesmo no futuro."
     )
 
-    cmd, binary = _build_orchestrator_cmd(role, prompt)
+    cmd, binary, ofile = _build_orchestrator_cmd(role, prompt)
 
     env = os.environ.copy()
     env_file = role.get("env_file")
@@ -2497,7 +2546,7 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
 
     section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
     section.open()
-    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100)
+    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile)
     if not ok:
         return ""
 
@@ -3430,8 +3479,6 @@ def main():
             memory_context = _load_memory_context(get_project_id())
             prompt = build_orchestrator_prompt(config, history, memory_context)
 
-            cmd, cmd_binary = _build_orchestrator_cmd(role, prompt)
-
             env = os.environ.copy()
             env_file = role.get("env_file")
             if env_file:
@@ -3445,9 +3492,10 @@ def main():
             clean_output = ""
             hard_fail = False
             for attempt in range(2):
+                cmd, cmd_binary, cmd_ofile = _build_orchestrator_cmd(role, prompt)
                 section = LiveSection(role_name.capitalize(), icon, color)
                 section.open()
-                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150)
+                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150, output_file=cmd_ofile)
 
                 if not ok:
                     hard_fail = True
