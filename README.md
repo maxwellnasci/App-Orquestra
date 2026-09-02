@@ -30,14 +30,22 @@ Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Re
 ## Instalação
 
 ```bash
-pip install rich prompt_toolkit cryptography textual --break-system-packages
+pip install rich prompt_toolkit cryptography textual textual-image rich-pixels --break-system-packages
 # deixar o comando `orquestra` disponível em qualquer pasta:
 ln -sf "$PWD/orquestra" ~/.local/bin/orquestra
 ```
 
-Ferramentas externas (no PATH): `claude`, `agy`, `codex`, `gh` (com `gh copilot`).
+Ferramentas externas (no PATH): `claude`, `agy`, `codex`, `gh` (com `gh copilot`),
+e `chromium`/`google-chrome` (renderiza a prévia do Open Design dentro da TUI).
 Cérebro do Orquestrador: `~/.claude-deepseek-env` (chave DeepSeek) ou o `kimi` CLI
-(Ollama Cloud).
+(Ollama Cloud). Open Design: seção `open_design` no `~/.orquestra.json` (auto-semeada
+se o clone existir).
+
+**Prévia do Open Design dentro da TUI:** a imagem é renderizada na aba 🎨 Idea Studio.
+A nitidez depende do terminal — num terminal com protocolo de imagem (Kitty, WezTerm,
+Ghostty, Konsole, ou o terminal integrado do Cursor/VS Code com imagens ligadas) é uma
+imagem de verdade; num terminal simples (qterminal) vira blocos coloridos. Em qualquer
+caso, uma cópia `.orquestra_preview.png` fica na pasta do projeto.
 
 ## Uso
 
