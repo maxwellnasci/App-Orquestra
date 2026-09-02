@@ -1123,17 +1123,11 @@ class OrquestraTUI(App):
 
 
 def _startup():
-    """Roda ANTES do Textual assumir o terminal: memória, bridge, log, cofre."""
+    """Roda ANTES do Textual assumir o terminal: memória + cofre.
+    A TUI é autossuficiente — NÃO abre editor externo, NÃO sobe o bridge do
+    Cursor (isso era do REPL antigo). Tudo acontece dentro do Orquestra."""
     import orquestra
-    from pathlib import Path as _P
     orquestra._init_memory_db()
-    orquestra._start_bridge_server()
-    try:
-        log_path = _P(orquestra.get_project_dir()) / orquestra.LOG_FILE_NAME
-        log_path.write_text("# Orquestra — Logs de Execução ao Vivo\n\n", encoding="utf-8")
-        orquestra._auto_open_in_cursor([str(log_path)])
-    except OSError:
-        pass
     try:
         vault = orquestra.VaultManager(orquestra.get_project_dir())
         if vault.needs_setup():
