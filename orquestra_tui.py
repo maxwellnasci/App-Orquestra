@@ -464,6 +464,24 @@ class OrquestraTUI(App):
             return "ollama-cloud"
         return "agy"  # Gemini / Antigravity
 
+    def _agent_models(self) -> dict:
+        """Só provedores que têm CLI de agente com ferramentas (Operador/Revisor).
+        Fora: Ollama Cloud (chat puro, sem ferramentas — só serve pro Orquestrador)."""
+        return {k: v for k, v in self.grouped_models.items() if "Ollama" not in k}
+
+    def _set_worker_model(self, slot: str, selected: str) -> bool:
+        """Valida e persiste a troca de modelo de um operário. Retorna False
+        (e avisa no chat) se o modelo não roda como agente com ferramentas."""
+        binary = self._binary_from_model(selected)
+        if binary in ("ollama-cloud", "brain"):
+            self.query_one("#chat-log", RichLog).write(
+                f"\n[yellow]⚠ '{selected}' é um modelo de chat puro (sem ferramentas) — "
+                f"não serve pro {slot}, que precisa ler/escrever arquivos. "
+                f"Escolha um Claude, Gemini, Codex ou DeepSeek.[/yellow]\n")
+            return False
+        self._persist_agent(slot, binary=binary, model=selected)
+        return True
+
     def _brain_provider_from_model(self, m: str) -> str:
         """Fallback quando o modelo não está no _model_provider (lista não carregou)."""
         m = m.lower()
@@ -549,19 +567,17 @@ class OrquestraTUI(App):
 
         elif event.button.id == "btn-sel-op":
             def update_op(selected: str | None):
-                if selected:
+                if selected and self._set_worker_model("operador", selected):
                     self._op_model = selected
                     event.button.label = f"Op: {shorten_name(selected)}"
-                    self._persist_agent("operador", binary=self._binary_from_model(selected), model=selected)
-            self.push_screen(ModelSelectionModal("Operador", self.grouped_models), update_op)
+            self.push_screen(ModelSelectionModal("Operador — executa (precisa de ferramentas)", self._agent_models()), update_op)
 
         elif event.button.id == "btn-sel-rev":
             def update_rev(selected: str | None):
-                if selected:
+                if selected and self._set_worker_model("revisor", selected):
                     self._rev_model = selected
                     event.button.label = f"Rev: {shorten_name(selected)}"
-                    self._persist_agent("revisor", binary=self._binary_from_model(selected), model=selected)
-            self.push_screen(ModelSelectionModal("Revisor", self.grouped_models), update_rev)
+            self.push_screen(ModelSelectionModal("Revisor — revisa (precisa de ferramentas)", self._agent_models()), update_rev)
 
         # Botões de aprovação do Operário
         elif event.button.id == "btn-approve":

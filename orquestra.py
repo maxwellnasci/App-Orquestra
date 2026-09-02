@@ -2670,11 +2670,15 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
     output_file = None
 
     if actual_binary == "agy":
+        # SEM --project: com --project, o agy opera no workspace-brain dele
+        # (~/.gemini/antigravity-cli/brain/<id>), não na pasta real. E --add-dir
+        # PRECISA ser caminho absoluto — "." é resolvido relativo ao scratch do
+        # agy, não ao cwd do processo. Com --add-dir <abs> o agy roda os comandos
+        # na pasta real do projeto (testado).
         cmd = ["agy", "-p", instruction,
                "--output-format", "stream-json",
                "--dangerously-skip-permissions",
-               "--project", get_project_id(),
-               "--add-dir", "."]
+               "--add-dir", get_project_dir()]
         if worker_model:
             cmd.extend(["--model", worker_model])
     elif actual_binary == "codex":
@@ -2695,10 +2699,15 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
         if worker_model:
             cmd.extend(["--model", worker_model])
     else:
+        # claude (inclui a tag "deepseek", que é claude + env_file) e qualquer
+        # binary inesperado. Só passa --model se parecer um modelo que o claude
+        # aceita (claude-* ou deepseek-* via env) — senão o claude rejeita e o
+        # operário "não funciona" sem erro claro.
         cmd = ["claude", "-p", instruction,
                "--output-format", "stream-json", "--verbose",
                "--permission-mode", "bypassPermissions"]
-        if worker_model:
+        _m = (worker_model or "").lower()
+        if worker_model and (_m.startswith("claude") or _m.startswith("deepseek") or actual_binary == "claude"):
             cmd.extend(["--model", worker_model])
 
     worker_env = os.environ.copy()
