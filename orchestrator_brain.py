@@ -131,8 +131,10 @@ def main():
         if provider == "deepseek":
             key, url = _creds_deepseek()
             if not key:
-                emit("Sem credencial DeepSeek (~/.claude-deepseek-env). Rode /agentes trocar "
-                     "e escolha outro cérebro para o Orquestrador.", ok=False)
+                key = os.environ.get("DEEPSEEK_API_KEY", "")
+            if not key:
+                emit("Sem credencial DeepSeek. Adicione no cofre: /senha DEEPSEEK_API_KEY <sua-chave> "
+                     "(ou configure ~/.claude-deepseek-env).", ok=False)
             msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
             emit(_call_openai_compatible(url, key, model, msgs))
 
@@ -152,9 +154,18 @@ def main():
         elif provider == "openai":
             key = os.environ.get("OPENAI_API_KEY", "")
             if not key:
-                emit("Sem OPENAI_API_KEY no ambiente/cofre.", ok=False)
+                emit("Sem OPENAI_API_KEY. Adicione no cofre: /senha OPENAI_API_KEY <sua-chave>", ok=False)
             msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
             emit(_call_openai_compatible("https://api.openai.com/v1/chat/completions", key, model, msgs))
+
+        elif provider in ("gemini", "google"):
+            key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY", "")
+            if not key:
+                emit("Sem GEMINI_API_KEY. Adicione no cofre: /senha GEMINI_API_KEY <sua-chave> "
+                     "(chave do Google AI Studio, não é a mesma coisa que o login do agy).", ok=False)
+            msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": user}]
+            emit(_call_openai_compatible(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", key, model, msgs))
 
         else:
             emit(f"Provedor de cérebro desconhecido: '{provider}'.", ok=False)

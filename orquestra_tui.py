@@ -367,6 +367,7 @@ class OrquestraTUI(App):
         """Carrega modelos e configuração ao iniciar."""
         import orquestra
         self.grouped_models: dict = {}
+        self._model_provider: dict = {}
         cfg = orquestra.load_config()
         orq = cfg.get("roles", {}).get("orquestrador", {})
         ops = cfg.get("workers", {}).get("operador", {})
@@ -429,6 +430,20 @@ class OrquestraTUI(App):
             "🤖 OpenAI Codex":         [(label, val) for val, label in codex_raw],
         }
 
+        # value do modelo → provedor (pra saber como falar com ele).
+        _COMPANY_PROVIDER = {
+            "☁️ Ollama Cloud (Kimi)": "ollama-cloud",
+            "🚀 Antigravity (Gemini)": "gemini",
+            "🧠 Anthropic Claude": "anthropic",
+            "🛸 GitHub Copilot": "copilot",
+            "🐋 DeepSeek": "deepseek",
+            "🤖 OpenAI Codex": "openai",
+        }
+        self._model_provider = {}
+        for company, models in self.grouped_models.items():
+            for _label, val in models:
+                self._model_provider.setdefault(val, _COMPANY_PROVIDER.get(company, "ollama-cloud"))
+
         # Os defaults (orq/op/rev) já vieram do ~/.orquestra.json em on_mount.
         # Aqui só populamos as listas dos modais de troca de modelo. As labels
         # dos botões já foram setadas em on_mount.
@@ -448,6 +463,30 @@ class OrquestraTUI(App):
         if "kimi" in m or "nemotron" in m or "mistral" in m or "minimax" in m or "glm" in m or "gemma" in m or "qwen" in m:
             return "ollama-cloud"
         return "agy"  # Gemini / Antigravity
+
+    def _brain_provider_from_model(self, m: str) -> str:
+        """Fallback quando o modelo não está no _model_provider (lista não carregou)."""
+        m = m.lower()
+        if m.startswith("claude") or any(x in m for x in ("sonnet", "opus", "haiku")):
+            return "anthropic"
+        if m.startswith("gemini"):
+            return "gemini"
+        if m.startswith("deepseek-v4") or m == "deepseek-chat":
+            return "deepseek"
+        if m.startswith(("gpt-3", "gpt-4", "gpt-5", "o1", "o3", "o4")):
+            return "openai"
+        return "ollama-cloud"  # kimi, gpt-oss, nemotron, glm, qwen, minimax...
+
+    def _check_brain_key(self, provider: str) -> None:
+        """Avisa no chat se o cérebro escolhido precisa de uma chave que não está no ambiente."""
+        import os
+        need = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY",
+                "gemini": "GEMINI_API_KEY"}
+        var = need.get(provider)
+        if var and not (os.environ.get(var) or (provider == "gemini" and os.environ.get("GOOGLE_API_KEY"))):
+            self.query_one("#chat-log", RichLog).write(
+                f"\n[yellow]⚠ Esse modelo precisa de {var}. Adicione com  "
+                f"[bold]/senha {var} <sua-chave>[/bold]  e reabra o Orquestra.[/yellow]\n")
 
     def _persist_agent(self, slot: str, **fields) -> None:
         """Grava a escolha de modelo/binary de um agente no ~/.orquestra.json,
@@ -491,18 +530,22 @@ class OrquestraTUI(App):
 
         # Seleção de Modelos
         if event.button.id == "btn-sel-orq":
-            # O Orquestrador só aceita "cérebros" de chat puro (DeepSeek/Ollama).
-            brains = {k: v for k, v in self.grouped_models.items()
-                      if "DeepSeek" in k or "Ollama" in k}
+            # O Orquestrador fala com o modelo por CHAT PURO (zero ferramentas) —
+            # todas as empresas servem, MENOS Copilot (não tem API de chat direto).
+            brains = {k: v for k, v in self.grouped_models.items() if "Copilot" not in k}
             def update_orq(selected: str | None):
                 if selected:
                     self._orq_model = selected
                     self._orq_binary = "brain"
-                    self._orq_provider = "deepseek" if "deepseek" in selected.lower() else "ollama-cloud"
+                    self._orq_provider = (self._model_provider.get(selected)
+                                          or self._brain_provider_from_model(selected))
                     event.button.label = f"Orq: {shorten_name(selected)}"
                     self._persist_agent("orquestrador", binary="brain",
                                         provider=self._orq_provider, model=selected)
-            self.push_screen(ModelSelectionModal("Orquestrador", brains or self.grouped_models), update_orq)
+                    self._check_brain_key(self._orq_provider)
+            self.push_screen(
+                ModelSelectionModal("Orquestrador — chat puro, sem ferramentas", brains or self.grouped_models),
+                update_orq)
 
         elif event.button.id == "btn-sel-op":
             def update_op(selected: str | None):
@@ -623,10 +666,22 @@ class OrquestraTUI(App):
         self._run_orchestrator(prompt)
 
     def _handle_slash(self, cmd: str, log) -> None:
-        """Comandos rápidos dentro da TUI (/modo, /detalhe, /ajuda)."""
-        import orquestra, json
+        """Comandos rápidos dentro da TUI (/senha, /modo, /detalhe, /design, /ajuda)."""
+        import orquestra, json, os
         parts = cmd.split()
         head = parts[0].lower()
+
+        if head.startswith("/senha") or head in ("/senhas", "/cofre", "/cofre-status"):
+            if not (_VAULT and _VAULT.is_unlocked):
+                log.write("\n[yellow]Cofre bloqueado. Reabra o Orquestra e digite a senha mestra.[/yellow]\n")
+                return
+            resp = _VAULT.handle_command(cmd)
+            # /senha NOME valor → injeta já nesta sessão (senão só valeria ao reabrir)
+            sp = cmd.split(None, 2)
+            if head == "/senha" and len(sp) == 3:
+                os.environ[sp[1].upper().strip()] = sp[2].strip()
+            log.write(f"\n[green]🔐 {resp or 'ok'}[/green]\n")
+            return
         if head in ("/modo", "/mode") and len(parts) > 1:
             mode = "tecnico" if parts[1].lower().startswith(("tec", "téc", "dev")) else "chat"
             config = orquestra.load_config()
@@ -649,8 +704,9 @@ class OrquestraTUI(App):
             else:
                 self._open_design_project(log)
         elif head in ("/ajuda", "/help"):
-            log.write("\n[dim]/design <o que prever> · /modo chat|tecnico · "
-                      "/detalhe minimal|normal|full · botões do topo trocam os modelos[/dim]\n")
+            log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
+                      "/modo chat|tecnico · /detalhe minimal|normal|full · "
+                      "botões do topo trocam os modelos[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
 
@@ -1122,10 +1178,14 @@ class OrquestraTUI(App):
         self.query_one("#chat-input").focus()
 
 
+_VAULT = None  # cofre desbloqueado, pra o /senha funcionar dentro da TUI
+
+
 def _startup():
     """Roda ANTES do Textual assumir o terminal: memória + cofre.
     A TUI é autossuficiente — NÃO abre editor externo, NÃO sobe o bridge do
     Cursor (isso era do REPL antigo). Tudo acontece dentro do Orquestra."""
+    global _VAULT
     import orquestra
     orquestra._init_memory_db()
     try:
@@ -1135,6 +1195,8 @@ def _startup():
         else:
             vault.unlock_interactive()
         vault.inject_env()
+        if vault.is_unlocked:
+            _VAULT = vault
     except RuntimeError as e:
         print(f"⚠ Cofre indisponível: {e}\n  Continuando sem o cofre nesta sessão.\n")
 

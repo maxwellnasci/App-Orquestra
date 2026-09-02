@@ -116,11 +116,17 @@ operários com nomes soltos, `ollama_api_key` em texto puro).
 
 ### Cérebros do Orquestrador (`binary="brain"`)
 
-| provider | credencial | modelos |
+`orchestrator_brain.py` fala com o modelo por chat completions puro (zero
+ferramentas). Qualquer empresa serve — MENOS Copilot (não tem API de chat direto).
+O botão `Orq:` no topo lista todos; se faltar a chave, o Orquestrador avisa no chat.
+
+| provider | credencial | funciona sem configurar? |
 |---|---|---|
-| `deepseek` | `~/.claude-deepseek-env` (`ANTHROPIC_API_KEY`) | `deepseek-v4-flash`, `deepseek-v4-pro` |
-| `ollama-cloud` | `kimi provider list --json` | `kimi-k3`, `gpt-oss:120b`, ... |
-| `anthropic` / `openai` | env / cofre | — |
+| `deepseek` | `~/.claude-deepseek-env` (`ANTHROPIC_API_KEY`) ou `/senha DEEPSEEK_API_KEY` | ✅ (se o env existir) |
+| `ollama-cloud` | `kimi provider list --json` | ✅ (se o `kimi` estiver configurado) |
+| `anthropic` | `/senha ANTHROPIC_API_KEY sk-ant-...` | precisa da chave |
+| `openai` | `/senha OPENAI_API_KEY sk-...` | precisa da chave |
+| `gemini` | `/senha GEMINI_API_KEY ...` (Google AI Studio — não é o login do `agy`) | precisa da chave |
 
 ### Motores dos operários (`binary=`)
 
