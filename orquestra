@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Resolve o caminho real caso seja um symlink
+# Launcher do Orquestra. Resolve o caminho real caso seja um symlink em ~/.local/bin,
+# então `orquestra` funciona de qualquer pasta (a pasta atual vira o projeto).
 REAL_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$REAL_PATH")" && pwd)"
 
-if [ -z "$TMUX" ]; then
-    # Inicia uma sessão tmux efêmera para permitir uso de split-window (ChatOps)
-    tmux new-session -d -s "orquestra_$$" "python3 '$SCRIPT_DIR/orquestra.py' $*"
-    tmux set-option -g mouse on
-    exec tmux attach-session -t "orquestra_$$"
-else
+# Interface oficial = TUI (Textual). `orquestra --repl` cai no REPL antigo
+# (headless/debug). Qualquer outro argumento é repassado.
+if [ "$1" = "--repl" ]; then
+    shift
     exec python3 "$SCRIPT_DIR/orquestra.py" "$@"
 fi
+
+exec python3 "$SCRIPT_DIR/orquestra_tui.py" "$@"

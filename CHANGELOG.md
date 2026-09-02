@@ -1,4 +1,26 @@
-# Changelog Orquestra V3 🚀
+# Changelog Orquestra
+
+## V4 — TUI + arquitetura de 3 agentes (set/2026)
+
+- **A TUI (`orquestra_tui.py`) virou a interface oficial.** `orquestra` abre a TUI;
+  `orquestra --repl` cai no REPL antigo. Startup da TUI agora faz cofre + memória +
+  bridge + log.
+- **3 agentes + Cão de Guarda:** Orquestrador (estrategista), Operador (executor),
+  Revisor (sob demanda), Cão de Guarda (Copilot automático).
+- **Orquestrador sem ferramentas por construção** — novo `orchestrator_brain.py`
+  (chat completions puro, DeepSeek/Ollama). Removidas as flags `--add-dir` /
+  `--dangerously-skip-permissions` do comando do Orquestrador.
+- **Cão de Guarda consertado** — antes `_run_copilot_watchdog()` definia a thread e
+  nunca a disparava (no-op). Agora roda de verdade, 1x por turno, com o `git diff`
+  no prompt.
+- **Gate de plano restaurado** — o Orquestrador emite `<PLANO>` e para; a TUI mostra
+  "▶ Executar plano / ✏️ Ajustar".
+- `/modo` e `/detalhe` voltaram a funcionar (eram hardcoded).
+- Config migra automaticamente da v1; `ollama_api_key` em texto puro é removida.
+- Bridge HTTP agora exige token de sessão e valida os caminhos.
+- `test_orquestra.py` — testes sem rede.
+
+## V3 (Cockpit) 🚀
 
 ## Novidades (V3 Cockpit)
 Este arquivo documenta as grandes mudanças da arquitetura e da experiência de uso do terminal no Orquestra V3.

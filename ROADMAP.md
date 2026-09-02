@@ -1,32 +1,46 @@
-# Roadmap e Ajustes — Orquestra
+# Roadmap e quadro de ideias — Orquestra
 
-Este documento serve como nosso quadro de ideias e documentação viva. 
-Conforme você for usando a interface `orquestra` no seu dia a dia, anote aqui o que está achando, o que incomoda e o que poderíamos melhorar. Nós vamos editando e evoluindo a ferramenta a partir daqui!
+Documento vivo. Conforme for usando a TUI no dia a dia, anote aqui o que incomoda e
+o que dá pra melhorar.
 
-## 📝 Documentação Atual
-A ferramenta funciona como um envelope ("wrapper") para 3 agentes diferentes:
-- **deepseek**: Usa a interface do Claude Code, mas com a API do DeepSeek v4 Pro (não gasta seus créditos Anthropic).
-- **claude**: Claude Code nativo (Anthropic).
-- **agy**: Antigravity CLI oficial.
+## Arquitetura atual (V4)
 
+TUI (Textual) como interface oficial. 3 agentes + Cão de Guarda:
 
-## 🎯 Backlog de Ideias e Melhorias Concluídas
+- **🎼 Orquestrador** — estrategista, chat puro (`orchestrator_brain.py`), **zero ferramentas**.
+  Conversa, faz o `<PLANO>` (com gate de aprovação) e delega.
+- **🔨 Operador** — executa (lê/escreve/roda). Claude Code por padrão.
+- **🔍 Revisor** — revisão sob demanda (botão ou pipeline).
+- **🐕 Cão de Guarda** — Copilot automático, audita cada `git diff` antes do commit.
 
-- [x] **Agentes com Papéis (Roles):** Implementados 6 papéis — Ajudante, Implementador, Fiscal, Segurança, Estrategista, Analista.
-- [x] **Roteador Inteligente:** O Gemini Flash analisa o pedido e delega para o especialista correto.
-- [x] **Memória de Conversa & Resposta da IA:** Salva tanto os pedidos do usuário quanto a resposta gerada pela IA em `~/.orquestra_chats/`.
-- [x] **"Bom Dia" Inteligente (Na Abertura):** O Ajudante analisa silenciosamente o histórico e abre a tela com um resumo de 2 linhas sobre onde o projeto parou.
-- [x] **Despedida Segura (`/sair`):** Pergunta se deseja gerar o relatório executivo `RESUMO_DIA.md` na pasta do projeto ao fechar.
-- [x] **Menu Interativo TUI (`/agentes trocar`):** Troca de modelos navegando pelas setas do teclado em 3 passos (Papel -> Família -> Modelo).
-- [x] **Busca Dinâmica de Modelos:** Consulta a CLI do Antigravity (`agy models`) e APIs em tempo real para exibir modelos novos automaticamente.
-- [x] **Interface Unificada sem Telas Pulantes:** `agy` e `claude` rodam centralizados de forma transparente com barra de progresso (spinner).
+Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 
-## 💡 Próximas Ideias Futuras
-- [ ] *(Adicione suas ideias aqui para as próximas semanas...)*
+## ✅ Feito
 
-## 🐛 Bugs Conhecidos
-- *(Nenhum bug reportado até o momento)*
+- [x] TUI vira a interface oficial (`orquestra` abre a TUI; `--repl` = REPL legado)
+- [x] Orquestrador estrategista sem ferramentas (cérebro via chat completions: DeepSeek/Ollama)
+- [x] Operador / Revisor / Cão de Guarda como agentes de verdade na config
+- [x] Cão de Guarda funcionando (era código morto) — roda 1x/turno com o `git diff` no prompt
+- [x] Gate de plano restaurado (`<PLANO>` → "▶ Executar / ✏️ Ajustar")
+- [x] `<PIPELINE>` na TUI retoma sozinho após o Aprovar
+- [x] "Aprovar" commita de verdade; "Rejeitar" reverte só os arquivos da tarefa
+- [x] `/modo` e `/detalhe` reativados
+- [x] Migração automática da config v1 → v2; `ollama_api_key` em texto puro removida
+- [x] Bridge HTTP com token de sessão + validação de path
+- [x] `test_orquestra.py` (testes sem rede)
+
+## 💡 Próximas ideias
+
+- [ ] Menu `/agentes trocar` completo dentro da TUI (hoje só os botões do topo)
+- [ ] `/goal` no REPL ainda usa o prompt antigo de estrategista — realinhar com o cérebro novo
+- [ ] Revisor automático opcional depois de cada aprovação (config toggle)
+- [ ] Limpar os roles v1 (`ajudante`, `fiscal`, `segurança`, `estrategista`) do `~/.orquestra.json`
+- [ ] Failover de cérebro do Orquestrador (se DeepSeek cair, tenta Ollama)
+- [ ] *(anote as suas aqui...)*
+
+## 🐛 Bugs conhecidos
+
+- Nenhum aberto no momento.
 
 ---
-*Dica: Quando quiser que eu implemente uma ideia daqui, basta me dizer "Pegue o item X do nosso roadmap e implemente".*
-
+*Dica: "pega o item X do roadmap e implementa".*

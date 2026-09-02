@@ -47,89 +47,84 @@ HISTORY_FILE = Path.home() / ".orquestra_history"
 DEEPSEEK_ENV = Path.home() / ".claude-deepseek-env"
 CHAT_HISTORY_DIR = Path.home() / ".orquestra_chats"
 
+# ── Arquitetura de 3 agentes + Cão de Guarda ────────────────────────────────
+# roles.orquestrador  → o ESTRATEGISTA. binary="brain" = chat completions puro
+#                       (orchestrator_brain.py), zero ferramentas por construção.
+#                       Só conversa, planeja e delega — nunca executa nada.
+# workers.operador     → EXECUTA: lê, escreve, altera código, roda comandos.
+# workers.revisor      → REVISA sob demanda (bugs, arquitetura, segurança).
+# workers.cao_guarda   → Copilot AUTOMÁTICO e silencioso: audita cada git diff.
+# workers.claude/agy/deepseek/codex → atalhos de motor específico (uso avançado).
 DEFAULT_CONFIG = {
     "active_role": "orquestrador",
     "roles": {
         "orquestrador": {
-            "binary": "agy",
-            "model": "gemini-3.6-flash-high",
+            "binary": "brain",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
             "icon": "🎼",
             "color": "cyan",
-            "description": "O Orquestra — chat fixo com memória do projeto. Troque o modelo aqui."
-        },
-        "ajudante": {
-            "binary": "agy",
-            "model": "gemini-3.6-flash-high",
-            "icon": "⚡",
-            "color": "yellow",
-            "description": "Dúvidas rápidas, pesquisas e explicação de conceitos."
-        },
-        "implementador": {
-            "binary": "claude",
-            "env_file": str(DEEPSEEK_ENV),
-            "icon": "💻",
-            "color": "cyan",
-            "description": "Codificador principal (escreve e altera arquivos)."
-        },
-        "fiscal": {
-            "binary": "agy",
-            "model": "gemini-3.1-pro-high",
-            "icon": "🔎",
-            "color": "magenta",
-            "description": "Revisão de código e caça a bugs."
-        },
-        "segurança": {
-            "binary": "agy",
-            "model": "gemini-3.1-pro-high",
-            "icon": "🛡️",
-            "color": "red",
-            "description": "Análise de vulnerabilidades de segurança."
-        },
-        "estrategista": {
-            "binary": "agy",
-            "model": "claude-opus-4-6-thinking",
-            "icon": "🧠",
-            "color": "blue",
-            "description": "Planejamento de arquitetura e decisões complexas."
-        },
-        "analista": {
-            "binary": "claude",
-            "model": "claude-sonnet-5",
-            "icon": "🔬",
-            "color": "green",
-            "description": "Análise profunda de código, diagnósticos e leitura crítica."
+            "description": "O estrategista — conversa, planeja e delega. Nunca executa nada sozinho."
         }
     },
     "workers": {
+        "operador": {
+            "binary": "claude",
+            "model": "claude-sonnet-5",
+            "icon": "🔨",
+            "color": "cyan",
+            "label": "Operador",
+            "description": "Executa: lê, escreve e altera código, roda comandos."
+        },
+        "revisor": {
+            "binary": "claude",
+            "model": "claude-opus-5",
+            "icon": "🔍",
+            "color": "blue",
+            "label": "Revisor",
+            "description": "Revisa código sob demanda: bugs, arquitetura, segurança."
+        },
+        "cao_guarda": {
+            "binary": "copilot",
+            "model": "auto",
+            "icon": "🐕",
+            "color": "yellow",
+            "label": "Cão de Guarda",
+            "description": "Copilot automático — audita cada git diff em silêncio."
+        },
         "claude": {
             "binary": "claude",
             "model": "",
             "icon": "💞",
-            "label": "Operário Claude",
-            "description": "Abertura no painel lateral para codificação pesada"
+            "label": "Motor Claude",
+            "description": "Atalho: força o Claude Code nativo."
         },
         "agy": {
             "binary": "agy",
             "model": "gemini-3.1-pro-high",
             "icon": "💚",
-            "label": "Operário Antigravity (Agy)",
-            "description": "Abertura no painel lateral para pesquisa e análise"
+            "label": "Motor Antigravity",
+            "description": "Atalho: força o Antigravity (Gemini)."
         },
         "deepseek": {
             "binary": "claude",
             "model": "deepseek-v4-pro",
             "env_file": str(DEEPSEEK_ENV),
             "icon": "💙",
-            "label": "Operário DeepSeek",
-            "description": "Abertura no painel lateral via claude-deepseek"
+            "label": "Motor DeepSeek",
+            "description": "Atalho: Claude Code apontado para a API do DeepSeek."
         },
         "codex": {
             "binary": "codex",
             "model": "",
             "icon": "🤖",
-            "label": "Operário Codex",
-            "description": "Abertura no painel lateral via Codex CLI (OpenAI)"
+            "label": "Motor Codex",
+            "description": "Atalho: força o Codex CLI (OpenAI)."
         }
+    },
+    "ui": {
+        "mode": "chat",
+        "detail": "normal"
     }
 }
 
@@ -270,16 +265,36 @@ def load_config() -> dict:
     
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    
+
     needs_save = False
 
-    # Garante que todos os roles existem
+    # ── Migração v1 → v2 (arquitetura de 3 agentes) ──────────────────────────
+    # v1: orquestrador rodava via `agy`/`claude` (com ferramentas) e os operários
+    # tinham nomes soltos (implementador/arquiteto/...). v2: orquestrador vira
+    # `brain` (chat puro, zero ferramentas) e os operários viram operador/revisor/
+    # cao_guarda. Preserva o modelo que o usuário tenha escolhido, quando dá.
+    orq = cfg.get("roles", {}).get("orquestrador", {})
+    if orq.get("binary") in ("agy", "claude", "ollama-cloud"):
+        legado_modelo = orq.get("model", "")
+        cfg.setdefault("roles", {})["orquestrador"] = dict(DEFAULT_CONFIG["roles"]["orquestrador"])
+        console.print(
+            "[dim]⚙  Config migrada: o Orquestrador agora é um estrategista sem ferramentas "
+            f"(era {orq.get('binary')}/{legado_modelo or 'padrão'}). Use /agentes trocar para ajustar.[/dim]"
+        )
+        needs_save = True
+
+    # ollama_api_key em texto puro nunca foi usado (o brain lê do provider) — remove
+    if "ollama_api_key" in cfg:
+        del cfg["ollama_api_key"]
+        needs_save = True
+
+    # Garante que todos os roles do default existem
     for role_name, role_data in DEFAULT_CONFIG["roles"].items():
         if role_name not in cfg.get("roles", {}):
             cfg.setdefault("roles", {})[role_name] = role_data
             needs_save = True
 
-    # Garante que a seção workers existe
+    # Garante que a seção workers existe e tem operador/revisor/cao_guarda
     if "workers" not in cfg:
         cfg["workers"] = DEFAULT_CONFIG["workers"]
         needs_save = True
@@ -289,10 +304,15 @@ def load_config() -> dict:
                 cfg["workers"][w_name] = w_data
                 needs_save = True
 
-    # Garante que a seção ui existe (modo técnico/chat)
+    # Garante que a seção ui existe e tem 'detail'
     if "ui" not in cfg:
-        cfg["ui"] = DEFAULT_CONFIG["ui"]
+        cfg["ui"] = dict(DEFAULT_CONFIG["ui"])
         needs_save = True
+    else:
+        for k, v in DEFAULT_CONFIG["ui"].items():
+            if k not in cfg["ui"]:
+                cfg["ui"][k] = v
+                needs_save = True
 
     if needs_save:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -550,9 +570,45 @@ def _git_status_paths(cwd: str) -> set:
         if " -> " in path:  # renome: "old -> new"
             path = path.split(" -> ", 1)[1].strip()
         path = path.strip('"')
-        if path:
+        if path and not _is_noise_path(path):
             paths.add(path)
     return paths
+
+def commit_pending(cwd: str, message: str) -> str:
+    """Commita os arquivos com mudança não commitada (ignora ruído tipo
+    __pycache__). Retorna a lista de arquivos commitados, ou '' se nada."""
+    dirty = _git_dirty_files(cwd)
+    if not dirty:
+        return ""
+    subprocess.run(["git", "add", "--"] + sorted(dirty), cwd=cwd, capture_output=True)
+    r = subprocess.run(["git", "commit", "-m", message], cwd=cwd, capture_output=True, text=True)
+    return ", ".join(sorted(dirty)) if r.returncode == 0 else ""
+
+
+def revert_pending(cwd: str) -> str:
+    """Descarta as mudanças não commitadas: checkout dos rastreados + clean dos
+    novos (menos ruído). Retorna a lista revertida."""
+    try:
+        res = subprocess.run(["git", "status", "--porcelain"], cwd=cwd,
+                              capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+    tracked, untracked = [], []
+    for line in res.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        code, path = line[:2], line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if _is_noise_path(path):
+            continue
+        (untracked if code == "??" else tracked).append(path)
+    if tracked:
+        subprocess.run(["git", "checkout", "HEAD", "--"] + tracked, cwd=cwd, capture_output=True)
+    if untracked:
+        subprocess.run(["git", "clean", "-fd", "--"] + untracked, cwd=cwd, capture_output=True)
+    return ", ".join(sorted(tracked + untracked))
+
 
 def _infer_task_kind(instruction: str) -> str:
     """Heurística simples por palavra-chave, sem chamada de LLM e sem mexer no
@@ -723,12 +779,16 @@ def handle_safe_exit(config: dict):
                     f"Histórico:\n{history_text}"
                 )
                 
-                result = subprocess.run(
-                    ["agy", "--model", "gemini-3.1-pro-high", "--print", prompt],
-                    capture_output=True, text=True
-                )
-                
-                if result.returncode == 0:
+                try:
+                    result = subprocess.run(
+                        ["agy", "--model", "gemini-3.1-pro-high", "-p", prompt],
+                        capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                    console.print(f"[red]⚠ Falha ao gerar o resumo ({e}).[/red]")
+                    result = None
+
+                if result is not None and result.returncode == 0:
                     out = result.stdout.strip()
                     out = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', out)
                     
@@ -919,6 +979,13 @@ def open_design_resolve_project(config: dict) -> dict | None:
     return {"daemon_url": daemon_url, "web_url": web_url, "project_id": project_id}
 
 
+def _is_noise_path(p: str) -> bool:
+    """Artefatos que o operário gera de passagem (rodar testes, importar) e que
+    não interessam na aprovação — nunca entram no changes_summary/commit."""
+    return ("__pycache__" in p or p.endswith((".pyc", ".pyo"))
+            or p.endswith((".orquestra_logs.md", ".pytest_cache")) or "/.pytest_cache/" in p)
+
+
 def _git_dirty_files(project_dir: str) -> set | None:
     """Lista de arquivos com mudança não commitada, ou None se a pasta não for um repo git."""
     try:
@@ -930,7 +997,8 @@ def _git_dirty_files(project_dir: str) -> set | None:
         return None
     if result.returncode != 0:
         return None
-    return {line[3:].strip() for line in result.stdout.splitlines() if line.strip()}
+    return {line[3:].strip() for line in result.stdout.splitlines()
+            if line.strip() and not _is_noise_path(line[3:].strip())}
 
 
 def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600,
@@ -1160,49 +1228,6 @@ def print_roles(config: dict):
 
     console.print(Panel(table, title="[bold]Sua Equipe de Especialistas[/bold]", border_style="dim cyan"))
 
-def auto_route_prompt(prompt: str, config: dict) -> str:
-    roles = list(config.get("roles", {}).keys())
-    if not roles:
-        return config.get("active_role", "")
-    
-    roles_str = ", ".join(roles)
-    
-    system_prompt = (
-        f"Você é o orquestrador inteligente de uma equipe de especialistas de IA. "
-        f"Sua única função é ler o pedido do usuário e retornar EXATAMENTE UMA PALAVRA "
-        f"da seguinte lista de especialistas, que melhor se encaixa no pedido: [{roles_str}]. "
-        f"Não adicione nenhuma explicação, nem pontuação. Apenas o nome do especialista em minúsculas.\n\n"
-        f"Pedido do usuário: {prompt}"
-    )
-    
-    try:
-        # Usando o agy com o modelo Flash que é ultra rápido
-        result = subprocess.run(
-            ["agy", "--model", "gemini-3.6-flash-high", "--print", system_prompt],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        chosen_role = result.stdout.strip().lower()
-        # Limpar pontuação caso a IA tenha retornado com ponto
-        chosen_role = "".join(c for c in chosen_role if c.isalnum() or c == "-")
-        
-        # Verifica se a IA respondeu um papel válido
-        if chosen_role in roles:
-            return chosen_role
-            
-        # Fallback tenta encontrar se alguma role está contida na resposta
-        for r in roles:
-            if r in chosen_role:
-                return r
-                
-    except Exception as e:
-        # Se falhar silenciosamente (ex: CLI indisponível), retorna a role atual
-        pass
-        
-    return config.get("active_role", "")
-
 def edit_config():
     editor = os.environ.get("EDITOR", "nano")
     console.print(f"[dim]Abrindo {CONFIG_FILE} no editor ({editor})...[/dim]")
@@ -1326,6 +1351,27 @@ def _fetch_codex_models() -> list[tuple[str, str]]:
     'padrão' como primeira opção segura (ver _CODEX_FALLBACK)."""
     return _CODEX_FALLBACK
 
+_OLLAMA_FALLBACK = [
+    ("gpt-oss:120b", "GPT-OSS 120b (Ollama Cloud)"),
+    ("kimi-k2.7-code", "Kimi 2.7 Code (Ollama Cloud)"),
+]
+
+def _fetch_ollama_models() -> list[tuple[str, str]]:
+    """Tenta buscar a lista de modelos do Ollama Cloud direto do Kimi CLI."""
+    try:
+        import json, subprocess
+        res = subprocess.run(["kimi", "provider", "list", "--json"], capture_output=True, text=True, timeout=5)
+        data = json.loads(res.stdout)
+        models = []
+        for k, v in data.get("models", {}).items():
+            if v.get("provider") == "ollama-cloud":
+                models.append((v.get("model", ""), v.get("displayName", "")))
+        if models:
+            return models
+    except Exception:
+        pass
+    return _OLLAMA_FALLBACK
+
 
 def _fetch_copilot_models() -> list[tuple[str, str]]:
     """Busca modelos disponíveis no GitHub Copilot via API em tempo real.
@@ -1371,30 +1417,46 @@ _DIALOG_STYLE = PTStyle.from_dict({
     "radio-list .selected": "bg:#313244 fg:#89b4fa bold",
 })
 
+# Motores para os OPERÁRIOS (harness de agente completo — leem/escrevem/rodam).
 _FAMILIA_CHOICES = [
     ("claude",   "💞 Claude Code            (claude) — Anthropic"),
     ("codex",    "🤖 Codex                  (codex)  — OpenAI"),
     ("deepseek", "💙 Claude-DeepSeek        (claude) — DeepSeek V4"),
     ("gemini",   "💚 Antigravity            (agy)    — Google"),
-    ("copilot",  "🤖 Copilot                (copilot)— GitHub"),
+    ("copilot",  "🐕 Copilot                (copilot)— GitHub"),
+]
+
+# Cérebros para o ORQUESTRADOR (chat puro, ZERO ferramentas — só planeja e delega).
+_BRAIN_CHOICES = [
+    ("brain-deepseek", "🧠 DeepSeek (chat direto)   — rápido e barato, sem ferramentas"),
+    ("brain-ollama",   "🧠 Ollama Cloud (Kimi/GPT)  — chat direto, sem ferramentas"),
 ]
 
 _SLOT_LABELS = {
-    "orquestrador": "Orquestrador",
-    "implementador": "Implementador (Claude)",
-    "arquiteto": "Arquiteto (DeepSeek)",
-    "pesquisador": "Pesquisador (Copilot/Agy)",
-    "designer": "Designer (Agy)",
-    "analista": "Analista (Codex/GPT)",
+    "orquestrador": "Orquestrador (Estrategista)",
+    "operador": "Operador (Executor)",
+    "revisor": "Revisor (sob demanda)",
+    "cao_guarda": "Cão de Guarda (automático)",
 }
 
 
 def _apply_familia(target: dict, familia: str, modelo: str):
-    """Aplica a família/modelo escolhidos num role/worker — qualquer um dos
-    dois formatos (config['roles']['orquestrador'] ou config['workers'][tag])
-    aceita qualquer uma das 4 famílias, não só a combinação original. Isso é
-    o que permite trocar a 'gasolina' de qualquer operário se uma assinatura
-    específica der problema, sem depender de reescrever config na mão."""
+    """Aplica a família/modelo escolhidos num role/worker.
+    Famílias 'brain-*' são só para o Orquestrador (chat puro via
+    orchestrator_brain.py). As demais são motores de operário."""
+    if familia == "brain-deepseek":
+        target["binary"] = "brain"
+        target["provider"] = "deepseek"
+        target["model"] = modelo
+        target.pop("env_file", None)
+        return
+    if familia == "brain-ollama":
+        target["binary"] = "brain"
+        target["provider"] = "ollama-cloud"
+        target["model"] = modelo
+        target.pop("env_file", None)
+        return
+    target.pop("provider", None)
     if familia == "gemini":
         target["binary"] = "agy"
         target["model"] = modelo
@@ -1441,12 +1503,10 @@ def interactive_agent_selection(config: dict):
             workers = config.get("workers", {})
             orch = config.get("roles", {}).get("orquestrador", {})
             slot_choices = [
-                ("orquestrador", f"🎼  Orquestrador (Chefe)          [{_modelo_label(orch)}]"),
-                ("implementador",f"🔨  Implementador (Código)        [{_modelo_label(workers.get('implementador', {}))}]"),
-                ("arquiteto",    f"🏛️  Arquiteto (Revisão/Segurança) [{_modelo_label(workers.get('arquiteto', {}))}]"),
-                ("pesquisador",  f"🔎  Pesquisador (Busca/Docs)      [{_modelo_label(workers.get('pesquisador', {}))}]"),
-                ("designer",     f"🎨  Designer (Visual/UI)          [{_modelo_label(workers.get('designer', {}))}]"),
-                ("analista",     f"🧠  Analista (Solucionador/Dados) [{_modelo_label(workers.get('analista', {}))}]"),
+                ("orquestrador", f"🎼  Orquestrador (Estrategista)   [{_modelo_label(orch)}]"),
+                ("operador",     f"🔨  Operador (Executor)           [{_modelo_label(workers.get('operador', {}))}]"),
+                ("revisor",      f"🔍  Revisor (sob demanda)         [{_modelo_label(workers.get('revisor', {}))}]"),
+                ("cao_guarda",   f"🐕  Cão de Guarda (automático)    [{_modelo_label(workers.get('cao_guarda', {}))}]"),
             ]
             slot = radiolist_dialog(
                 title="\n  🎼  Orquestra — Trocar Inteligência",
@@ -1463,10 +1523,12 @@ def interactive_agent_selection(config: dict):
 
         elif step == "familia":
             slot_label = _SLOT_LABELS.get(slot, slot)
+            # O Orquestrador só aceita "cérebros" de chat puro (zero ferramentas).
+            choices = _BRAIN_CHOICES if slot == "orquestrador" else _FAMILIA_CHOICES
             familia = radiolist_dialog(
                 title="\n  🎼  Orquestra — Trocar Inteligência",
                 text=f"Passo 2 de 3  ──  Qual provedor para o {slot_label}?",
-                values=_FAMILIA_CHOICES,
+                values=choices,
                 style=_DIALOG_STYLE,
                 ok_text="Próximo →",
                 cancel_text="← Voltar",
@@ -1478,14 +1540,16 @@ def interactive_agent_selection(config: dict):
 
         elif step == "modelo":
             console.print("[dim]⏳ Buscando modelos...[/dim]", end="")
-            if familia == "gemini":
+            if familia in ("gemini",):
                 model_choices = _fetch_agy_models()
             elif familia == "claude":
                 model_choices = _fetch_claude_models()
-            elif familia == "deepseek":
+            elif familia in ("deepseek", "brain-deepseek"):
                 model_choices = _fetch_deepseek_models()
             elif familia == "copilot":
                 model_choices = _fetch_copilot_models()
+            elif familia == "brain-ollama":
+                model_choices = _fetch_ollama_models()
             else:
                 model_choices = _fetch_codex_models()
             console.print("\r                                        \r", end="")
@@ -1541,6 +1605,13 @@ def launch_interactive(config: dict) -> int:
         env.update(load_env_file(env_file))
 
     binary = role.get("binary", "agy")
+
+    if binary == "brain":
+        # O Orquestrador não tem sessão interativa (é chat puro). Cai no Operador.
+        console.print("[dim]O Orquestrador é só chat — abrindo o Operador interativamente.[/dim]")
+        role = config.get("workers", {}).get("operador", {"binary": "claude"})
+        role_name = "operador"
+        binary = role.get("binary", "claude")
 
     if not shutil.which(binary):
         console.print(f"[bold red]✗ Binário '{binary}' não encontrado no PATH.[/bold red]")
@@ -1632,8 +1703,16 @@ def _auto_open_images(text: str):
 
 
 def _detail_level(config: dict) -> str:
-    """Nível de verbosidade fixo em normal para o modo Cursor."""
-    return "normal"
+    """minimal | normal | full — quanto do trabalho ao vivo dos operários aparece.
+    Lido de config['ui']['detail'] (/detalhe), default 'normal'."""
+    lvl = (config or {}).get("ui", {}).get("detail", "normal")
+    return lvl if lvl in ("minimal", "normal", "full") else "normal"
+
+
+def _is_chat_mode(config: dict) -> bool:
+    """True = bolhas limpas + Orquestrador comenta o resultado. False (/modo tecnico)
+    = narração crua de tool calls. Lido de config['ui']['mode'], default 'chat'."""
+    return (config or {}).get("ui", {}).get("mode", "chat") != "tecnico"
 
 
 # ─────────────────────────────────────────────────────────
@@ -1730,6 +1809,30 @@ class LiveSection:
 
 _BRIDGE_PORT = 49152
 _bridge_server_thread = None
+# Token de sessão: só quem está no mesmo processo (via _auto_open_in_cursor) sabe.
+# Impede que qualquer outro processo local mande o bridge abrir/diffar arquivos.
+_BRIDGE_TOKEN = None
+
+
+def _bridge_token() -> str:
+    global _BRIDGE_TOKEN
+    if _BRIDGE_TOKEN is None:
+        _BRIDGE_TOKEN = os.urandom(16).hex()
+    return _BRIDGE_TOKEN
+
+
+def _bridge_path_ok(fp: str) -> bool:
+    """Aceita só caminhos dentro da pasta do projeto, do HOME ou do tempdir —
+    nunca um path arbitrário do sistema."""
+    try:
+        real = os.path.realpath(fp)
+    except (OSError, ValueError):
+        return False
+    roots = (os.path.realpath(get_project_dir()),
+             os.path.realpath(os.path.expanduser("~")),
+             os.path.realpath(tempfile.gettempdir()))
+    return any(real == r or real.startswith(r + os.sep) for r in roots)
+
 
 def _start_bridge_server():
     """Inicia o servidor bridge HTTP em uma thread daemon."""
@@ -1756,6 +1859,10 @@ def _start_bridge_server():
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length)
             try:
+                if self.headers.get('X-Orquestra-Token') != _bridge_token():
+                    self.send_response(403)
+                    self.end_headers()
+                    return
                 payload = json.loads(body)
                 action = payload.get('action')
                 cursor_bin = shutil.which('cursor')
@@ -1767,6 +1874,10 @@ def _start_bridge_server():
                 if action == 'diff':
                     f1 = payload.get('file1', '')
                     f2 = payload.get('file2', '')
+                    if not (_bridge_path_ok(f1) and _bridge_path_ok(f2)):
+                        self.send_response(400)
+                        self.end_headers()
+                        return
                     # Grava um arquivo .diff legível e abre no Cursor
                     result = subprocess.run(
                         ['diff', '-u', f1, f2],
@@ -1781,6 +1892,10 @@ def _start_bridge_server():
                 elif action == 'open':
                     fp = payload.get('file', '')
                     line = payload.get('line', 0)
+                    if not _bridge_path_ok(fp):
+                        self.send_response(400)
+                        self.end_headers()
+                        return
                     # Atualiza estado (Retrovisor)
                     try:
                         state_file = Path.home() / '.orquestra_cursor_state.json'
@@ -1837,7 +1952,7 @@ def _auto_open_in_cursor(file_paths: list[str], cwd=None):
             req = urllib.request.Request(
                 f"http://127.0.0.1:{_BRIDGE_PORT}",
                 data=json.dumps(payload).encode('utf-8'),
-                headers={'Content-Type': 'application/json'},
+                headers={'Content-Type': 'application/json', 'X-Orquestra-Token': _bridge_token()},
                 method='POST'
             )
             with urllib.request.urlopen(req, timeout=1.0) as resp:
@@ -2098,23 +2213,128 @@ def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: 
         section.tool_call("turno falhou.")
 
 
+_BRAIN_DIR = Path(__file__).resolve().parent
+
+
 def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
-    """Monta o comando de streaming pro PRÓPRIO orquestrador (decisão inicial do
-    turno e _orchestrator_react) — mesmo padrão de _build_worker_cmd, mas SEM
-    flags de escrita/permissão: o orquestrador só decide e conversa, nunca mexe
-    em arquivos (isso é sempre delegado a um operário via <DELEGATE>/<PIPELINE>).
-    Retorna (cmd, binary)."""
-    binary = role.get("binary", "agy")
+    """Monta o comando pro PRÓPRIO orquestrador (decisão do turno e
+    _orchestrator_react). O padrão é binary="brain" → orchestrator_brain.py:
+    chat completions PURO, zero ferramentas por construção — o estrategista não
+    consegue ler/escrever/rodar nada, só planeja e delega.
+
+    `agy`/`claude` são aceitos como fallback, mas SEM nenhuma flag de
+    ferramenta/permissão (spike confirmou que eles executam comandos mesmo em
+    --mode plan / --disallowedTools, então nesse modo o Orquestrador PODE furar
+    o papel — use só se o brain estiver indisponível). Retorna (cmd, binary)."""
+    binary = role.get("binary", "brain")
     model = role.get("model")
+
+    if binary in ("brain", "ollama-cloud"):
+        provider = role.get("provider") or ("ollama-cloud" if binary == "ollama-cloud" else "deepseek")
+        cmd = ["python3", str(_BRAIN_DIR / "orchestrator_brain.py"), "-p", prompt,
+               "--provider", provider]
+        if model:
+            cmd.extend(["--model", model])
+        return cmd, "brain"
 
     if binary == "agy":
         cmd = ["agy", "-p", prompt, "--output-format", "stream-json"]
         if model:
             cmd.extend(["--model", model])
-    else:
-        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        return cmd, "agy"
 
-    return cmd, binary
+    # claude (fallback)
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if model:
+        cmd.extend(["--model", model])
+    return cmd, "claude"
+
+
+_ORCH_SYSTEM = """Você é o Orquestra — o ESTRATEGISTA que coordena o projeto '{projeto}'.
+Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso total a ela).
+
+QUEM VOCÊ É
+Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você NÃO
+tem ferramentas: não lê arquivos, não escreve código, não roda comandos — é incapaz
+disso por construção. Todo trabalho braçal é feito pela sua equipe.
+
+SUA EQUIPE (você aciona com a tag <DELEGATE>)
+- binary="operador"    → EXECUTA: lê o código, escreve, altera, roda comandos, cria
+                          arquivos. É ele quem "analisa o projeto" quando o usuário pede.
+- binary="revisor"     → REVISA sob demanda: caça bugs, avalia arquitetura e segurança
+                          de um trecho de código ou de um diff.
+- binary="open-design" → gera uma PRÉVIA VISUAL real (renderizada e navegável) de uma
+                          mudança de interface.
+O Cão de Guarda roda sozinho depois de cada edição — você não precisa acioná-lo.
+
+COMO VOCÊ TRABALHA
+1. Dúvida conceitual ("o que é X?", "qual a diferença entre Y e Z?", "vale a pena usar Z
+   aqui?") → responda você mesmo, direto e objetivo. Sem plano, sem delegação.
+2. Qualquer coisa que exija ver ou mexer no código (analisar, corrigir, implementar,
+   refatorar, revisar):
+   a. Escreva 1-2 frases com sua leitura do problema e o caminho que você propõe.
+   b. Emita um bloco <PLANO> com os passos (quem faz o quê).
+   c. PARE nessa resposta. Espere o usuário aprovar ("pode ir", "sim", "manda ver").
+   d. Só emita <DELEGATE> junto do <PLANO> se o usuário JÁ tiver dito claramente para
+      executar ("faz isso", "corrige agora", "analisa aí").
+3. Depois do "sim": emita o(s) <DELEGATE>. Antes de cada bloco, 1-2 frases de intenção —
+   é o que o usuário lê enquanto a equipe trabalha. Nunca delegue em silêncio.
+
+FORMATO
+<PLANO>
+1. operador → o que vai investigar / implementar
+2. revisor → o que vai revisar
+</PLANO>
+
+<DELEGATE binary="operador">
+Instruções completas e autossuficientes (o operador NÃO vê esta conversa — descreva o
+objetivo, os arquivos/pastas relevantes e o resultado esperado).
+</DELEGATE>
+
+CADEIA (um passo alimenta o próximo) → um único <PIPELINE> com <DELEGATE> na ordem:
+<PIPELINE>
+<DELEGATE binary="operador">(1ª etapa)</DELEGATE>
+<DELEGATE binary="revisor">(revisa o que a 1ª etapa produziu)</DELEGATE>
+</PIPELINE>
+Cada etapa recebe o resultado da anterior automaticamente — não copie esse resultado na
+instrução. Vários <DELEGATE> soltos (fora de <PIPELINE>) rodam em PARALELO — use só para
+tarefas realmente independentes.
+
+ANÁLISE LONGA: se o usuário pede um relatório ou análise extensa, mande o operador
+ESCREVER E SALVAR um arquivo Markdown (ex: ANALISE.md) em vez de despejar tudo no chat —
+o painel Editor abre o arquivo sozinho.
+
+PRÉVIA VISUAL: se o pedido cria/altera algo de interface (tela, componente, layout, cor,
+animação, redesenho), primeiro <DELEGATE binary="open-design"> pedindo a prévia, mostre
+ao usuário, e só peça a implementação real depois que ele aprovar. Pule só se ele disser
+que quer pular, ou se não houver nada visual.
+
+COFRE: se o usuário precisar configurar uma API key ou senha, lembre-o de usar
+/senha NOME valor (fica criptografado, nunca aparece no chat).
+"""
+
+
+def build_orchestrator_prompt(config: dict, history: list, memory_context: str = "") -> str:
+    """Monta o prompt completo do Orquestrador (system + memória + histórico).
+    Usado pelo REPL e pela TUI — fonte única do texto. O marcador literal
+    'Histórico da Conversa:\\n' é o ponto onde orchestrator_brain.py corta
+    system/user, então não mude essa string."""
+    import datetime as _dt
+    system = _ORCH_SYSTEM.format(
+        projeto=Path(get_project_dir()).name,
+        agora=_dt.datetime.now().strftime("%d/%m/%Y %H:%M"),
+        cwd=get_project_dir(),
+    )
+    memory_block = (
+        f"\nFatos e lições conhecidos (memória de longo prazo, não é o histórico da conversa):\n{memory_context}\n"
+        if memory_context else ""
+    )
+    parts = [system, memory_block, "\nHistórico da Conversa:\n"]
+    for msg in history[-20:]:
+        prefix = "Usuário" if msg.get("role") == "user" else "Orquestra"
+        parts.append(f"{prefix}: {msg.get('content', '')}\n")
+    parts.append("\n\nResponda ao usuário agora:")
+    return "".join(parts)
 
 
 def _capture_orchestrator_result(line: str, is_agy: bool, state: dict):
@@ -2145,11 +2365,13 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
     de verdade (mata o processo se passar de timeout_s), a mesma garantia que
     subprocess.run(timeout=...) dava antes. Retorna (final_text, ok)."""
     state = {"final_text": "", "is_error": False}
-    is_agy = (binary == "agy")
+    # brain/ollama-cloud emitem o mesmo envelope {"event":"result",...} que o agy
+    is_agy = (binary in ("agy", "ollama-cloud", "brain"))
 
     try:
         proc = subprocess.Popen(
             cmd, env=env,
+            cwd=get_project_dir(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
@@ -2364,14 +2586,24 @@ PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECAS
 PLANO_RE   = re.compile(r'<PLANO>(.*?)</PLANO>', re.DOTALL | re.IGNORECASE)
 
 
-# Defaults de label/ícone/cor/binary por tag histórica — usados só quando o
-# config não sobrescreve nada. Tag desconhecida cai no default do "claude".
+# Defaults de label/ícone/cor/binary por tag — usados só quando o config não
+# sobrescreve nada. Tag desconhecida cai no default do "operador".
 _WORKER_TAG_DEFAULTS = {
-    "implementador": ("claude", "Implementador", "🔨", "cyan"),
-    "arquiteto":   ("claude", "Arquiteto", "🏛️", "blue"),
-    "pesquisador": ("copilot", "Pesquisador", "🔎", "yellow"),
-    "designer":    ("agy", "Designer", "🎨", "green"),
-    "analista":    ("codex", "Analista", "🧠", "magenta"),
+    "operador":   ("claude",  "Operador",       "🔨", "cyan"),
+    "revisor":    ("claude",  "Revisor",        "🔍", "blue"),
+    "cao_guarda": ("copilot", "Cão de Guarda",  "🐕", "yellow"),
+    "claude":     ("claude",  "Motor Claude",   "💞", "cyan"),
+    "agy":        ("agy",     "Motor Antigravity", "💚", "green"),
+    "deepseek":   ("claude",  "Motor DeepSeek", "💙", "blue"),
+    "codex":      ("codex",   "Motor Codex",    "🤖", "magenta"),
+}
+
+# Tags legadas (prompts/históricos antigos) → papel canônico da arquitetura de 3.
+_WORKER_ALIASES = {
+    "implementador": "operador", "designer": "operador", "pesquisador": "operador",
+    "arquiteto": "revisor", "analista": "revisor", "fiscal": "revisor",
+    "seguranca": "revisor", "segurança": "revisor",
+    "guarda": "cao_guarda", "watchdog": "cao_guarda", "cão_de_guarda": "cao_guarda",
 }
 
 
@@ -2379,17 +2611,16 @@ def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     """Resolve qual operário real usar a partir da tag do <DELEGATE>/<PIPELINE>.
     Retorna (worker_config, actual_binary, label, icon, color).
 
-    IMPORTANTE: o `binary`/`label`/`icon`/`color` salvos em config["workers"][tag]
-    SEMPRE têm prioridade sobre o default da tag — isso é o que faz o menu
-    `/agentes trocar` conseguir trocar a "família" (Gemini/Claude/DeepSeek/
-    Codex) de QUALQUER operário, inclusive os 3 históricos (claude/agy/
-    deepseek). Antes desta correção, esses 3 ignoravam completamente o que
-    estava salvo em config e sempre usavam o binary/label fixo no código —
-    trocar a família desses 3 no menu não tinha efeito nenhum na prática."""
+    Tags legadas (implementador, arquiteto, ...) são traduzidas para os papéis
+    canônicos (operador/revisor/cao_guarda) via _WORKER_ALIASES, então históricos
+    e prompts antigos continuam funcionando. O que estiver salvo em
+    config["workers"][tag] SEMPRE tem prioridade sobre o default da tag — é o que
+    faz o menu `/agentes trocar` conseguir trocar o motor de qualquer papel."""
     workers = config.get("workers", {})
-    tag = target_binary_tag.lower()
+    tag = target_binary_tag.lower().strip()
+    tag = _WORKER_ALIASES.get(tag, tag)
 
-    worker = workers[tag] if tag in workers else workers.get("implementador", {})
+    worker = workers.get(tag) or workers.get("operador", {})
     default_binary, default_label, default_icon, default_color = _WORKER_TAG_DEFAULTS.get(
         tag, ("claude", tag.capitalize(), "🤖", "white")
     )
@@ -2418,7 +2649,9 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
     if actual_binary == "agy":
         cmd = ["agy", "-p", instruction,
                "--output-format", "stream-json",
-               "--dangerously-skip-permissions"]
+               "--dangerously-skip-permissions",
+               "--project", get_project_id(),
+               "--add-dir", "."]
         if worker_model:
             cmd.extend(["--model", worker_model])
     elif actual_binary == "codex":
@@ -2451,35 +2684,110 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
 
     return cmd, worker_env, output_file
 
-def _run_copilot_watchdog():
-    """Roda o Copilot em background para analisar mudanças de código recentes
-    em busca de bugs severos, sem travar o usuário."""
-    def _watchdog_thread():
-        # Verifica se realmente há arquivos modificados antes de invocar
-        diff_check = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, cwd=get_project_dir())
-        if not diff_check.stdout.strip():
-            return
+_WATCHDOG_BUG_WORDS = (
+    "bug", "erro", "falha", "crash", "exception", "vulnerab", "quebr",
+    "incorret", "race condition", "regress", "null", "undefined", "leak",
+)
+_WATCHDOG_SKIP_PREFIXES = ("AI Credits", "Tokens", "Resume", "Changes ", "Log:", "●", "│", "└")
+_watchdog_lock = threading.Lock()
+_watchdog_last = [0.0]
 
-        cmd = [
-            "gh", "copilot", "-p",
-            "Você é o Cão de Guarda do Orquestra. Execute `git status` e `git diff` (incluindo untracked files) para ver as modificações recentes. Analise-as procurando por BUGS ou lógicas erradas. Seja direto: se achar bug, reporte com clareza. Se estiver 100% perfeito, responda APENAS 'Tudo certo'.",
-            "--no-ask-user", "--model", "auto"
-        ]
-        try:
-            res = subprocess.run(
-                cmd, cwd=get_project_dir(),
-                capture_output=True, text=True, timeout=60,
-                stdin=subprocess.DEVNULL
-            )
-            out = res.stdout.strip()
-            # Se a resposta indicar erro ou que está limpo, ignoramos silenciosamente
-            if "Tudo certo" in out and len(out) < 50:
-                return
-            if res.returncode == 0 and out:
-                # Usa rich console via patch_stdout para imprimir em cima do prompt sem quebrar a linha de digitação
-                console.print(f"\n[bold yellow]🐕 [Watchdog Copilot][/bold yellow]\n{out}\n")
-        except Exception:
-            pass # Falhas de timeout ou erro de binário são silenciosas no watchdog
+
+def _git_diff_snapshot(cwd: str, max_chars: int = 6000) -> str:
+    """Diff das mudanças não commitadas (tracked + conteúdo dos untracked), já
+    pronto pra colar no prompt do Cão de Guarda. '' se não houver nada."""
+    try:
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=cwd,
+                                capture_output=True, text=True, timeout=10)
+        if status.returncode != 0 or not status.stdout.strip():
+            return ""
+        parts = []
+        tracked = subprocess.run(["git", "diff", "--unified=3"], cwd=cwd,
+                                 capture_output=True, text=True, timeout=15)
+        if tracked.stdout.strip():
+            parts.append(tracked.stdout)
+        for line in status.stdout.splitlines():
+            if line.startswith("??"):
+                path = line[3:].strip().strip('"')
+                fp = Path(cwd) / path
+                try:
+                    if fp.is_file() and fp.stat().st_size < 40000:
+                        parts.append(f"\n--- NOVO ARQUIVO: {path} ---\n" + fp.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    pass
+        blob = "\n".join(parts).strip()
+        return blob[:max_chars] + ("\n…(diff truncado)" if len(blob) > max_chars else "")
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return ""
+
+
+def watchdog_verdict(config: dict, cwd: str = None) -> tuple:
+    """Roda o Cão de Guarda (SÍNCRONO) sobre o diff atual. Passa o diff pronto no
+    prompt em vez de pedir pro agente rodar git — mais rápido e determinístico.
+    Retorna (texto, achou_bug). ('', False) quando não há mudança, o binário
+    falha, ou o veredito é 'tudo certo'."""
+    cwd = cwd or get_project_dir()
+    diff = _git_diff_snapshot(cwd)
+    if not diff:
+        return "", False
+
+    worker, binary, *_ = _resolve_worker(config, "cao_guarda")
+    model = worker.get("model", "auto")
+    prompt = (
+        "Você é o Cão de Guarda. Analise APENAS o diff abaixo em busca de BUGS ou lógica "
+        "errada (ignore estilo e formatação). Se achar algo, seja curto e direto: arquivo, "
+        "o problema e o impacto. Se estiver tudo certo, responda somente 'Tudo certo'.\n\n"
+        f"{diff}"
+    )
+
+    if binary == "copilot":
+        cmd = ["gh", "copilot", "-p", prompt, "--no-ask-user"]
+        if model and model != "auto":
+            cmd += ["--model", model]
+    elif binary == "agy":
+        cmd = ["agy", "-p", prompt]
+        if model:
+            cmd += ["--model", model]
+    elif binary == "codex":
+        cmd = ["codex", "exec", prompt, "--sandbox", "read-only", "--skip-git-repo-check"]
+    else:
+        cmd = ["claude", "-p", prompt]
+        if model:
+            cmd += ["--model", model]
+
+    try:
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                             timeout=90, stdin=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "", False
+
+    out = _ANSI_RE.sub("", res.stdout or "")
+    out = "\n".join(l for l in out.splitlines() if not l.startswith(_WATCHDOG_SKIP_PREFIXES)).strip()
+    if not out or ("tudo certo" in out.lower() and len(out) < 60):
+        return "", False
+    has_bug = any(w in out.lower() for w in _WATCHDOG_BUG_WORDS)
+    return out, has_bug
+
+
+def _run_copilot_watchdog(config: dict = None):
+    """Dispara o Cão de Guarda numa thread daemon (não bloqueia o operário) e
+    imprime no terminal SÓ se houver algo a dizer. Cooldown de 15s pra não rodar
+    N vezes quando vários operários paralelos terminam quase juntos."""
+    with _watchdog_lock:
+        if time.time() - _watchdog_last[0] < 15:
+            return
+        _watchdog_last[0] = time.time()
+    cfg = config or load_config()
+
+    def _run():
+        text, has_bug = watchdog_verdict(cfg)
+        if not text:
+            return
+        marker = "⚠ [bold red]" if has_bug else "[bold yellow]"
+        with _console_lock:
+            console.print(f"\n{marker}🐕 Cão de Guarda[/]\n{text}\n")
+
+    threading.Thread(target=_run, daemon=True, name="cao-guarda").start()
 
 def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
     """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
@@ -2528,6 +2836,26 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             except OSError:
                 pass
 
+        # Failover: erro de limite/quota → tenta uma vez com o motor de reserva,
+        # numa LiveSection NOVA (a anterior já foi fechada por _run_worker_headless).
+        low_err = (error_detail or "").lower()
+        if is_error and ("429" in low_err or "credit" in low_err or "quota" in low_err or "rate limit" in low_err):
+            fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude"}
+            fb_bin = fb_map.get(actual_binary, "copilot")
+            console.print(f"[bold yellow]⚠️ {label} atingiu limite — failover para {fb_bin}...[/bold yellow]")
+            fb_cmd, fb_env, fb_out = _build_worker_cmd({"binary": fb_bin, "model": ""}, fb_bin, full_instruction)
+            fb_section = LiveSection(f"{label} → {fb_bin}", icon, color)
+            fb_section.open()
+            final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+                fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
+                is_codex=(fb_bin == "codex"), is_copilot=(fb_bin == "copilot"), output_file=fb_out,
+            )
+            if fb_out:
+                try:
+                    os.unlink(fb_out)
+                except OSError:
+                    pass
+
         if is_error:
             console.print(f"[bold red]⚠ Pipeline parou na etapa {idx} ({label}) por erro.[/bold red]")
             detail_text = error_detail or "(sem detalhes de stderr)"
@@ -2541,7 +2869,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             new_status = "⚠️ Aguardando Aprovação"
             # Dispara o cão de guarda na última etapa se houver mudanças
             if idx == total:
-                _run_copilot_watchdog()
+                _run_copilot_watchdog(config)
         else:
             new_status = "✅ Concluído"
         update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
@@ -3068,76 +3396,7 @@ def main():
             save_chat_message(role_name, "user", raw)
             history = load_chat_history(role_name)
             memory_context = _load_memory_context(get_project_id())
-            memory_block = f"Fatos e lições conhecidos (memória de longo prazo, não é o histórico da conversa):\n{memory_context}\n\n" if memory_context else ""
-
-            context_str = (
-                f"Você é o Orquestra, o assistente inteligente do projeto '{projeto}'.\n"
-                f"Hoje é {agora}. Você está no terminal do usuário, na pasta '{get_project_dir()}'.\n"
-                "ESTILO DE COMUNICAÇÃO: Seja direto e objetivo. Respostas curtas. Sem enrolação.\n"
-                "Antes de executar qualquer tarefa prática, gere um PLANO RESUMIDO usando obrigatoriamente a tag:\n"
-                "<PLANO>\n"
-                "1. pesquisador → [o que ele vai fazer]\n"
-                "2. implementador → [o que ele vai fazer]\n"
-                "3. arquiteto → [o que ele vai revisar]\n"
-                "</PLANO>\n"
-                "O conteúdo entre <PLANO> e </PLANO> abre automaticamente numa tela cheia separada para o usuário ler — "
-                "o chat fica limpo. Sempre aguarde a confirmação do usuário antes de emitir <DELEGATE>/<PIPELINE>, "
-                "a menos que o usuário já tenha dito explicitamente para executar.\n"
-                "REGRA DE OURO: Você NÃO DEVE inventar código, alucinar ou chutar o que não sabe com certeza.\n"
-                "Quando precisar executar uma tarefa prática (ler/escrever código, rodar comandos, acessar web), DELEGUE para um operário.\n"
-                "IMPORTANTE: antes de qualquer bloco <DELEGATE>/<PIPELINE>, escreva sempre 1-2 frases em "
-                "português explicando o que você vai fazer e por quê. Nunca emita blocos de delegação sem "
-                "esse texto de intenção antes deles — é isso que o usuário vê enquanto o operário trabalha.\n"
-                "Para delegar, inclua ao final da resposta um ou mais blocos:\n"
-                "<DELEGATE binary=\"implementador\">\n(Instruções completas para o operário)\n</DELEGATE>\n"
-                "Use binary=\"implementador\" para codificação e refatoração pesada (usa DeepSeek V4 Pro), "
-                "binary=\"pesquisador\" para pesquisa rápida e varredura (usa Copilot — também é o Cão de Guarda de segurança), "
-                "binary=\"arquiteto\" para revisão, arquitetura e segurança da informação (usa DeepSeek), "
-                "binary=\"analista\" para problemas lógicos profundos e troubleshooting complexo.\n"
-                "SEGURANÇA: O agente Copilot (pesquisador) atua como Cão de Guarda automático após cada código gerado — "
-                "ele verifica silenciosamente se há bugs, e SÓ aparece na tela se encontrar algo errado. "
-                "Isso garante qualidade em cada implementação.\n"
-                "COFRE DE SENHAS: O usuário pode usar /senha NOME valor para salvar credenciais de forma segura. "
-                "Quando o usuário mencionar que precisa configurar uma API key ou senha, lembre-o de usar /senha.\n"
-                "Use binary=\"open-design\" para gerar uma PRÉVIA VISUAL de verdade — renderizada e navegável, "
-                "não uma descrição em texto nem uma imagem estática. Ele lê o projeto de verdade na pasta atual "
-                "(design system, componentes, paleta reais) e devolve uma prévia fiel ao visual já existente.\n\n"
-                "REGRA OBRIGATÓRIA DE PRÉVIA: sempre que o pedido envolver criar ou alterar QUALQUER coisa "
-                "visual/de interface (tela nova, componente, layout, botão, cor, animação, redesenho, etc.), "
-                "você NÃO PODE delegar a implementação real (binary=\"claude\" ou binary=\"agy\" escrevendo/"
-                "alterando arquivos de verdade) diretamente. Primeiro delegue para binary=\"open-design\" pedindo "
-                "a prévia dessa mudança específica, mostre o resultado ao usuário, e só peça a implementação real "
-                "depois que o usuário aprovar explicitamente essa prévia numa mensagem seguinte. Só pule essa "
-                "etapa se o usuário disser claramente que já aprovou / quer pular a prévia, ou se a tarefa não "
-                "tiver nenhum componente visual (ex: lógica de backend pura, bug de dado, configuração).\n\n"
-                "Você pode convocar múltiplos operários de uma vez gerando múltiplos blocos <DELEGATE> — eles "
-                "rodam TODOS AO MESMO TEMPO, em paralelo, cada um recebendo só a instrução que você escreveu "
-                "pra ele. Use isso quando as tarefas forem independentes entre si.\n\n"
-                "Quando o usuário pedir uma CADEIA/PIPELINE — um operário analisa algo, o resultado dele vai "
-                "para o próximo analisar, e assim por diante até um resultado final (ex.: \"analisa essa ideia "
-                "com o Antigravity, depois manda pro DeepSeek dar a visão dele, depois o Claude Code faz a "
-                "análise final\") — NÃO use vários <DELEGATE> soltos (eles rodariam em paralelo, sem um ver o "
-                "resultado do outro). Em vez disso, envolva os blocos <DELEGATE>, na ORDEM em que devem rodar, "
-                "dentro de um único bloco <PIPELINE>:\n"
-                "<PIPELINE>\n"
-                "<DELEGATE binary=\"pesquisador\">(o que a 1ª etapa deve analisar)</DELEGATE>\n"
-                "<DELEGATE binary=\"arquiteto\">(o que a 2ª etapa deve revisar)</DELEGATE>\n"
-                "<DELEGATE binary=\"implementador\">(o que a 3ª etapa deve implementar)</DELEGATE>\n"
-                "</PIPELINE>\n"
-                "Cada etapa roda só depois que a anterior termina, e recebe automaticamente o resultado da "
-                "etapa anterior como contexto — você não precisa (nem deve) copiar esse resultado na instrução, "
-                "só descreva o que aquela etapa específica deve fazer com o que recebeu. Ao final da última "
-                "etapa você mesmo vai comentar o resultado consolidado pro usuário revisar e decidir se "
-                "implementa. binary=\"open-design\" ainda não é suportado dentro de <PIPELINE>. Você pode "
-                "emitir <PIPELINE> e <DELEGATE> soltos na mesma resposta, se fizer sentido.\n\n"
-                f"{memory_block}"
-                "Histórico da Conversa:\n"
-            )
-            for msg in history[-20:]:
-                prefix = "Usuário" if msg["role"] == "user" else "Orquestra"
-                context_str += f"{prefix}: {msg['content']}\n"
-            
-            prompt = f"{context_str}\n\nResponda ao usuário agora:"
+            prompt = build_orchestrator_prompt(config, history, memory_context)
 
             cmd, cmd_binary = _build_orchestrator_cmd(role, prompt)
 
@@ -3213,12 +3472,15 @@ def main():
 
             # Busca TODAS as tags de delegação soltas (paralelas)
             delegate_matches = list(DELEGATE_RE.finditer(clean_output_no_pipeline))
-            chat_mode = True
+            chat_mode = _is_chat_mode(config)
             detail_level = _detail_level(config)
 
             if delegate_matches or pipeline_steps_list:
-                # Exibe a resposta removendo TODAS as tags para o usuário ver
-                user_output = re.sub(r'<DELEGATE.*?</DELEGATE>', '', output_no_pipeline, flags=re.DOTALL | re.IGNORECASE).strip()
+                # Só o texto ANTES da 1ª tag — o que vier depois de um
+                # <DELEGATE>/<PIPELINE>/<PLANO> é alucinação de resultado (quem
+                # produz resultado é o operário), então é descartado.
+                _tag_m = re.search(r'<(?:PLANO|PIPELINE|DELEGATE)\b', output, re.IGNORECASE)
+                user_output = (output[:_tag_m.start()] if _tag_m else output).strip()
 
                 if not user_output:
                     # Fallback: garante uma frase de intenção mesmo se o LLM não escrever
@@ -3335,8 +3597,11 @@ def main():
                         fb_bin = fb_map.get(actual_binary, "copilot")
                         fb_worker = {"binary": fb_bin, "model": ""}
                         fb_cmd, fb_env, fb_out = _build_worker_cmd(fb_worker, fb_bin, delegate_instruction)
+                        # LiveSection NOVA — a original já foi fechada por _run_worker_headless
+                        fb_section = LiveSection(f"{lbl} → {fb_bin}", ic, col)
+                        fb_section.open()
                         final_text, is_error, error_detail, changes_summary = _run_worker_headless(
-                            fb_cmd, fb_env, get_project_dir(), section, fb_bin == "agy", detail=detail,
+                            fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
                             is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"), output_file=fb_out,
                         )
                         if fb_out:
@@ -3379,7 +3644,7 @@ def main():
 
                     if not is_error and changes_summary:
                         new_status = "⚠️ Aguardando Aprovação"
-                        _run_copilot_watchdog()
+                        _run_copilot_watchdog(config)
                     else:
                         new_status = "❌ Erro" if is_error else "✅ Concluído"
                     update_task_status(task_id, new_status, final_text[:4000] if final_text else None)

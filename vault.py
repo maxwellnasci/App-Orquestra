@@ -1,6 +1,7 @@
 """
 vault.py — Cofre de Segurança do Orquestra
-Criptografia AES-256 (via Fernet) por projeto.
+Criptografia autenticada via Fernet (AES-128-CBC + HMAC-SHA256), com chave
+derivada de 256 bits (PBKDF2-SHA256), por projeto.
 Cada pasta tem seu próprio .orquestra_vault isolado.
 """
 

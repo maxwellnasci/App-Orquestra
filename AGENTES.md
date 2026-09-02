@@ -1,275 +1,150 @@
-# Orquestra — Documentação para Agentes de IA
+# Orquestra — Arquitetura para Agentes de IA
 
-> **Leia este arquivo antes de qualquer coisa.** Ele descreve a arquitetura completa,
-> os papéis de cada agente, como o sistema funciona e como contribuir com segurança.
-
----
-
-## O que é o Orquestra
-
-O Orquestra é uma **interface de terminal inteligente multi-agente** que transforma o
-fluxo de trabalho de desenvolvimento. Em vez de usar um único modelo de IA, o Orquestra
-coordena um time de agentes especializados — cada um com sua ferramenta e modelo ideal —
-tudo através de uma conversa natural no terminal.
-
-**Filosofia central:** Uma pessoa comum deve conseguir ter um fluxo de trabalho de nível
-profissional, com segurança, qualidade de código e múltiplas perspectivas de IA, sem
-precisar conhecer os detalhes técnicos de cada ferramenta.
+> Leia antes de mexer no código. Descreve a arquitetura de 3 agentes, o fluxo de um
+> turno e as regras que não podem quebrar.
 
 ---
 
-## Arquitetura
+## O que é
 
-```
-Usuário (terminal)
-       │
-       ▼
-┌─────────────────────────────────────────────────────────┐
-│  orquestra.py — REPL principal                          │
-│  • Interpreta comandos e input do usuário               │
-│  • Gerencia histórico de conversa                       │
-│  • Intercepta comandos de segurança (/senha)            │
-│  • Exibe respostas com Rich (UI rica no terminal)       │
-└────────────────────┬────────────────────────────────────┘
-                     │
-          ┌──────────┴───────────┐
-          ▼                      ▼
-┌──────────────────┐   ┌────────────────────────────────┐
-│  vault.py        │   │  Orquestrador (Gemini Flash)   │
-│  Cofre AES-256   │   │  Decide o que fazer e          │
-│  de credenciais  │   │  emite tags DELEGATE/PIPELINE  │
-└──────────────────┘   └──────────────┬─────────────────┘
-                                      │
-              ┌───────────────────────┼────────────────┐
-              ▼                       ▼                 ▼
-   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-   │  implementador   │  │  pesquisador     │  │  arquiteto       │
-   │  DeepSeek V4 Pro │  │  Copilot (auto)  │  │  DeepSeek V4 Pro │
-   │  Escrita de      │  │  Pesquisa + Cão  │  │  Revisão e       │
-   │  código pesado   │  │  de Guarda       │  │  arquitetura     │
-   └──────────────────┘  └──────────────────┘  └──────────────────┘
-```
+Uma **TUI multi-agente** (Textual) que funciona como um Cursor/VS Code de terminal.
+O usuário conversa com um **Orquestrador estrategista** que planeja e delega; uma
+equipe pequena executa; cada mudança passa por aprovação humana e por um Cão de
+Guarda automático.
 
-### Tags de Delegação
-
-O Orquestrador coordena os agentes usando duas tags XML embutidas na resposta:
-
-**`<DELEGATE binary="nome">`** — Roda um agente de forma independente (paralelo):
-```
-<DELEGATE binary="implementador">
-Crie uma função Python que lê um CSV e retorna um DataFrame.
-</DELEGATE>
-```
-
-**`<PIPELINE>`** — Roda agentes em cadeia (saída de um vira entrada do próximo):
-```
-<PIPELINE>
-<DELEGATE binary="pesquisador">Leia o arquivo auth.py e documente o que ele faz</DELEGATE>
-<DELEGATE binary="arquiteto">Revise a segurança da lógica documentada</DELEGATE>
-<DELEGATE binary="implementador">Aplique as correções sugeridas pelo revisor</DELEGATE>
-</PIPELINE>
-```
+**Filosofia:** uma pessoa comum tem um fluxo de trabalho profissional (segurança,
+qualidade, múltiplas perspectivas de IA) sem conhecer os detalhes de cada CLI.
 
 ---
 
-## Agentes Disponíveis
+## Os 3 agentes + o Cão de Guarda
 
-### Roles (acesso direto via `/agentes NOME`)
+| Agente (config) | Papel | Motor padrão | Ferramentas? |
+|---|---|---|---|
+| `roles.orquestrador` | Estrategista: conversa, `<PLANO>`, delega | `brain` / DeepSeek v4 Flash | **NÃO** (chat puro) |
+| `workers.operador` | Executor: lê/escreve/roda/cria | `claude` / claude-sonnet-5 | sim (headless) |
+| `workers.revisor` | Revisão sob demanda | `claude` / claude-opus-5 | sim (headless) |
+| `workers.cao_guarda` | Auditoria automática do diff | `copilot` / auto | sim (read-only) |
 
-| Role | Modelo | Especialidade |
-|------|--------|--------------|
-| `orquestrador` | Gemini 3.7 Flash | Coordenação, conversa, memória |
-| `implementador` | DeepSeek V4 Pro | Codificação pesada e refatoração |
-| `pesquisador` | Copilot (auto) | Pesquisa rápida e varredura |
-| `arquiteto` | DeepSeek V4 Pro | Revisão, segurança, arquitetura |
-| `analista` | Claude Sonnet | Análise profunda e troubleshooting |
-| `fiscal` | Gemini 3.1 Pro | QA e busca de bugs |
-| `segurança` | Gemini 3.1 Pro | Auditoria de segurança |
-| `estrategista` | Gemini 3.7 Pro | Planejamento macro de features |
-| `ajudante` | Gemini 3.6 Flash | Dúvidas rápidas e conceitos |
-
-### Workers (acionados pelo Orquestrador via DELEGATE/PIPELINE)
-
-| Worker | Binário | Modelo |
-|--------|---------|--------|
-| `implementador` | claude | claude-sonnet-5 |
-| `arquiteto` | claude (deepseek) | deepseek-v4-pro[1m] |
-| `pesquisador` | copilot | auto |
-| `designer` | agy | gemini-3.7-flash |
-| `analista` | codex | gpt-5.6-terra |
+Atalhos de motor (uso avançado): `workers.claude`, `.agy`, `.deepseek`, `.codex`.
+Tags legadas (`implementador`, `arquiteto`, `pesquisador`, `analista`, `designer`,
+`fiscal`) são traduzidas por `_WORKER_ALIASES` → operador/revisor.
 
 ---
 
-## Cofre de Segurança (vault.py)
-
-O Orquestra possui um cofre de credenciais criptografado por projeto usando **AES-256**.
-
-### Funcionamento
-
-- Ao abrir o Orquestra em uma pasta pela **primeira vez**, o assistente de configuração
-  é exibido automaticamente e cria o cofre com senha mestra.
-- Nas **sessões seguintes**, o cofre é desbloqueado com a senha mestra.
-- As credenciais são injetadas automaticamente como **variáveis de ambiente** da sessão.
-- O arquivo `.orquestra_vault` é **adicionado ao .gitignore automaticamente** — nunca
-  vai parar no repositório Git.
-
-### Comandos do Cofre
-
-| Comando | Descrição |
-|---------|-----------|
-| `/senha NOME valor` | Salva uma credencial criptografada |
-| `/senha NOME` | Injeta a credencial no ambiente (sem exibir o valor) |
-| `/senhas` | Lista nomes das credenciais salvas |
-| `/senha-remove NOME` | Remove uma credencial |
-| `/senha-mestra NOVA_SENHA` | Troca a senha mestra do cofre |
-| `/cofre-status` | Exibe quantas credenciais estão salvas |
-
-### Segurança técnica
-
-- Criptografia: **AES-256-GCM** via biblioteca `cryptography` (Python)
-- Derivação de chave: **PBKDF2-SHA256** com 600.000 iterações
-- Salt aleatório de 16 bytes por projeto
-- Cada credencial é criptografada individualmente
-- O valor nunca aparece no chat, nos logs ou no histórico do terminal
-
----
-
-## Watchdog (Cão de Guarda)
-
-Após cada código gerado por qualquer agente, o **Copilot é acionado silenciosamente**
-em background para auditar o `git diff` e verificar se há bugs ou lógica errada.
-
-- Se o código estiver **perfeito**: o watchdog não aparece na tela (silencioso).
-- Se encontrar **problema**: exibe um alerta `🐕 [Watchdog Copilot]` com o diagnóstico.
-
-Implementação: função `_run_copilot_watchdog()` em `orquestra.py` (linha ~2134).
-
----
-
-## Fluxo de Trabalho Recomendado
-
-O Orquestra foi projetado para funcionar da seguinte forma em cada projeto:
-
-1. **Abra o terminal na pasta do projeto**
-2. **Digite `orquestra`** — o cofre é verificado/desbloqueado automaticamente
-3. **Converse naturalmente** — o Orquestrador (Gemini) entende sua intenção
-4. **Para tarefas práticas**, o Orquestrador exibe um **plano resumido** antes de executar
-5. **Confirme** — os agentes trabalham em paralelo ou em cadeia conforme o plano
-6. **O Watchdog** escaneia silenciosamente o código gerado
-
-### Exemplo de sessão
+## Fluxo de um turno
 
 ```
-orquestra → cria uma função de login com JWT
-
-🎼 Orquestrador:
-Plano:
-• pesquisador: lê o projeto para entender o padrão atual de auth
-• implementador: cria a função JWT seguindo o padrão encontrado
-• arquiteto: revisa a segurança da implementação
-
-Confirma? (responda 'sim' ou detalhe alguma mudança)
-
-orquestra → sim
-
-⏺ 🔎 Pesquisador (buscando...)
-⏺ 💻 Implementador (codificando...)
-🐕 [Watchdog Copilot] — nenhum problema encontrado
+Usuário (TUI: chat)
+   │
+   ▼
+Orquestrador  ─ orchestrator_brain.py (chat completions, ZERO ferramentas)
+   │   • dúvida conceitual → responde e acabou
+   │   • tarefa de código → escreve <PLANO> e PARA (gate)
+   │
+   ▼  usuário clica "▶ Executar plano"
+Orquestrador emite <DELEGATE binary="operador"> / <PIPELINE>
+   │
+   ▼
+Operador (headless, --output-format stream-json)
+   │   • GPS: arquivos tocados abrem no Editor em tempo real
+   │   • git snapshot antes/depois isola a tarefa
+   │
+   ▼  mexeu em arquivos → status "⚠️ Aguardando Aprovação"
+Usuário: ✅ Aprovar (commit) │ ❌ Rejeitar (git reset dos arquivos da tarefa) │ 🔍 Revisar
+   │
+   ▼  ao aprovar
+Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + alerta
 ```
+
+### Tags que o Orquestrador emite
+
+- `<PLANO> ... </PLANO>` — passos; abre destacado, é o gate de aprovação.
+- `<DELEGATE binary="operador"> instruções </DELEGATE>` — uma tarefa. Vários soltos = paralelo.
+- `<PIPELINE> <DELEGATE>...</DELEGATE> <DELEGATE>...</DELEGATE> </PIPELINE>` — cadeia; cada
+  etapa recebe o resultado da anterior automaticamente.
+- `<DELEGATE binary="open-design"> ... </DELEGATE>` — prévia visual real (não entra em `<PIPELINE>`).
 
 ---
 
-## Arquivos do Projeto
+## Regras que não podem quebrar
 
-```
-App Orquestra/
-├── orquestra.py          ← REPL principal (~3000 linhas)
-├── vault.py              ← Módulo do cofre de credenciais
-├── AGENTES.md            ← Este arquivo (documentação)
-├── .orquestra_vault      ← [GERADO] Cofre criptografado (não versionar)
-├── .orquestra_salt       ← [GERADO] Salt do cofre (não versionar)
-└── ~/.orquestra.json     ← Configuração global (roles e workers)
-```
+1. **O Orquestrador nunca ganha ferramentas.** `_build_orchestrator_cmd` só usa
+   `binary="brain"` (ou `agy`/`claude` como fallback **sem** `--add-dir` /
+   `--dangerously-skip-permissions` / `--permission-mode bypassPermissions`). O spike
+   provou que `agy`/`claude` executam comandos mesmo em `--mode plan` — por isso o
+   caminho padrão é `orchestrator_brain.py` (chat REST puro).
+2. **O texto do prompt do Orquestrador tem fonte única:** `build_orchestrator_prompt()`
+   em `orquestra.py`. TUI e REPL chamam essa função. O marcador literal
+   `"Histórico da Conversa:\n"` é onde `orchestrator_brain.py` corta system/user — não mude.
+3. **Comandos `/senha*`** são interceptados por `vault.handle_command` antes de
+   qualquer agente.
+4. **O Cão de Guarda roda de verdade:** `_run_copilot_watchdog(config)` dispara uma
+   thread (cooldown de 15s) que chama `watchdog_verdict(config)`. Silencioso se o
+   veredito for "tudo certo".
+5. **`vault.py`** não tem dependência além de `cryptography` + stdlib.
+6. **Assinaturas compartilhadas:** `_run_worker_headless`, `_resolve_worker`,
+   `_build_worker_cmd`, `_build_orchestrator_cmd`, `build_orchestrator_prompt` são
+   usadas pela TUI **e** pelo REPL — mudou uma, atualize os dois callers.
 
 ---
 
-## Configuração (~/.orquestra.json)
-
-O arquivo de configuração global define os agentes disponíveis. Estrutura:
+## Config (`~/.orquestra.json`)
 
 ```json
 {
   "active_role": "orquestrador",
   "roles": {
-    "NOME_DO_ROLE": {
-      "binary": "agy|claude|copilot|codex",
-      "model": "nome-do-modelo",
-      "env_file": "/path/para/.env-opcional",
-      "icon": "emoji",
-      "color": "cor-rich",
-      "description": "O que este agente faz"
-    }
+    "orquestrador": { "binary": "brain", "provider": "deepseek", "model": "deepseek-v4-flash" }
   },
   "workers": {
-    "NOME_DO_WORKER": {
-      "binary": "agy|claude|copilot|codex",
-      "model": "nome-do-modelo",
-      "env_file": "/path/para/.env-opcional",
-      "description": "O que este worker faz"
-    }
-  }
+    "operador":   { "binary": "claude", "model": "claude-sonnet-5" },
+    "revisor":    { "binary": "claude", "model": "claude-opus-5" },
+    "cao_guarda": { "binary": "copilot", "model": "auto" }
+  },
+  "ui": { "mode": "chat", "detail": "normal" }
 }
 ```
 
-### Binários suportados
+`load_config()` migra automaticamente configs v1 (orquestrador em `agy`/`claude`,
+operários com nomes soltos, `ollama_api_key` em texto puro).
 
-| Binário | Ferramenta | Modelos |
-|---------|-----------|---------|
-| `agy` | Antigravity CLI | gemini-* |
-| `claude` | Claude Code CLI | claude-* ou deepseek-* (via env_file) |
-| `copilot` | GitHub Copilot CLI | auto |
-| `codex` | OpenAI Codex CLI | gpt-* |
+### Cérebros do Orquestrador (`binary="brain"`)
 
----
+| provider | credencial | modelos |
+|---|---|---|
+| `deepseek` | `~/.claude-deepseek-env` (`ANTHROPIC_API_KEY`) | `deepseek-v4-flash`, `deepseek-v4-pro` |
+| `ollama-cloud` | `kimi provider list --json` | `kimi-k3`, `gpt-oss:120b`, ... |
+| `anthropic` / `openai` | env / cofre | — |
 
-## Comandos do Terminal
+### Motores dos operários (`binary=`)
 
-| Comando | Descrição |
-|---------|-----------|
-| `/ajuda` | Lista todos os comandos |
-| `/agentes` | Lista os agentes disponíveis |
-| `/agentes NOME` | Troca o agente ativo |
-| `/agentes trocar` | Abre menu interativo |
-| `/tarefas` | Lista tarefas recentes |
-| `/aprovar ID` | Aprova e commita uma tarefa |
-| `/goal OBJETIVO` | Planeja e executa um objetivo macro |
-| `/senha NOME valor` | Salva credencial no cofre |
-| `/senhas` | Lista credenciais do cofre |
-| `/sair` | Fecha o Orquestra |
-| `F1` | Atalho para /ajuda |
-| `F2` | Atalho para /agentes trocar |
-| `F3` | Atalho para /tarefas |
+| binary | ferramenta | headless |
+|---|---|---|
+| `claude` | Claude Code | `-p --output-format stream-json --permission-mode bypassPermissions` |
+| `agy` | Antigravity | `-p --output-format stream-json --dangerously-skip-permissions` |
+| `codex` | Codex CLI | `exec --json --sandbox workspace-write` |
+| `copilot` | `gh copilot` | `-p --no-ask-user` (texto puro) |
 
 ---
 
-## Dependências
+## Cofre (`vault.py`)
 
-```bash
-pip install rich prompt_toolkit cryptography
+Fernet (AES-128-CBC + HMAC-SHA256), chave de 256 bits via PBKDF2-SHA256 (600k
+iterações), salt de 16 bytes por projeto. `.orquestra_vault` e `.orquestra_salt`
+entram no `.gitignore` sozinhos. Credenciais são injetadas como env vars da sessão
+(`inject_env`). O valor nunca aparece no chat/log/histórico.
+
+---
+
+## Arquivos
+
 ```
-
-Ferramentas externas necessárias:
-- `agy` — Antigravity CLI (Google Deepmind)
-- `claude` — Claude Code CLI (Anthropic)
-- `gh copilot` — GitHub Copilot CLI
-- `codex` — OpenAI Codex CLI (opcional)
-
----
-
-## Contribuindo
-
-Ao modificar o `orquestra.py`:
-1. Mantenha os comentários existentes
-2. O Watchdog (`_run_copilot_watchdog`) deve sempre ser chamado após código gerado
-3. Comandos `/senha*` devem sempre ser interceptados **antes** de chegar ao Orquestrador
-4. O `vault.py` não deve ter dependências além de `cryptography` e stdlib Python
+orquestra                → launcher (TUI; --repl = REPL antigo)
+orquestra_tui.py         → a interface (Textual)
+orquestra.py             → backend: config, memória SQLite, cofre, execução, Cão de Guarda
+orchestrator_brain.py    → cérebro do Orquestrador (chat puro, zero ferramentas)
+vault.py                 → cofre de credenciais
+test_orquestra.py        → testes sem rede (python3 test_orquestra.py)
+_archive/                → código aposentado (roles antigos, llm_orchestrator.py)
+```

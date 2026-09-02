@@ -1,71 +1,77 @@
-# Orquestra — O Cockpit de Agentes de IA 🚀
+# Orquestra — seu cockpit de agentes de IA no terminal 🎼
 
-O **Orquestra** (V3) é uma interface de chat interativa de terminal e um roteador inteligente para agentes de IA locais. Projetado para unificar o acesso a múltiplos modelos e CLIs (como Claude Code, DeepSeek, Antigravity) debaixo de um sistema unificado, ele traz a fluidez das interfaces gráficas direto para o console raiz.
+O **Orquestra** é uma TUI (interface de terminal, estilo Cursor/VS Code) onde você
+conversa com um **Orquestrador estrategista** que planeja o trabalho e coordena uma
+equipe de agentes. Você não decora flags de CLI nem troca de ferramenta na mão — fala
+o que quer e a equipe executa, com você aprovando cada mudança.
 
-## 🏗️ O que há de novo no V3?
+## Os 3 agentes + o Cão de Guarda
 
-### O TUI Cockpit (Terminal Vitaminado)
-Você não precisa sair do terminal para ser produtivo:
-- **Barra de Status Inferior:** O rodapé do seu console sempre exibe o modelo ativo.
-- **Teclas Rápidas:** Use `F1` (Comandos), `F2` (Trocar Combustível) e `F3` (Fila de Tarefas) direto no seu teclado, sem interromper o fluxo de digitação.
-- **Contexto Mágico (`@`):** Digite `@` no prompt para ativar o autocompletar de arquivos da sua pasta atual. Ao pressionar Enter, os arquivos selecionados têm seu conteúdo injetado automaticamente como contexto para a IA, num formato que economiza tokens.
-
-### Modo `/goal` (Estrategista e Pipelines Automáticos)
-Inspirado na arquitetura do Manus AI, o Orquestra agora suporta planejamento de longo prazo autônomo.
-- Digite `/goal <sua meta macro>` (ex: `/goal fazer um sistema de login`).
-- O motor intercepta, vira o **Estrategista** e quebra o pedido complexo em um **Pipeline Iterativo** (uma série de tarefas atômicas encadeadas).
-- O Orquestra joga tudo no banco SQLite local (`~/.orquestra_chats/memory.db`) e roda as tarefas em sequência, injetando o contexto do passo anterior no próximo.
-
-### Human-in-the-Loop Nativo (Fast-Diff)
-O agente nunca mais vai quebrar o seu código sem você ver:
-- Se um agente alterar, deletar ou criar arquivos locais, a Tarefa entra no status `⚠️ Aguardando Aprovação`.
-- Você confere as mudanças na tela. Se estiver feliz, digite `/aprovar [id]`. O Orquestra cria um commit no Git de forma limpa.
-- Se a IA errou rude, digite `/rejeitar [id]`. O Orquestra roda um `git reset --hard` para você e volta o estado original. Zero dor de cabeça.
-
----
-
-## 🧠 O Roteador Inteligente (Auto-Orquestrador)
-
-Quando você digita uma frase livre no terminal (ex: *"revisa o arquivo de login e busca bugs"*):
-1. O Orquestra intercepta a sua mensagem.
-2. Ele chama um modelo ultraleve em background passando o seu pedido.
-3. A IA decide qual é o melhor **Especialista** para a tarefa.
-4. O Orquestra invoca o operário e delega o trabalho (em `PIPELINE` ou múltiplos operários em `DELEGATE` paralelos!).
-
-Isso elimina o problema de gastar créditos caros para tarefas simples, garantindo que o agente certo seja chamado para o trabalho certo.
-
----
-
-## 🎭 Os Especialistas Padrões
-
-Toda a configuração fica salva em `~/.orquestra.json`.
-
-| Papel | Descrição | Modelo Padrão | CLI Base |
+| Agente | Papel | O que faz | Motor padrão |
 |---|---|---|---|
-| ⚡ **Ajudante** | Dúvidas rápidas, pesquisas e explicações. | Gemini 3.6 Flash | Antigravity (`agy`) |
-| 💻 **Implementador** | Codificador principal (escreve e edita arquivos). | DeepSeek v4 Pro | Claude Code (`claude`) |
-| 🔎 **Fiscal** | Revisão de código e caça a bugs. | Gemini 3.1 Pro | Antigravity (`agy`) |
-| 🛡️ **Segurança** | Análise de vulnerabilidades. | Gemini 3.1 Pro | Antigravity (`agy`) |
-| 🧠 **Estrategista** | Arquitetura, planejamento e modo `/goal`. | Claude Opus 4.6 | Antigravity (`agy`) |
-| 🔬 **Analista** | Análise profunda e diagnósticos críticos. | Claude Sonnet 5 | Claude Code (`claude`) |
+| 🎼 **Orquestrador** | Estrategista | Conversa, pensa a solução, faz o `<PLANO>` e delega. **Não tem ferramentas** — nunca lê/escreve/roda nada sozinho. | DeepSeek v4 Flash (chat direto) |
+| 🔨 **Operador** | Executor | Lê o código, escreve, altera, roda comandos, cria arquivos. | Claude Code (`claude-sonnet-5`) |
+| 🔍 **Revisor** | Revisão sob demanda | Caça bugs, avalia arquitetura e segurança de um trecho ou de um diff. Você aciona pelo botão "🔍 Revisar". | Claude Code (`claude-opus-5`) |
+| 🐕 **Cão de Guarda** | Automático e silencioso | Depois de cada edição, audita o `git diff` no rodapé. Fica verde se está tudo certo, vermelho só se achar bug. | GitHub Copilot |
 
----
+Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Rev:`).
 
-## 🎛️ Comandos Disponíveis na Interface
+## Como funciona um turno
+
+1. Você pede algo. Dúvida conceitual → o Orquestrador responde na hora.
+2. Tarefa que mexe em código → ele escreve um `<PLANO>` e **para**. Você clica
+   **▶ Executar plano** (ou **✏️ Ajustar**).
+3. O Operador executa. Os arquivos tocados abrem no painel Editor em tempo real (GPS).
+4. Ele terminou e mexeu em arquivos → barra **✅ Aprovar / ❌ Rejeitar / 🔍 Revisar**.
+   - **Aprovar** → commit limpo no Git + o Cão de Guarda roda.
+   - **Rejeitar** → `git reset` só dos arquivos daquela tarefa.
+   - **Revisar** → o Revisor analisa o diff.
+
+## Instalação
+
+```bash
+pip install rich prompt_toolkit cryptography textual --break-system-packages
+# deixar o comando `orquestra` disponível em qualquer pasta:
+ln -sf "$PWD/orquestra" ~/.local/bin/orquestra
+```
+
+Ferramentas externas (no PATH): `claude`, `agy`, `codex`, `gh` (com `gh copilot`).
+Cérebro do Orquestrador: `~/.claude-deepseek-env` (chave DeepSeek) ou o `kimi` CLI
+(Ollama Cloud).
+
+## Uso
+
+```bash
+cd /caminho/do/seu/projeto
+orquestra          # abre a TUI, a pasta atual vira o projeto
+orquestra --repl   # REPL antigo (headless/debug)
+```
+
+Na primeira vez em cada projeto, o **cofre** (`AES/Fernet`, por pasta) pede uma senha
+mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comandos:
+`/senha NOME valor`, `/senhas`, `/senha-remove NOME`.
+
+## Comandos na TUI
 
 | Comando | O que faz |
 |---|---|
-| `<texto livre>` | Roteador Inteligente: escolhe o especialista automaticamente. |
-| `@arquivo` | Autocompleta nomes de arquivo para injeção automática de contexto. |
-| `/goal <texto>` | Inicia o Estrategista para quebrar a meta em múltiplas Tasks e executá-las no Pipeline. |
-| `/tarefas` | (Ou `F3`) Mostra a Fila de Tarefas (Histórico do SQLite) na tela. |
-| `/aprovar [id]` | Aceita o diff gerado por uma task pendente (salva no Git). |
-| `/rejeitar [id]` | Recusa as alterações e limpa (reset) a árvore de trabalho. |
-| `/agentes trocar`| (Ou `F2`) Menu interativo TUI para trocar o modelo/motor de qualquer agente em tempo real. |
-| `/agente <nome>` | Força a troca para um especialista específico para o chat livre. |
-| `/status` | Exibe qual agente está ativo. |
-| `/historico` | Exibe o histórico recente de conversas. |
-| `/sair` | Fecha o Orquestra com a opção de criar o `RESUMO_DIA.md`. |
+| `<texto livre>` | Fala com o Orquestrador. |
+| `/modo chat` \| `/modo tecnico` | Bolhas limpas × narração crua de tool calls. |
+| `/detalhe minimal` \| `normal` \| `full` | Quanto do trabalho ao vivo aparece. |
+| Botões do topo | Trocam o modelo do Orquestrador / Operador / Revisor. |
+
+## Arquivos
+
+| Arquivo | Papel |
+|---|---|
+| `orquestra` | Launcher (abre a TUI; `--repl` cai no REPL). |
+| `orquestra_tui.py` | A interface (Textual). |
+| `orquestra.py` | Backend: config, memória, cofre, execução dos operários, Cão de Guarda. |
+| `orchestrator_brain.py` | O cérebro do Orquestrador — chat puro, zero ferramentas. |
+| `vault.py` | Cofre de credenciais por projeto. |
+| `AGENTES.md` | Documentação de arquitetura para contribuir. |
+| `~/.orquestra.json` | Configuração (roles, workers, ui). |
+| `~/.orquestra_chats/memory.db` | Fila de tarefas + memória de lições (SQLite). |
 
 ---
-*Construído com Python, prompt_toolkit e sqlite3.*
+*Python · Textual · prompt_toolkit · sqlite3 · cryptography*

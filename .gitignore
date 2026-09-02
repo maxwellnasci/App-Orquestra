@@ -1,1 +1,9 @@
 .sdd/runtime/
+__pycache__/
+*.pyc
+.orquestra_logs.md
+.orquestra_vault
+.orquestra_salt
+.orquestra_cursor_state.json
+RESUMO_DIA.md
+_archive/
