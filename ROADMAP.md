@@ -28,6 +28,9 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 - [x] Migração automática da config v1 → v2; `ollama_api_key` em texto puro removida
 - [x] Bridge HTTP com token de sessão + validação de path
 - [x] `test_orquestra.py` (testes sem rede)
+- [x] Open Design religado: seção `open_design` na config (auto-semeada se o clone existir),
+  `<DELEGATE binary="open-design">` e `/design` funcionando na TUI, prévia na aba Idea Studio,
+  gate de aprovação se o Open Design escrever nos arquivos reais
 
 ## 💡 Próximas ideias
 

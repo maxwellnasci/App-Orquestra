@@ -125,6 +125,15 @@ DEFAULT_CONFIG = {
     "ui": {
         "mode": "chat",
         "detail": "normal"
+    },
+    # Open Design (nexu-io/open-design) — prévia visual real de mudanças de UI.
+    # repo_path = clone; node_bin_dir = Node oficial (o do Kali não roda TS);
+    # agent = "claude" (o default do projeto, antigravity/Gemini, não replica
+    # bem o design system real — ver VALIDACAO_OPEN_DESIGN.md §10).
+    "open_design": {
+        "repo_path": str(Path.home() / "Documentos" / "Kali Linux" / "open-design"),
+        "node_bin_dir": str(Path.home() / ".local" / "opt" / "node-open-design" / "bin"),
+        "agent": "claude"
     }
 }
 
@@ -286,6 +295,11 @@ def load_config() -> dict:
     # ollama_api_key em texto puro nunca foi usado (o brain lê do provider) — remove
     if "ollama_api_key" in cfg:
         del cfg["ollama_api_key"]
+        needs_save = True
+
+    # Open Design: semeia a seção se ausente (só se o clone existir de fato).
+    if "open_design" not in cfg and Path(DEFAULT_CONFIG["open_design"]["repo_path"]).is_dir():
+        cfg["open_design"] = dict(DEFAULT_CONFIG["open_design"])
         needs_save = True
 
     # Garante que todos os roles do default existem

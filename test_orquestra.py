@@ -120,6 +120,12 @@ try:
     check(c1["ui"].get("detail") == "normal", "ui.detail preenchido")
     c2 = orquestra.load_config()
     check(c2["roles"]["orquestrador"]["binary"] == "brain", "2ª carga idempotente")
+    od = c1.get("open_design")
+    from pathlib import Path as _P
+    if _P(orquestra.DEFAULT_CONFIG["open_design"]["repo_path"]).is_dir():
+        check(od and od.get("agent") == "claude", "open_design semeado com agent=claude")
+    else:
+        check(od is None, "open_design NÃO semeado (clone ausente)")
 finally:
     orquestra.CONFIG_FILE = orig_cfg
 

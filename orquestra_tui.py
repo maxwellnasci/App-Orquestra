@@ -321,8 +321,9 @@ class OrquestraTUI(App):
                 yield Label("🎨 IDEA STUDIO", classes="panel-title")
                 yield Markdown(
                     "# Idea Studio\n\n"
-                    "Aqui aparecerão seus **mapas mentais**, diagramas de fluxo "
-                    "e prévias de telas geradas pelo Open Design."
+                    "As prévias visuais geradas pelo **Open Design** aparecem aqui — "
+                    "com o link da prévia ao vivo (abre no navegador).",
+                    id="idea-md",
                 )
 
             with Vertical(id="chat-panel", classes="panel"):
@@ -621,11 +622,34 @@ class OrquestraTUI(App):
             with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             log.write(f"\n[green]Detalhe: {parts[1]}[/green]\n")
+        elif head in ("/design", "/open-design"):
+            rest = cmd.split(maxsplit=1)
+            if len(rest) > 1:
+                log.write(f"\n[bold white]▶ Você:[/bold white] /design {rest[1]}\n")
+                self.query_one("#chat-input").disabled = True
+                self._run_open_design(rest[1].strip())
+            else:
+                self._open_design_project(log)
         elif head in ("/ajuda", "/help"):
-            log.write("\n[dim]/modo chat|tecnico · /detalhe minimal|normal|full · "
-                      "botões do topo trocam os modelos[/dim]\n")
+            log.write("\n[dim]/design <o que prever> · /modo chat|tecnico · "
+                      "/detalhe minimal|normal|full · botões do topo trocam os modelos[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
+
+    @work(thread=True)
+    def _open_design_project(self, log) -> None:
+        """/design sem argumento: sobe o Open Design e abre o projeto no navegador."""
+        import subprocess as _sp, shutil as _sh
+        import orquestra
+        self.call_from_thread(log.write, "\n[dim]🎨 Verificando o Open Design...[/dim]\n")
+        resolved = orquestra.open_design_resolve_project(orquestra.load_config())
+        if not resolved or not resolved.get("web_url"):
+            self.call_from_thread(log.write, "\n[yellow]⚠ Não consegui subir o Open Design.[/yellow]\n")
+            return
+        url = f"{resolved['web_url']}/projects/{resolved['project_id']}"
+        self.call_from_thread(log.write, f"\n[magenta]🎨 Open Design:[/magenta] {url}\n")
+        if _sh.which("xdg-open"):
+            _sp.Popen(["xdg-open", url], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
 
     # ── Worker: Orquestrador ──────────────────────────────────────────────────
 
@@ -703,9 +727,15 @@ class OrquestraTUI(App):
             return
 
         if delegates or pipelines:
+            _OD = ("open-design", "opendesign", "open_design")
             for m in delegates:
-                self._run_worker(m.group(1).lower(), m.group(2).strip())
+                bt = m.group(1).lower()
+                if bt in _OD:
+                    self._run_open_design(m.group(2).strip())
+                else:
+                    self._run_worker(bt, m.group(2).strip())
             for steps in pipelines:
+                steps = [(t, i) for t, i in steps if t.lower() not in _OD]
                 if steps:
                     self._run_pipeline_tui(steps)
             return
@@ -859,6 +889,80 @@ class OrquestraTUI(App):
         if rest and rest["steps"]:
             self.call_from_thread(log.write, "\n[dim]🔗 Retomando o pipeline...[/dim]\n")
             self.call_from_thread(lambda: self._run_pipeline_tui(rest["steps"], rest["previous"]))
+        else:
+            self.call_from_thread(self._re_enable_input)
+
+    # ── Open Design (prévia visual) ─────────────────────────────────────────
+
+    @work(thread=True)
+    def _run_open_design(self, instruction: str) -> None:
+        """Gera uma prévia visual real via Open Design e mostra na aba Idea Studio.
+        Não escreve nos arquivos do projeto — é só prévia (o open_design_run_task
+        avisa em destaque se algo for tocado)."""
+        import re as _re
+        import subprocess as _sp
+        import shutil as _sh
+        import orquestra
+
+        log = self.query_one("#chat-log", RichLog)
+        self.call_from_thread(log.write, "\n[bold magenta]🎨 Open Design[/bold magenta] gerando a prévia (pode levar 1-3 min)...\n")
+
+        def on_status(text):
+            def _u():
+                lbl = self.query_one("#status-indicator", Label)
+                if text:
+                    lbl.update(f"[magenta]🎨 {text}[/magenta]"); lbl.remove_class("hidden")
+                else:
+                    lbl.update(""); lbl.add_class("hidden")
+            self.call_from_thread(_u)
+
+        config = orquestra.load_config()
+        section = _TUILiveSection("Open Design", lambda t: None, lambda *a: None, on_status)
+        section.open()
+        ok, text = orquestra.open_design_run_task(config, instruction, section=section, timeout_s=360)
+        on_status("")
+
+        orquestra.save_chat_message("orquestrador", "assistant",
+                                    f"[{'Prévia do Open Design' if ok else 'Erro do Open Design'}]:\n{text[:4000]}")
+
+        if not ok:
+            self.call_from_thread(log.write, f"\n[bold red]⚠ Open Design falhou:[/bold red] {text[:600]}\n")
+            self.call_from_thread(self._re_enable_input)
+            return
+
+        urls = _re.findall(r'https?://\S+', text)
+        preview_url = urls[-1].rstrip('.,;)') if urls else ""
+
+        self.call_from_thread(log.write, f"\n[bold magenta]🎨 Open Design[/bold magenta] {text[:1200]}\n")
+
+        def _show_idea():
+            md = self.query_one("#idea-md", Markdown)
+            body = f"# Prévia gerada\n\n{text}"
+            if preview_url:
+                body += f"\n\n---\n\n**[▶ Abrir prévia ao vivo]({preview_url})**"
+            md.update(body)
+            panel = self.query_one("#idea-panel")
+            if panel.has_class("hidden"):
+                panel.remove_class("hidden")
+                btn = self.query_one("#btn-idea")
+                btn.add_class("active"); btn.label = "🎨 Idea Studio [✓]"
+        self.call_from_thread(_show_idea)
+
+        if preview_url and _sh.which("xdg-open"):
+            try:
+                _sp.Popen(["xdg-open", preview_url], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                self.call_from_thread(log.write, f"\n[dim]🔗 Abrindo no navegador: {preview_url}[/dim]\n")
+            except OSError:
+                pass
+
+        # linkedDirs NÃO é read-only: o Open Design às vezes escreve nos arquivos
+        # reais mesmo em "prévia". Se mexeu, cai no mesmo gate de aprovação.
+        dirty = orquestra._git_dirty_files(orquestra.get_project_dir())
+        if dirty:
+            self.call_from_thread(log.write,
+                f"\n[dim]Arquivos alterados pelo Open Design: {', '.join(sorted(dirty))}[/dim]\n")
+            self._pending_changes = ", ".join(sorted(dirty))
+            self.call_from_thread(self._show_action_bar)
         else:
             self.call_from_thread(self._re_enable_input)
 

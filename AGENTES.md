@@ -63,7 +63,12 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
 - `<DELEGATE binary="operador"> instruções </DELEGATE>` — uma tarefa. Vários soltos = paralelo.
 - `<PIPELINE> <DELEGATE>...</DELEGATE> <DELEGATE>...</DELEGATE> </PIPELINE>` — cadeia; cada
   etapa recebe o resultado da anterior automaticamente.
-- `<DELEGATE binary="open-design"> ... </DELEGATE>` — prévia visual real (não entra em `<PIPELINE>`).
+- `<DELEGATE binary="open-design"> ... </DELEGATE>` — prévia visual real via Open Design
+  (não entra em `<PIPELINE>`). A TUI roda `open_design_run_task`, mostra a prévia na aba
+  **Idea Studio** e abre o link ao vivo no navegador. Config: seção `open_design` em
+  `~/.orquestra.json` (`repo_path`, `node_bin_dir`, `agent`), auto-semeada por `load_config()`
+  se o clone existir. `linkedDirs` NÃO é read-only — se o Open Design escrever nos arquivos
+  reais, a TUI mostra o aviso e cai no gate de aprovação. Também: comando `/design <o que prever>`.
 
 ---
 
