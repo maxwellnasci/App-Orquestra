@@ -182,7 +182,29 @@ alterados". **Fix:** `_is_noise_path()` filtra `__pycache__`, `*.pyc`,
 
 ---
 
-## 6. Backups / rollback
+## 6. Status verificado (set/2026)
+
+Todos testados headless, exatamente como o código chama, lendo/rodando na pasta
+real do projeto:
+
+| Motor | Papel | Conecta via | Testado |
+|---|---|---|---|
+| `claude` | Operador/Revisor | login Claude Code | ✅ lê arquivos, roda comandos |
+| `agy` | Operador | login Antigravity (`--add-dir` absoluto) | ✅ depois do fix — antes ia pro sandbox dele |
+| `codex` | Operador | login Codex (`exec -o`) | ✅ lê arquivos, `pwd` na pasta certa |
+| `claude` + `~/.claude-deepseek-env` | Revisor (DeepSeek) | API key no arquivo | ✅ chave válida, lê arquivos |
+| `agy`/`claude`/`codex` `--mode plan` | Orquestrador | login da CLI, read-only | ✅ os 3 respondem, emitem `<PLANO>`/`<DELEGATE>`, NÃO escrevem |
+| `brain` deepseek/ollama | Orquestrador | API key (arquivo / kimi CLI) | ✅ responde |
+| **`gh copilot`** | **Cão de Guarda** | login GitHub Copilot | ✅ autenticado; achou `ZeroDivisionError` plantado num diff (`achou_bug=True`) |
+
+O Copilot roda como `binary: copilot, model: auto` no `watchdog_verdict()` —
+recebe o `git diff` pronto no prompt, filtra o rodapé de métricas (`AI Credits`,
+`Tokens`, `Resume`, `Changes`) e classifica se tem bug pelas palavras-chave em
+`_WATCHDOG_BUG_WORDS`. Silencioso se o veredito for "tudo certo".
+
+---
+
+## 7. Backups / rollback
 
 - Config antiga: `~/.orquestra.json.bak-pre-refactor`
 - Restaurar: `cp ~/.orquestra.json.bak-pre-refactor ~/.orquestra.json`
@@ -191,7 +213,7 @@ alterados". **Fix:** `_is_noise_path()` filtra `__pycache__`, `*.pyc`,
 
 ---
 
-## 7. Ordem dos commits (set-out/2026)
+## 8. Ordem dos commits (set-out/2026)
 
 | Commit | O quê |
 |---|---|
@@ -202,3 +224,4 @@ alterados". **Fix:** `_is_noise_path()` filtra `__pycache__`, `*.pyc`,
 | `8a2ba1d` | Orquestrador aceita todas as empresas + `/senha` na TUI |
 | `19902c7` | `agy` não enxergava a pasta + validação de modelo dos operários |
 | `14686b0` | Orquestrador usa as contas LOGADAS no terminal (agy/claude/codex) |
+| `af26769` | `APRENDIZADOS.md` (este arquivo) |
