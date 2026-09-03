@@ -19,6 +19,11 @@
 - Config migra automaticamente da v1; `ollama_api_key` em texto puro é removida.
 - Bridge HTTP agora exige token de sessão e valida os caminhos.
 - `test_orquestra.py` — testes sem rede.
+- **Chat aceita colar textos grandes** — o campo `#chat-input` era um `Input` de
+  uma linha só, cujo `_on_paste` do Textual descarta tudo além da primeira linha
+  colada (`event.text.splitlines()[0]`). Virou `ChatInput` (baseado em `TextArea`):
+  cola o texto inteiro (multi-linha), Enter continua enviando e `Ctrl+J` insere
+  quebra de linha manual.
 
 ## V3 (Cockpit) 🚀
 

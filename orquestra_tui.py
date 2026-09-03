@@ -15,10 +15,11 @@ import os
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, Container
-from textual.widgets import Label, Button, Input, RichLog, TextArea, Markdown, OptionList, DirectoryTree
+from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree
 from textual.widgets.option_list import Option
 from textual.screen import ModalScreen
-from textual import work
+from textual.message import Message
+from textual import work, events
 
 
 # ─── Utilitário: encurtamento de nomes para o header ─────────────────────────
@@ -123,6 +124,38 @@ class _TUILiveSection:
 
     def close(self, ok: bool = True, error_detail: str = "", changes_summary: str = ""):
         self._on_close(ok, error_detail, changes_summary)
+
+
+# ─── Campo de chat multi-linha ────────────────────────────────────────────────
+
+class ChatInput(TextArea):
+    """Campo de chat baseado em TextArea (não em Input).
+
+    O Input padrão do Textual descarta tudo além da primeira linha ao colar
+    texto (`event.text.splitlines()[0]` em _on_paste) — por isso era impossível
+    colar um texto grande/multi-linha para o Orquestrador ler. TextArea cola o
+    texto inteiro. Enter continua enviando a mensagem (como antes); Ctrl+J
+    insere uma quebra de linha manual.
+    """
+
+    class Submitted(Message):
+        def __init__(self, chat_input: "ChatInput", value: str) -> None:
+            self.chat_input = chat_input
+            self.value = value
+            super().__init__()
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
+            return
+        if event.key == "ctrl+j":
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        await super()._on_key(event)
 
 
 # ─── Aplicação Principal ──────────────────────────────────────────────────────
@@ -253,6 +286,7 @@ class OrquestraTUI(App):
     #chat-input {
         width: 1fr;
         min-width: 40;
+        height: 5;
         border-right: none;
     }
 
@@ -305,7 +339,7 @@ class OrquestraTUI(App):
         min-width: 18;
     }
 
-    Input {
+    ChatInput {
         dock: bottom;
         margin: 1;
     }
@@ -356,7 +390,7 @@ class OrquestraTUI(App):
                     yield Button("✅ Aprovar", id="btn-approve", classes="action-btn", variant="success")
                     yield Button("❌ Rejeitar", id="btn-reject", classes="action-btn", variant="error")
                     yield Button("🔍 Revisar", id="btn-review", classes="action-btn")
-                yield Input(placeholder="Digite aqui... [Enter para enviar]", id="chat-input")
+                yield ChatInput(placeholder="Digite aqui... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
 
         # ── Rodapé Watchdog ───────────────────────────────────────────────────
         yield Label("🐕 Watchdog: Aguardando alterações para revisão...", id="watchdog-footer")
@@ -694,13 +728,13 @@ class OrquestraTUI(App):
 
     # ── Chat: Recebe o Enter do usuário ───────────────────────────────────────
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         """Intercepta o Enter no chat e dispara o Orquestrador em background."""
         prompt = event.value.strip()
         if not prompt:
             return
 
-        self.query_one("#chat-input", Input).value = ""
+        self.query_one("#chat-input", ChatInput).text = ""
         log = self.query_one("#chat-log", RichLog)
 
         if prompt.startswith("/"):
