@@ -1021,7 +1021,7 @@ class OrquestraTUI(App):
             # do cooldown do Revisor acima — são auditorias diferentes.
             if now - self._last_editor_watchdog >= 15:
                 self._last_editor_watchdog = now
-                self._run_watchdog(commit_after=False)
+                self._run_watchdog(commit_after=False, file_path=info["path"])
 
     def _add_suggestion_card(self, sug_id: str, sug: dict) -> None:
         """Monta um cartão de sugestão (Aceitar/Recusar) no painel do Editor."""
@@ -1573,18 +1573,23 @@ class OrquestraTUI(App):
     # ── Worker: Watchdog ──────────────────────────────────────────────────────
 
     @work(thread=True)
-    def _run_watchdog(self, commit_after: bool = False) -> None:
+    def _run_watchdog(self, commit_after: bool = False, file_path: str | None = None) -> None:
         """Cão de Guarda: usa orquestra.watchdog_verdict (mesma lógica do REPL).
         Verde por padrão no rodapé; vermelho só se achar bug. Se commit_after,
         commita o diff DEPOIS da auditoria (o guarda audita as mudanças ainda
-        não commitadas)."""
+        não commitadas).
+
+        file_path: repassado a watchdog_verdict como fallback — se a pasta não
+        for git (ou não houver diff detectável), audita esse arquivo inteiro em
+        vez de desistir em silêncio. gh copilot/claude/agy/codex não precisam
+        de git pra rodar; só o cálculo do diff precisava."""
         import orquestra
         log = self.query_one("#chat-log", RichLog)
         footer = self.query_one("#watchdog-footer")
         self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
 
         config = orquestra.load_config()
-        text, has_bug = orquestra.watchdog_verdict(config)
+        text, has_bug = orquestra.watchdog_verdict(config, file_path=file_path)
 
         if not text:
             self.call_from_thread(footer.update, "🐕 Cão de Guarda: nada a apontar. ✅")

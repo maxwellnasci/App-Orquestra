@@ -3197,20 +3197,36 @@ def _git_diff_snapshot(cwd: str, max_chars: int = 6000) -> str:
         return ""
 
 
-def watchdog_verdict(config: dict, cwd: str = None) -> tuple:
+def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tuple:
     """Roda o Cão de Guarda (SÍNCRONO) sobre o diff atual. Passa o diff pronto no
     prompt em vez de pedir pro agente rodar git — mais rápido e determinístico.
     Retorna (texto, achou_bug). ('', False) quando não há mudança, o binário
-    falha, ou o veredito é 'tudo certo'."""
+    falha, ou o veredito é 'tudo certo'.
+
+    file_path: quando passado E não há diff git (pasta sem `.git`, ou o
+    arquivo ainda não tem histórico), audita o CONTEÚDO desse arquivo direto
+    em vez de desistir. O binário do Cão de Guarda (gh copilot/claude/agy/
+    codex) nunca precisou de git pra rodar — só _git_diff_snapshot precisa,
+    porque git é a fonte de "o que mudou". Sem essa fonte, auditar o arquivo
+    inteiro ainda é melhor que ficar em silêncio."""
     cwd = cwd or get_project_dir()
     diff = _git_diff_snapshot(cwd)
+    modo = "diff"
+    if not diff and file_path:
+        try:
+            content = Path(file_path).read_text(encoding="utf-8", errors="replace")
+            diff = f"--- ARQUIVO ATUAL ({Path(file_path).name}, sem git pra comparar) ---\n{content[:6000]}"
+            modo = "arquivo"
+        except OSError:
+            pass
     if not diff:
         return "", False
 
     worker, binary, *_ = _resolve_worker(config, "cao_guarda")
     model = worker.get("model", "auto")
+    alvo = "o diff" if modo == "diff" else "o arquivo (sem git disponível pra comparar com a versão anterior)"
     prompt = (
-        "Você é o Cão de Guarda. Analise APENAS o diff abaixo em busca de BUGS ou lógica "
+        f"Você é o Cão de Guarda. Analise APENAS {alvo} abaixo em busca de BUGS ou lógica "
         "errada (ignore estilo e formatação). Se achar algo, seja curto e direto: arquivo, "
         "o problema e o impacto. Se estiver tudo certo, responda somente 'Tudo certo'.\n\n"
         f"{diff}"
