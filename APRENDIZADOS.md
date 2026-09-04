@@ -416,3 +416,54 @@ achados testando na prática (commits `dca0c8d`, `895e0a6`):**
   `watchdog_verdict` e `_orchestrator_react` mockados, só a fiação de verdade
   rodando): save no Modo Aprendizado disparou os três — Revisor comentou,
   Cão de Guarda atualizou o rodapé, Orquestrador reagiu depois.
+
+**Follow-up sério, mesmo dia — usuário chegou a cogitar parar o projeto
+("está bem ruim o fluxo, a gente não sabe quem está fazendo nem o prompt
+que foi mandado, estamos no escuro"). Investigação (não assumida, checada
+no disco) antes de qualquer código (commit `5c9bbb8`):**
+
+- **Nada tinha quebrado.** Repo real do Orquestra limpo, `primeiro.py` do
+  Projeto Cisco com o MESMO bug de sempre, inalterado — Modo Aprendizado é
+  read-only de verdade, fisicamente não tinha como ter estragado nada.
+- **Causa raiz real: `Projeto Cisco` não é um repositório git** (`ls -la`
+  confirmou — sem pasta `.git`, só um `.gitignore` que o `vault.py` cria
+  sozinho no primeiro uso, isso é normal). **Todo** o modelo de segurança —
+  Aprovar/Rejeitar, Cão de Guarda, autoria por IA, gate por risco — depende
+  de `git diff`/`git status` por baixo. Sem `.git`, esses mecanismos ficam
+  **silenciosamente inertes**, sem UM aviso sequer. Isso não é específico
+  deste ciclo — é uma lacuna que sempre existiu, só nunca tinha sido
+  testada num projeto sem git antes. **Se mexer em qualquer coisa do gate
+  de novo, checar sempre**: existe aviso pro usuário se a pasta não é git?
+  (agora sim, ver abaixo — mas é fácil reintroduzir esse silêncio.)
+- **Achados concretos de transparência, direto no código:**
+  1. O indicador de atividade ao vivo mostrava a tool call crua do Claude
+     Code (`Bash({"command": "cd ... && ls"})`) mesmo em `detail="normal"`
+     (o que o modo chat usa) — só devia ficar cru em `detail="full"`.
+  2. **O prompt de verdade mandado pro agente nunca aparecia em lugar
+     nenhum da tela** — só a resposta. Caixa-preta real, não impressão do
+     usuário.
+- **Fix, os 3 confirmados com pergunta direta ao usuário antes de
+  implementar (não assumidos):**
+  1. `on_mount` avisa (uma vez, linha amarela) se `Path(project_dir)/".git"`
+     não existe, listando exatamente o que fica sem efeito.
+  2. `_run_worker`/`_run_pipeline_tui` escrevem uma linha apagada
+     "📤 Prompt para {agente}: {instrução}" antes de disparar o worker.
+  3. `_friendly_tool_call` (novo, orquestra.py) traduz tool call comum
+     (Bash/Read/Write/Edit/Grep/Glob/WebFetch/TodoWrite) pra frase legível
+     em `detail="normal"`; `detail="full"` continua com o preview cru
+     (`_preview`) de sempre — não perde informação pra quem quer o técnico.
+- **Validado:** boot numa pasta sem `.git` mostra o aviso; boot numa pasta
+  COM `.git` não mostra (testado os dois); `_run_worker` com um marcador
+  único no prompt (`"...XYZ123"`) confirmado aparecendo na linha de prompt
+  do chat; `_friendly_tool_call` testado direto pra Bash/Read/Edit/Grep e
+  fallback genérico.
+- **Lição maior, não só de código:** a velocidade de adicionar as 5
+  features + os 2 fixes anteriores no mesmo dia aumentou a superfície do
+  projeto rápido (WorkerResult, file_authorship, risk_gates, plan-panel,
+  usage-footer, orchestrator_react) bem na hora em que o próprio
+  `ANALISE_ARQUITETURA.md` já tinha avisado sobre risco de over-engineering.
+  A causa raiz do incidente (falta de git) não foi introduzida por nenhuma
+  dessas features, mas a sensação de "não sei o que tá rolando" piora
+  proporcionalmente à quantidade de coisa nova rodando ao mesmo tempo. Se o
+  usuário voltar a sentir isso, a pergunta certa não é "que feature falta"
+  — é "o que dá pra tirar".
