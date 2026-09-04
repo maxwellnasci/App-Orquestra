@@ -44,6 +44,24 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 - [x] Sugestões inline (`<SUGESTAO>`) com cartão Aceitar/Recusar por trecho
 - [x] Motor OpenCode/OpenRouter (LLMs chinesas: DeepSeek, Qwen, GLM, Kimi, MiniMax)
 - [x] Fix: chat vazava da caixa com os painéis abertos (`RichLog min_width`)
+- [x] Gasto e uso por LLM: `WorkerResult` captura custo/tokens/duração que já
+  chegavam no stream do Claude/Agy/Codex e eram descartados (só Claude expõe
+  custo real em $; Agy/Codex só tokens). Rodapé `#usage-footer` +
+  `/uso`/`/saldo` (saldo real da DeepSeek via API) — é o "ganho rápido" que
+  a Direção Estratégica pedia (ver abaixo)
+- [x] Autoria por IA (índice paralelo, por arquivo): tabela `file_authorship`
+  registra qual agente editou por último cada arquivo, gravada só quando a
+  tarefa é aprovada — não mexe em `commit_pending`/`revert_pending`. Consulta
+  via `/quem <arquivo>`
+- [x] Atividade ao vivo no `<PIPELINE>`: religou a narração no
+  `#status-indicator` entre etapas (antes usava callbacks no-op e ficava
+  mudo)
+- [x] Painel "📋 Plano" (`#plan-panel`): checklist ao vivo (⬜🔄✅❌) das etapas
+  do `<PIPELINE>`, some quando Aprovar/Rejeitar resolve a tarefa
+- [x] Gate por risco (`risk_gates`, nasce `enabled: false`): pula a pausa de
+  aprovação se nenhum arquivo tocado bate em padrão sensível (`.env`,
+  `secret`, `auth`, etc.) E o Cão de Guarda não achou nada — só no ponto de
+  aprovação, não no `<PLANO>` (ainda não há arquivo pra classificar ali)
 
 ## 💡 Próximas ideias
 
@@ -86,6 +104,9 @@ conseguem ou não querem fazer por conflito de modelo de negócio.
   arquivos sensíveis (segredos, dados de cliente) só vão pra modelo local
   (Ollama); o resto pode ir pra Claude/DeepSeek. Log por turno do que saiu da
   máquina e pra qual fornecedor. Cofre por projeto já existe; é crescer em cima.
+  (`_classify_risk`/`risk_gates` já dá um classificador de caminho sensível —
+  hoje só decide pausa/segue, ainda não decide *pra qual fornecedor* vai;
+  é a peça que falta pra virar essa aposta de verdade.)
 - [ ] **2. Camada de segurança automática (perfil ciber + portfólio)** — engordar
   o Cão de Guarda: varredura de segredo no diff, dependência com CVE, checklist
   OWASP quando o arquivo é rota web. Skills do Kali já na máquina.
@@ -95,7 +116,8 @@ conseguem ou não querem fazer por conflito de modelo de negócio.
   empresa treinando júnior.
 
 Ganho rápido que ajuda as três: rodapé mostrando, por turno, qual fornecedor foi
-usado e quanto de cota gastou (transparência que o Cursor esconde).
+usado e quanto de cota gastou (transparência que o Cursor esconde). **Feito**
+— ver `#usage-footer`/`/uso` no "✅ Feito" acima.
 
 ### 🛡️ Júri de Segurança (depois das apostas, não antes)
 
