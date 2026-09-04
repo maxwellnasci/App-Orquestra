@@ -297,3 +297,81 @@ testados numa sessão de uso real do zero, do início ao fim, num projeto novo**
 escrever um bug de propósito, `Ctrl+S`, conferir que o cartão de sugestão
 aparece e que Aceitar aplica certo; trocar o `Rev:` pra um modelo OpenCode e
 repetir.
+
+## 10. Sessão de 04/09/2026 — Gasto/uso, autoria por IA, atividade ao vivo, todo.md, gate por risco
+
+Cinco melhorias no fluxo, planejadas com `EnterPlanMode`/`ExitPlanMode`
+(plano em `~/.claude/plans/concurrent-imagining-micali.md`) depois de um
+pedido exploratório do usuário por ideias mais modernas (Manus AI como
+referência). Commits `3213b48` (código) e `2c541b8` (roadmap):
+
+1. **`WorkerResult`** (dataclass) substitui a tupla posicional de
+   `_run_worker_headless` — captura `cost_usd`/`tokens_in`/`tokens_out`/
+   `duration_ms`/`changed_files` que já chegavam no stream de cada CLI e
+   eram descartados. Confirmado empiricamente (`claude -p --output-format
+   stream-json`, `agy -p --output-format stream-json`, `codex exec --json`)
+   que **só o Claude Code devolve custo real em dólar** (`total_cost_usd`);
+   Agy e Codex só tokens — CLIs de assinatura não expõem preço. Rodapé
+   `#usage-footer` + `/uso`/`/saldo` (saldo real da DeepSeek via
+   `GET api.deepseek.com/user/balance`) deixam essa diferença explícita no
+   texto ("estimado" vs "saldo").
+2. **Autoria por IA** — índice paralelo (tabela `file_authorship`, por
+   arquivo, não por linha — escopo v1 deliberado), gravado só quando a
+   tarefa é aprovada de verdade; não mexe em `commit_pending`/
+   `revert_pending`. Decisão tomada com o usuário via `AskUserQuestion`
+   antes de implementar: alternativas (commit por etapa / branch efêmera)
+   dariam git-blame nativo, mas mudariam o significado de "Rejeitar" — o
+   usuário preferiu manter a rede de segurança intocada. Consulta via
+   `/quem <arquivo>`.
+3. **Atividade ao vivo** — `<PIPELINE>` na TUI passava callbacks no-op pro
+   `_run_worker_headless`; religado no mesmo `#status-indicator` que o
+   `<DELEGATE>` solto já usava (mecanismo existia, só não estava plugado).
+4. **Painel "📋 Plano"** (`#plan-panel`) — checklist ao vivo (⬜🔄✅❌) das
+   etapas do `<PIPELINE>`, populado a partir da mesma lista de steps já
+   usada pra rodar o pipeline; some quando Aprovar/Rejeitar resolve.
+5. **Gate por risco** (`risk_gates`, nasce `enabled: false`) — só se aplica
+   no ponto de aprovação (arquivos já tocados, dá pra classificar caminho
+   por `fnmatch`); NÃO no `plan-bar`, que aparece antes de qualquer arquivo
+   ser tocado (ajuste feito na implementação ao perceber que o plano
+   original propunha os dois pontos, mas o plan-bar não tem path nenhum
+   disponível ainda). Mesmo com caminho "seguro", roda o Cão de Guarda
+   síncrono antes de decidir — se ele achar algo, pausa igual ao fluxo
+   manual (a rede de segurança não depende só do classificador de caminho).
+
+**Bug pego no meio do caminho:** ao trocar o retorno de
+`_run_worker_headless` pra `WorkerResult`, esqueci de migrar os 2 call
+sites de `_worker_lifecycle` (o `<DELEGATE>` paralelo do **REPL legado**,
+`--repl`) — continuavam desempacotando a tupla antiga e quebrariam em
+runtime com `TypeError: cannot unpack non-iterable WorkerResult`. Só achei
+ao re-grepar TODOS os call sites de `_run_worker_headless` depois de
+"terminar" — se mexer nessa função nunca mais, confirmar isso de novo antes
+de considerar pronto.
+
+**Testes:** `test_orquestra.py` (88 checks, sem rede) + smoke tests diretos
+de banco (`get_session_usage_totals`, `set_file_author`/`get_file_author`,
+`_classify_risk`) + boot real da TUI via `app.run_test()`. O gate por risco
+foi validado à parte com um script dedicado — **3 cenários, num repo git
+isolado em `/tmp`** (não no repo real, não em `~/.orquestra.json` real —
+`load_config` trocado só em memória do processo de teste), mockando
+`_run_worker_headless` (Operador) e `watchdog_verdict` (Cão de Guarda) pra
+não gastar chamada real e não competir com o worker de fundo
+`_load_models_and_config` (busca modelo de 7 provedores, pode demorar):
+- **A** (caminho comum) → seguiu sem pausar, commitou, `file_authorship`
+  gravado com o agente certo.
+- **B** (`.env`, caminho sensível) → pausou, nada commitado, sem autoria
+  gravada.
+- **C** (caminho comum, mas Cão de Guarda mockado pra achar bug) → pausou
+  mesmo assim — confirma que o classificador de caminho sozinho não é a
+  única rede de segurança.
+
+Gotcha do próprio teste: a primeira tentativa esperava `app.workers` ficar
+vazio antes de checar o resultado — nunca fica, porque `_load_models_and_config`
+(que roda em todo `on_mount`, buscando modelo de 7 provedores) é um worker
+de fundo que pode demorar muito mais que a tarefa sendo testada. A espera
+certa é por um sinal concreto (barra de aprovação visível, ou contagem de
+commit mudou), não "nenhum worker rodando".
+
+**Não coberto por este ciclo (gaps conhecidos):** autoria é por arquivo, não
+por linha; o gate por risco não cobre o fluxo do Open Design (gate próprio,
+mais raro); não há selo visual de autoria na aba do Editor (só `/quem` via
+chat).
