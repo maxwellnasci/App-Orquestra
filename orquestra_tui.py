@@ -383,6 +383,33 @@ class OrquestraTUI(App):
         text-style: bold;
     }
 
+    #usage-footer {
+        height: 1;
+        dock: bottom;
+        background: $surface;
+        color: $text-muted;
+        content-align: left middle;
+        padding: 0 2;
+    }
+
+    #plan-panel {
+        height: auto;
+        max-height: 10;
+        overflow-y: auto;
+        background: $boost;
+        border-top: solid $primary-background;
+        padding: 0 1;
+    }
+
+    #plan-panel.hidden {
+        display: none;
+    }
+
+    .plan-step {
+        height: 1;
+        padding: 0 1;
+    }
+
     RichLog {
         height: 1fr;
         padding: 1;
@@ -490,6 +517,9 @@ class OrquestraTUI(App):
                 # quebra no tamanho real do painel (que tem min-width: 40 no CSS).
                 yield RichLog(id="chat-log", markup=True, wrap=True, min_width=1)
                 yield Label("", id="status-indicator", classes="hidden")
+                # Painel "📋 Plano" — checklist persistente do <PLANO>/<PIPELINE>
+                # ativo (some quando Aprovar/Rejeitar resolve a tarefa).
+                yield Vertical(id="plan-panel", classes="hidden")
                 # Barra do PLANO — aparece quando o Orquestrador propõe um <PLANO>
                 with Container(id="plan-bar", classes="hidden"):
                     yield Button("▶ Executar plano", id="btn-exec-plan", classes="action-btn", variant="success")
@@ -501,8 +531,9 @@ class OrquestraTUI(App):
                     yield Button("🔍 Revisar", id="btn-review", classes="action-btn")
                 yield ChatInput(placeholder="Digite aqui... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
 
-        # ── Rodapé Watchdog ───────────────────────────────────────────────────
+        # ── Rodapés ───────────────────────────────────────────────────────────
         yield Label("🐕 Watchdog: Aguardando alterações para revisão...", id="watchdog-footer")
+        yield Label("💰 Uso: $0.00 · 0 chamadas", id="usage-footer")
 
     # ── Inicialização ─────────────────────────────────────────────────────────
 
@@ -534,6 +565,10 @@ class OrquestraTUI(App):
         self._last_auto_review: float = 0.0     # cooldown da revisão automática ao salvar
         self._pending_suggestions: dict[str, dict] = {}  # sug_id -> {"path","linha_inicio","linha_fim","motivo","codigo"}
         self._suggestion_counter: int = 0
+        self._pending_attribution: dict | None = None  # agente/instrução/arquivos da mudança aguardando aprovação
+        self._plan_steps: list[dict] = []       # [{"text","status"}] do <PLANO>/<PIPELINE> ativo — painel "📋 Plano"
+        import orquestra
+        self._session_usage = orquestra.get_session_usage_totals(orquestra.get_project_id())
 
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold cyan]🎼 Orquestrador[/bold cyan] Bem-vindo ao Orquestra. Converse comigo — eu planejo e a equipe executa.\n")
@@ -548,6 +583,7 @@ class OrquestraTUI(App):
             btn.label = "🎓 Aprendizado [✓]"
             self.query_one("#editor-toolbar").remove_class("hidden")
 
+        self._update_usage_footer()
         self._load_models_and_config()
 
     @work(exclusive=True)
@@ -837,6 +873,8 @@ class OrquestraTUI(App):
         elif decision == "reject":
             import orquestra
             self._pipeline_rest = None  # abandona o resto do pipeline
+            self._pending_attribution = None  # nada foi commitado — nada a atribuir
+            self._clear_plan_panel()
             revertidos = orquestra.revert_pending(orquestra.get_project_dir())
             if revertidos:
                 log.write(f"\n[bold red]❌ Rejeitado — revertido:[/bold red] {revertidos}\n")
@@ -1103,6 +1141,40 @@ class OrquestraTUI(App):
             with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             log.write(f"\n[green]Detalhe: {parts[1]}[/green]\n")
+        elif head in ("/quem", "/autor"):
+            if len(parts) < 2:
+                log.write("\n[dim]Uso: /quem <caminho/do/arquivo>[/dim]\n")
+                return
+            fp = " ".join(parts[1:]).strip()
+            rel = fp
+            try:
+                rel = str(Path(fp).resolve().relative_to(Path(orquestra.get_project_dir()).resolve()))
+            except (ValueError, OSError):
+                pass
+            info = orquestra.get_file_author(orquestra.get_project_id(), rel) or orquestra.get_file_author(orquestra.get_project_id(), fp)
+            if not info:
+                log.write(f"\n[dim]Sem registro de autoria pra `{rel}` (nunca foi tocado por um agente do Orquestra, ou a mudança nunca foi aprovada).[/dim]\n")
+            else:
+                log.write(
+                    f"\n[bold]✏️ {rel}[/bold] — última edição: [bold]{info['agent_label']}[/bold] "
+                    f"em {info['updated_at'][:16].replace('T', ' ')}\n"
+                    f"[dim]{info['last_instruction'] or '(sem descrição)'}[/dim]\n"
+                )
+        elif head in ("/uso", "/gasto", "/saldo"):
+            u = self._session_usage
+            log.write(
+                f"\n💰 [bold]Uso estimado (Claude Code):[/bold] ${u['cost_usd']:.4f} · "
+                f"{u['tokens_in']} tokens in / {u['tokens_out']} tokens out · {u['calls']} chamada(s)\n"
+                "[dim]Codex/Agy (assinatura) contam nas chamadas, mas não têm preço por token exposto pela CLI — só Claude e DeepSeek têm custo real.[/dim]\n"
+            )
+            if head == "/saldo":
+                deepseek_env = orquestra.load_env_file(str(orquestra.DEEPSEEK_ENV))
+                deepseek_key = deepseek_env.get("ANTHROPIC_API_KEY", "")
+                balance = orquestra._deepseek_balance(deepseek_key) if deepseek_key else None
+                if balance is not None:
+                    log.write(f"[green]DeepSeek — saldo real: ${balance:.2f}[/green]\n")
+                else:
+                    log.write("[dim]DeepSeek: sem key configurada ou saldo indisponível agora.[/dim]\n")
         elif head in ("/design", "/open-design"):
             rest = cmd.split(maxsplit=1)
             if len(rest) > 1:
@@ -1114,6 +1186,7 @@ class OrquestraTUI(App):
         elif head in ("/ajuda", "/help"):
             log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
                       "/modo chat|tecnico · /detalhe minimal|normal|full · "
+                      "/quem <arquivo> · /uso · /saldo · "
                       "botões do topo trocam os modelos[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
@@ -1316,7 +1389,7 @@ class OrquestraTUI(App):
 
         section = _TUILiveSection(label, on_line, on_close, on_status)
         section.open()
-        final_text, is_error, error_detail, changes_summary = orquestra._run_worker_headless(
+        result = orquestra._run_worker_headless(
             cmd, worker_env, cwd, section,
             is_agy=(actual_binary == "agy"),
             is_codex=(actual_binary == "codex"),
@@ -1324,7 +1397,17 @@ class OrquestraTUI(App):
             is_opencode=(actual_binary == "opencode"),
             output_file=output_file,
         )
-        
+        final_text, is_error, error_detail, changes_summary = (
+            result.final_text, result.is_error, result.error_detail, result.changes_summary,
+        )
+        if not read_only:
+            orquestra._record_agent_performance(
+                orquestra.get_project_id(), label, orquestra._infer_task_kind(instruction),
+                "error" if is_error else "success",
+                result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms,
+            )
+            self.call_from_thread(self._add_usage, result.cost_usd, result.tokens_in, result.tokens_out)
+
         on_status("")
 
         # Para o GPS
@@ -1376,7 +1459,43 @@ class OrquestraTUI(App):
         if changes_summary:
             self.call_from_thread(log.write, f"\n[dim]{changes_summary}[/dim]\n")
             self._pending_changes = changes_summary
-            self.call_from_thread(self._show_action_bar)
+            attribution = None
+            if not read_only and result.changed_files:
+                attribution = {
+                    "agent_tag": actual_binary, "agent_label": label,
+                    "instruction": instruction, "files": result.changed_files,
+                }
+
+            auto_ok = (not read_only) and self._should_auto_approve(config, result.changed_files)
+            has_bug = False
+            if auto_ok:
+                footer = self.query_one("#watchdog-footer")
+                self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
+                wtext, has_bug = orquestra.watchdog_verdict(config)
+                if wtext and has_bug:
+                    self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
+                    self.call_from_thread(footer.add_class, "alert")
+                    self.call_from_thread(log.write, f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
+                else:
+                    self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
+                    self.call_from_thread(footer.remove_class, "alert")
+
+            if auto_ok and not has_bug:
+                self.call_from_thread(log.write, "\n[dim](gate por risco: seguindo sem pausar)[/dim]\n")
+                commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
+                if commited:
+                    self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                    if attribution:
+                        for fp in attribution["files"]:
+                            orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
+                                                       attribution["agent_label"], attribution["instruction"])
+                self.call_from_thread(self._re_enable_input)
+            else:
+                if auto_ok and has_bug:
+                    self.call_from_thread(log.write,
+                        "\n[dim](gate por risco: caminho parecia seguro, mas o Cão de Guarda achou algo — pausando mesmo assim)[/dim]\n")
+                self._pending_attribution = attribution
+                self.call_from_thread(self._show_action_bar)
         else:
             self.call_from_thread(self._re_enable_input)
 
@@ -1411,14 +1530,26 @@ class OrquestraTUI(App):
             commited = orquestra.commit_pending(orquestra.get_project_dir(), "Orquestra: mudança aprovada")
             if commited:
                 self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                # Autoria por IA — índice paralelo (file_authorship): só grava
+                # depois que o commit de verdade aconteceu; se fosse Rejeitar,
+                # _handle_approval descarta o buffer sem chamar isto.
+                attr = self._pending_attribution
+                if attr:
+                    for fp in attr["files"]:
+                        orquestra.set_file_author(
+                            orquestra.get_project_id(), fp, attr["agent_tag"], attr["agent_label"],
+                            attr["instruction"],
+                        )
+            self._pending_attribution = None
 
         # Se um <PIPELINE> ficou pausado nesta aprovação, retoma as etapas restantes.
         rest = self._pipeline_rest
         self._pipeline_rest = None
         if rest and rest["steps"]:
             self.call_from_thread(log.write, "\n[dim]🔗 Retomando o pipeline...[/dim]\n")
-            self.call_from_thread(lambda: self._run_pipeline_tui(rest["steps"], rest["previous"]))
+            self.call_from_thread(lambda: self._run_pipeline_tui(rest["steps"], rest["previous"], is_resume=True))
         else:
+            self.call_from_thread(self._clear_plan_panel)
             self.call_from_thread(self._re_enable_input)
 
     # ── Open Design (prévia visual dentro do Orquestra) ─────────────────────
@@ -1564,7 +1695,7 @@ class OrquestraTUI(App):
     # ── Pipeline (operador → revisor → ...) ──────────────────────────────────
 
     @work(thread=True)
-    def _run_pipeline_tui(self, steps: list, previous: str = "") -> None:
+    def _run_pipeline_tui(self, steps: list, previous: str = "", is_resume: bool = False) -> None:
         """Roda uma cadeia <PIPELINE> em sequência, passando o resultado de cada
         etapa como contexto para a próxima. Se uma etapa mexe em arquivos, pausa
         na aprovação e guarda as etapas restantes em self._pipeline_rest —
@@ -1574,6 +1705,16 @@ class OrquestraTUI(App):
         cwd = orquestra.get_project_dir()
         self._warn_pending_manual_edits(cwd, log)
         config = orquestra.load_config()
+
+        # Painel "📋 Plano": na primeira chamada (não-retomada) monta a lista
+        # cheia de passos; numa retomada pós-aprovação, self._plan_steps já
+        # existe (com as etapas já feitas marcadas "done") — só o offset muda.
+        if not is_resume or not self._plan_steps:
+            self._plan_steps = [{"text": instr, "status": "pending"} for _, instr in steps]
+            offset = 0
+        else:
+            offset = max(0, len(self._plan_steps) - len(steps))
+        self.call_from_thread(self._render_plan_panel)
 
         for idx, (tag, instruction) in enumerate(steps, 1):
             worker_cfg, actual_binary, label, icon, color = orquestra._resolve_worker(config, tag)
@@ -1587,38 +1728,114 @@ class OrquestraTUI(App):
             if previous:
                 full = f"Contexto — resultado da etapa anterior:\n\n{previous[:4000]}\n\nSua tarefa:\n{instruction}"
 
+            step_no = offset + idx
+            if offset + idx - 1 < len(self._plan_steps):
+                self._plan_steps[offset + idx - 1]["status"] = "running"
+                self.call_from_thread(self._render_plan_panel)
+
             self.call_from_thread(log.write, f"\n[dim]🔗 Etapa {label} ({idx} de {len(steps)} restante(s))[/dim]\n")
             cmd, env, out_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, full)
-            section = _TUILiveSection(label, lambda t: None, lambda *a: None, None)
+
+            # Atividade ao vivo: antes, o pipeline passava callbacks no-op e
+            # nada aparecia entre uma etapa e a próxima — agora religa no mesmo
+            # #status-indicator que o <DELEGATE> solto já usa.
+            def on_status(text: str, _label=label, _step=step_no, _total=len(steps) + offset):
+                def _update():
+                    status_lbl = self.query_one("#status-indicator", Label)
+                    if text:
+                        status_lbl.update(f"🔗 Etapa {_step}/{_total} — {_label}: {text}")
+                        status_lbl.remove_class("hidden")
+                    else:
+                        status_lbl.update("")
+                        status_lbl.add_class("hidden")
+                self.call_from_thread(_update)
+
+            section = _TUILiveSection(label, lambda t: None, lambda *a: None, on_status)
             section.open()
-            final_text, is_error, err, changes = orquestra._run_worker_headless(
+            result = orquestra._run_worker_headless(
                 cmd, env, cwd, section,
                 is_agy=(actual_binary == "agy"), is_codex=(actual_binary == "codex"),
                 is_copilot=(actual_binary == "copilot"), is_opencode=(actual_binary == "opencode"),
                 output_file=out_file,
             )
+            final_text, is_error, err, changes = (
+                result.final_text, result.is_error, result.error_detail, result.changes_summary,
+            )
+            on_status("")
             if out_file:
                 try:
                     os.unlink(out_file)
                 except OSError:
                     pass
+            orquestra._record_agent_performance(
+                orquestra.get_project_id(), label, orquestra._infer_task_kind(instruction),
+                "error" if is_error else "success",
+                result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms,
+            )
+            self.call_from_thread(self._add_usage, result.cost_usd, result.tokens_in, result.tokens_out)
             if is_error:
+                if offset + idx - 1 < len(self._plan_steps):
+                    self._plan_steps[offset + idx - 1]["status"] = "error"
+                    self.call_from_thread(self._render_plan_panel)
                 self.call_from_thread(log.write, f"\n[bold red]⚠ Pipeline parou em {label}: {err[:400]}[/bold red]\n")
                 orquestra.save_chat_message("orquestrador", "assistant", f"[Pipeline parou em {label}]: {err[:1500]}")
                 self.call_from_thread(self._re_enable_input)
                 return
+            if offset + idx - 1 < len(self._plan_steps):
+                self._plan_steps[offset + idx - 1]["status"] = "done"
+                self.call_from_thread(self._render_plan_panel)
             previous = (final_text or "").strip()
             orquestra.save_chat_message("orquestrador", "assistant", f"[Pipeline — {label}]:\n{previous[:4000]}")
             self.call_from_thread(log.write, f"\n[bold green]{icon} {label}[/bold green] {previous[:1500]}\n")
             if changes:
                 self._pending_changes = changes
-                remaining = steps[idx:]  # etapas ainda não rodadas
-                self._pipeline_rest = {"steps": remaining, "previous": previous} if remaining else None
-                if remaining:
-                    self.call_from_thread(log.write,
-                        f"\n[dim](o pipeline continua depois do Aprovar: {len(remaining)} etapa(s))[/dim]\n")
-                self.call_from_thread(self._show_action_bar)
-                return
+                attribution = None
+                if result.changed_files:
+                    attribution = {
+                        "agent_tag": actual_binary, "agent_label": label,
+                        "instruction": instruction, "files": result.changed_files,
+                    }
+
+                auto_ok = self._should_auto_approve(config, result.changed_files)
+                has_bug = False
+                if auto_ok:
+                    footer = self.query_one("#watchdog-footer")
+                    self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
+                    wtext, has_bug = orquestra.watchdog_verdict(config)
+                    if wtext and has_bug:
+                        self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
+                        self.call_from_thread(footer.add_class, "alert")
+                        self.call_from_thread(log.write, f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
+                    else:
+                        self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
+                        self.call_from_thread(footer.remove_class, "alert")
+
+                if auto_ok and not has_bug:
+                    # Gate por risco: nenhum caminho sensível e o Cão de Guarda não
+                    # achou nada — commita e segue pro próximo passo sem pausar.
+                    self.call_from_thread(log.write, "\n[dim](gate por risco: seguindo sem pausar)[/dim]\n")
+                    commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
+                    if commited:
+                        self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                        if attribution:
+                            for fp in attribution["files"]:
+                                orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
+                                                           attribution["agent_label"], attribution["instruction"])
+                    # sem return — o loop segue pro idx seguinte
+                else:
+                    if auto_ok and has_bug:
+                        self.call_from_thread(log.write,
+                            "\n[dim](gate por risco: caminho parecia seguro, mas o Cão de Guarda achou algo — pausando mesmo assim)[/dim]\n")
+                    self._pending_attribution = attribution
+                    remaining = steps[idx:]  # etapas ainda não rodadas
+                    self._pipeline_rest = {"steps": remaining, "previous": previous} if remaining else None
+                    if remaining:
+                        self.call_from_thread(log.write,
+                            f"\n[dim](o pipeline continua depois do Aprovar: {len(remaining)} etapa(s))[/dim]\n")
+                    self.call_from_thread(self._show_action_bar)
+                    return
+
+        self.call_from_thread(self._clear_plan_panel)
 
         self.call_from_thread(self._re_enable_input)
 
@@ -1634,6 +1851,51 @@ class OrquestraTUI(App):
     def _re_enable_input(self) -> None:
         self.query_one("#chat-input").disabled = False
         self.query_one("#chat-input").focus()
+
+    def _should_auto_approve(self, config: dict, changed_files: list[str]) -> bool:
+        """Gate por risco (nasce desligado): True só quando risk_gates.enabled
+        é True e nenhum arquivo tocado bate nos padrões sensíveis — aí a
+        tarefa segue sem pausar em vez de exigir Aprovar."""
+        import orquestra
+        if not config.get("risk_gates", {}).get("enabled") or not changed_files:
+            return False
+        return not orquestra._classify_risk(changed_files, config)
+
+    def _update_usage_footer(self) -> None:
+        u = self._session_usage
+        text = f"💰 Uso: ${u['cost_usd']:.2f} estimado · {u['calls']} chamada(s)"
+        try:
+            self.query_one("#usage-footer", Label).update(text)
+        except Exception:
+            pass
+
+    def _add_usage(self, cost_usd: float, tokens_in: int, tokens_out: int) -> None:
+        """Acumula custo/tokens no total do projeto e atualiza o rodapé. Chamar
+        via call_from_thread — quem soma de verdade é o SQLite (agent_performance);
+        isto só mantém o número na tela em sincronia sem reconsultar o banco."""
+        self._session_usage["cost_usd"] += cost_usd or 0.0
+        self._session_usage["tokens_in"] += tokens_in or 0
+        self._session_usage["tokens_out"] += tokens_out or 0
+        self._session_usage["calls"] += 1
+        self._update_usage_footer()
+
+    def _render_plan_panel(self) -> None:
+        """Reescreve o painel '📋 Plano' a partir de self._plan_steps — chamado
+        toda vez que um passo muda de status. Vazio = painel escondido."""
+        panel = self.query_one("#plan-panel", Vertical)
+        panel.remove_children()
+        if not self._plan_steps:
+            panel.add_class("hidden")
+            return
+        panel.remove_class("hidden")
+        icons = {"pending": "⬜", "running": "🔄", "done": "✅", "error": "❌"}
+        for step in self._plan_steps:
+            icon = icons.get(step["status"], "⬜")
+            panel.mount(Label(f"{icon} {step['text'][:100]}", classes="plan-step"))
+
+    def _clear_plan_panel(self) -> None:
+        self._plan_steps = []
+        self._render_plan_panel()
 
 
 _VAULT = None  # cofre desbloqueado, pra o /senha funcionar dentro da TUI

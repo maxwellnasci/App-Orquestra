@@ -10,12 +10,14 @@ import subprocess
 import shutil
 import json
 import re
+import fnmatch
 import time
 import datetime
 import threading
 import tempfile
 import urllib.request
 import urllib.error
+from dataclasses import dataclass, field
 from pathlib import Path
 from vault import VaultManager
 
@@ -142,7 +144,14 @@ DEFAULT_CONFIG = {
         "repo_path": str(Path.home() / "Documentos" / "Kali Linux" / "open-design"),
         "node_bin_dir": str(Path.home() / ".local" / "opt" / "node-open-design" / "bin"),
         "agent": "claude"
-    }
+    },
+    # Gate por risco: nasce DESLIGADO — é a única feature que muda o
+    # comportamento padrão de quem já usa a ferramenta, então ligar é decisão
+    # consciente do usuário (config ou /modo autonomo), nunca automático.
+    "risk_gates": {
+        "enabled": False,
+        "always_confirm_patterns": ["*.env*", "*secret*", "*credential*", "*/auth*", "*.pem", "*.key"],
+    },
 }
 
 
@@ -349,6 +358,17 @@ def load_config() -> dict:
                 cfg["ui"][k] = v
                 needs_save = True
 
+    # Gate por risco: seção nova, sempre nasce com enabled=False (ver comentário
+    # no DEFAULT_CONFIG) — nunca liga sozinha numa migração.
+    if "risk_gates" not in cfg:
+        cfg["risk_gates"] = dict(DEFAULT_CONFIG["risk_gates"])
+        needs_save = True
+    else:
+        for k, v in DEFAULT_CONFIG["risk_gates"].items():
+            if k not in cfg["risk_gates"]:
+                cfg["risk_gates"][k] = v
+                needs_save = True
+
     if needs_save:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -485,6 +505,29 @@ def _init_memory_db():
                     task_kind TEXT NOT NULL,
                     outcome TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+            """)
+            # Migração: custo/uso por chamada — só o Claude devolve total_cost_usd
+            # de verdade (assinatura/API não expõe preço pro Agy/Codex); os demais
+            # ficam 0.0 e o que importa pra eles são as colunas de tokens.
+            for col_def in ("cost_usd REAL NOT NULL DEFAULT 0",
+                            "tokens_in INTEGER NOT NULL DEFAULT 0",
+                            "tokens_out INTEGER NOT NULL DEFAULT 0",
+                            "duration_ms INTEGER NOT NULL DEFAULT 0"):
+                try:
+                    conn.execute(f"ALTER TABLE agent_performance ADD COLUMN {col_def}")
+                    conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # coluna já existe (banco de uma sessão anterior)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS file_authorship (
+                    project_id TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    agent_tag TEXT NOT NULL,
+                    agent_label TEXT NOT NULL,
+                    last_instruction TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (project_id, file_path)
                 )
             """)
             conn.commit()
@@ -655,7 +698,9 @@ def _infer_task_kind(instruction: str) -> str:
     return "geral"
 
 
-def _record_agent_performance(project_id: str, agent_tag: str, task_kind: str, outcome: str):
+def _record_agent_performance(project_id: str, agent_tag: str, task_kind: str, outcome: str,
+                               cost_usd: float = 0.0, tokens_in: int = 0, tokens_out: int = 0,
+                               duration_ms: int = 0):
     """Chamada mecânica (sem LLM) logo após um worker/pipeline/Open Design
     terminar. Degrada silenciosamente em qualquer erro — isso é telemetria de
     aprendizado, nunca deve derrubar o turno do usuário por causa dela."""
@@ -664,15 +709,82 @@ def _record_agent_performance(project_id: str, agent_tag: str, task_kind: str, o
             conn = sqlite3.connect(MEMORY_DB_FILE)
             try:
                 conn.execute(
-                    "INSERT INTO agent_performance (project_id, agent_tag, task_kind, outcome, created_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (project_id, agent_tag, task_kind, outcome, datetime.datetime.now().isoformat()),
+                    "INSERT INTO agent_performance "
+                    "(project_id, agent_tag, task_kind, outcome, created_at, cost_usd, tokens_in, tokens_out, duration_ms) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (project_id, agent_tag, task_kind, outcome, datetime.datetime.now().isoformat(),
+                     cost_usd, tokens_in, tokens_out, duration_ms),
                 )
                 conn.commit()
             finally:
                 conn.close()
     except sqlite3.Error:
         pass
+
+
+def get_session_usage_totals(project_id: str) -> dict:
+    """Soma cost_usd/tokens/chamadas gravados em agent_performance pro projeto
+    atual — usado pelo rodapé de uso da TUI. Nunca lança: telemetria opcional."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(tokens_in), 0), "
+                    "COALESCE(SUM(tokens_out), 0), COUNT(*) FROM agent_performance WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        return {"cost_usd": row[0], "tokens_in": row[1], "tokens_out": row[2], "calls": row[3]}
+    except sqlite3.Error:
+        return {"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "calls": 0}
+
+
+def set_file_author(project_id: str, file_path: str, agent_tag: str, agent_label: str,
+                     last_instruction: str = ""):
+    """Upsert em file_authorship — chamado só depois que a tarefa é aprovada
+    (ver commit_pending/_handle_approval na TUI). Se a tarefa for rejeitada,
+    quem chama simplesmente não invoca isto — nada fica gravado."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                conn.execute(
+                    "INSERT INTO file_authorship (project_id, file_path, agent_tag, agent_label, last_instruction, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(project_id, file_path) DO UPDATE SET "
+                    "agent_tag=excluded.agent_tag, agent_label=excluded.agent_label, "
+                    "last_instruction=excluded.last_instruction, updated_at=excluded.updated_at",
+                    (project_id, file_path, agent_tag, agent_label, (last_instruction or "")[:300],
+                     datetime.datetime.now().isoformat()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def get_file_author(project_id: str, file_path: str) -> dict | None:
+    """Lê quem editou por último um arquivo — None se nunca foi tocado por um
+    agente do Orquestra (ou se o registro nunca chegou a ser aprovado)."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                row = conn.execute(
+                    "SELECT agent_tag, agent_label, last_instruction, updated_at FROM file_authorship "
+                    "WHERE project_id = ? AND file_path = ?",
+                    (project_id, file_path),
+                ).fetchone()
+            finally:
+                conn.close()
+        if not row:
+            return None
+        return {"agent_tag": row[0], "agent_label": row[1], "last_instruction": row[2], "updated_at": row[3]}
+    except sqlite3.Error:
+        return None
 
 
 def _store_lesson(project_id: str | None, category: str, text: str, source: str = ""):
@@ -1041,6 +1153,21 @@ def _git_dirty_files(project_dir: str) -> set | None:
             if line.strip() and not _is_noise_path(line[3:].strip())}
 
 
+def _classify_risk(paths: list[str], config: dict) -> bool:
+    """True se algum caminho bate num padrão sensível de risk_gates — usado
+    pelos dois pontos de gate da TUI (plan-bar/action-bar) pra decidir se
+    segue sem pausar ou pede aprovação como hoje. Só é consultado quando
+    risk_gates.enabled é True (ver DEFAULT_CONFIG — nasce desligado)."""
+    patterns = config.get("risk_gates", {}).get("always_confirm_patterns", [])
+    if not patterns:
+        return False
+    for path in paths:
+        low = path.lower()
+        if any(fnmatch.fnmatch(low, pat.lower()) for pat in patterns):
+            return True
+    return False
+
+
 def open_design_run_task(config: dict, instruction: str, timeout_s: int = 600,
                           section: "LiveSection | None" = None) -> tuple[bool, str]:
     """Roda uma automação de tiro único no Open Design ligada à pasta atual:
@@ -1197,6 +1324,31 @@ def load_env_file(env_path_str: str) -> dict:
                 key, _, val = line.partition("=")
                 env[key.strip()] = val.strip()
     return env
+
+def _deepseek_balance(api_key: str) -> float | None:
+    """Saldo real (paga por token, API key) via GET .../user/balance — chamado
+    sob demanda (/saldo na TUI), nunca por turno. None em qualquer falha:
+    telemetria opcional, nunca deve travar a UI."""
+    if not api_key:
+        return None
+    req = urllib.request.Request(
+        "https://api.deepseek.com/user/balance",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    infos = data.get("balance_infos") or []
+    for info in infos:
+        if info.get("currency") == "USD":
+            try:
+                return float(info.get("total_balance", 0))
+            except (TypeError, ValueError):
+                return None
+    return None
+
 
 def get_project_dir() -> str:
     return os.getcwd()
@@ -2153,6 +2305,14 @@ def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail:
     elif etype == "result":
         state["final_text"] = d.get("result", "") or ""
         state["is_error"] = bool(d.get("is_error"))
+        # Único motor que devolve custo em dólar de verdade (confirmado via
+        # `claude -p ... --output-format stream-json`, campo "total_cost_usd"
+        # no evento "result") — Agy/Codex só dão tokens, sem preço.
+        state["cost_usd"] = d.get("total_cost_usd") or 0.0
+        usage = d.get("usage") or {}
+        state["tokens_in"] = usage.get("input_tokens", 0) or 0
+        state["tokens_out"] = usage.get("output_tokens", 0) or 0
+        state["duration_ms"] = d.get("duration_ms") or 0
 
 
 def _narrate_copilot_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
@@ -2228,6 +2388,14 @@ def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: st
         res = d.get("result", {})
         state["final_text"] = res.get("response", "") or ""
         state["is_error"] = res.get("status") != "SUCCESS"
+        # Confirmado via `agy -p ... --output-format stream-json`: "usage" traz
+        # tokens (input_tokens/output_tokens), mas sem custo em dólar — login
+        # por assinatura não expõe preço, igual ao Codex.
+        usage = res.get("usage") or {}
+        state["tokens_in"] = usage.get("input_tokens", 0) or 0
+        state["tokens_out"] = usage.get("output_tokens", 0) or 0
+        duration_s = res.get("duration_seconds")
+        state["duration_ms"] = int(duration_s * 1000) if duration_s else 0
         if detail == "full":
             section.end_line()
         elif state["final_text"] and not state["is_error"]:
@@ -2296,6 +2464,13 @@ def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: 
         if msg and not state.get("final_text"):
             state["final_text"] = f"[Codex] {msg}"
         section.tool_call("turno falhou.")
+    elif ev_type == "turn.completed":
+        # Confirmado via `codex exec ... --json`: "usage" traz tokens
+        # (input_tokens/cached_input_tokens/output_tokens), sem custo em
+        # dólar — ChatGPT-auth não expõe preço, igual ao Agy.
+        usage = d.get("usage") or {}
+        state["tokens_in"] = usage.get("input_tokens", 0) or 0
+        state["tokens_out"] = usage.get("output_tokens", 0) or 0
 
 
 def _narrate_opencode_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
@@ -2685,19 +2860,37 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
     return clean.strip()
 
 
+@dataclass
+class WorkerResult:
+    """Retorno de _run_worker_headless. Dataclass em vez de tupla posicional
+    pra crescer (custo/tokens, adicionados na feature de gasto/uso) sem
+    empilhar mais posições — cada call site lê pelo nome do campo."""
+    final_text: str
+    is_error: bool
+    error_detail: str
+    changes_summary: str
+    cost_usd: float = 0.0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    duration_ms: int = 0
+    changed_files: list[str] = field(default_factory=list)
+
+
 def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection", is_agy: bool,
                           detail: str = "normal", is_codex: bool = False, is_copilot: bool = False,
-                          is_opencode: bool = False, output_file: str | None = None):
+                          is_opencode: bool = False, output_file: str | None = None) -> WorkerResult:
     """Roda um operário headless, narrando eventos ao vivo na LiveSection — em
     NENHUM nível de detalhe fica em silêncio total (ver _detail_level). Abre e
     fecha a seção aqui mesmo, já com o resumo de erro embutido no fechamento.
-    Retorna (final_text, is_error, error_detail).
+    Retorna um WorkerResult (final_text, is_error, error_detail, changes_summary,
+    cost_usd, tokens_in, tokens_out, duration_ms).
 
     output_file: quando informado (Codex), depois que o processo termina o
     conteúdo desse arquivo (-o/--output-last-message) sobrescreve o final_text
     capturado via streaming — é a fonte mais confiável, já que o parser do
     --json do Codex é best-effort."""
-    state = {"final_text": "", "is_error": False}
+    state = {"final_text": "", "is_error": False, "cost_usd": 0.0, "tokens_in": 0,
+             "tokens_out": 0, "duration_ms": 0}
     stderr_lines = []
     # Snapshot pra avisar, ao fechar a seção, quais arquivos reais foram tocados —
     # mesma técnica já usada no Open Design (_git_dirty_files), estendida aqui pra
@@ -2768,11 +2961,13 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
         error_detail = ""
 
     changes_summary = ""
+    changed_files: list[str] = []
     if files_before is not None:
         files_after = _git_dirty_files(cwd)
         touched = (files_after or set()) - files_before
         if touched:
-            changes_summary = f"Arquivos alterados: {', '.join(sorted(touched))}"
+            changed_files = sorted(touched)
+            changes_summary = f"Arquivos alterados: {', '.join(changed_files)}"
             try:
                 diff_stat = subprocess.run(
                     ["git", "diff", "--stat"], cwd=cwd, capture_output=True, text=True, timeout=10,
@@ -2784,7 +2979,11 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 
     section.close(ok=not state["is_error"], error_detail=error_detail, changes_summary=changes_summary)
 
-    return state["final_text"], state["is_error"], error_detail, changes_summary
+    return WorkerResult(
+        final_text=state["final_text"], is_error=state["is_error"], error_detail=error_detail,
+        changes_summary=changes_summary, cost_usd=state["cost_usd"], tokens_in=state["tokens_in"],
+        tokens_out=state["tokens_out"], duration_ms=state["duration_ms"], changed_files=changed_files,
+    )
 
 
 DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DOTALL | re.IGNORECASE)
@@ -3063,11 +3262,14 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         
         pre_snapshot = "\n".join(sorted(_git_status_paths(get_project_dir())))
         task_id = create_task(instruction, label, pre_snapshot=pre_snapshot)
-        final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+        result = _run_worker_headless(
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
             is_codex=(actual_binary == "codex"), is_copilot=(actual_binary == "copilot"),
             is_opencode=(actual_binary == "opencode"), output_file=output_file,
+        )
+        final_text, is_error, error_detail, changes_summary = (
+            result.final_text, result.is_error, result.error_detail, result.changes_summary,
         )
         if output_file:
             try:
@@ -3085,10 +3287,13 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             fb_cmd, fb_env, fb_out = _build_worker_cmd({"binary": fb_bin, "model": ""}, fb_bin, full_instruction)
             fb_section = LiveSection(f"{label} → {fb_bin}", icon, color)
             fb_section.open()
-            final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+            result = _run_worker_headless(
                 fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
                 is_codex=(fb_bin == "codex"), is_copilot=(fb_bin == "copilot"),
                 is_opencode=(fb_bin == "opencode"), output_file=fb_out,
+            )
+            final_text, is_error, error_detail, changes_summary = (
+                result.final_text, result.is_error, result.error_detail, result.changes_summary,
             )
             if fb_out:
                 try:
@@ -3101,7 +3306,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             detail_text = error_detail or "(sem detalhes de stderr)"
             summary = f"[Pipeline interrompido na etapa {idx}/{total} — erro do {label}]:\n{detail_text[-1500:]}"
             save_chat_message("orquestrador", "assistant", summary)
-            _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "error")
+            _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "error",
+                                       result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms)
             update_task_status(task_id, "❌ Erro", final_text[:4000] if final_text else None)
             return
 
@@ -3117,7 +3323,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         captured = final_text.strip()
         step_summaries.append((label, captured))
         save_chat_message("orquestrador", "assistant", f"[Pipeline etapa {idx}/{total} — {label}]:\n{captured[:4000]}")
-        _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "success")
+        _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "success",
+                                   result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms)
         previous_result = captured
 
     combined = "\n\n".join(f"--- {lbl} ---\n{txt[:3000]}" for lbl, txt in step_summaries)
@@ -3825,9 +4032,12 @@ def main():
                     is_codex = actual_binary == "codex"
                     is_copilot = actual_binary == "copilot"
                     is_opencode = actual_binary == "opencode"
-                    final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+                    result = _run_worker_headless(
                         w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
                         is_codex=is_codex, is_copilot=is_copilot, is_opencode=is_opencode, output_file=output_file,
+                    )
+                    final_text, is_error, error_detail, changes_summary = (
+                        result.final_text, result.is_error, result.error_detail, result.changes_summary,
                     )
 
                     if is_error and ("429" in (error_detail or "") or "credit" in (error_detail or "").lower() or "quota" in (error_detail or "").lower()):
@@ -3840,10 +4050,13 @@ def main():
                         # LiveSection NOVA — a original já foi fechada por _run_worker_headless
                         fb_section = LiveSection(f"{lbl} → {fb_bin}", ic, col)
                         fb_section.open()
-                        final_text, is_error, error_detail, changes_summary = _run_worker_headless(
+                        result = _run_worker_headless(
                             fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
                             is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"),
                             is_opencode=(fb_bin=="opencode"), output_file=fb_out,
+                        )
+                        final_text, is_error, error_detail, changes_summary = (
+                            result.final_text, result.is_error, result.error_detail, result.changes_summary,
                         )
                         if fb_out:
                             try:
@@ -3889,7 +4102,8 @@ def main():
                     else:
                         new_status = "❌ Erro" if is_error else "✅ Concluído"
                     update_task_status(task_id, new_status, final_text[:4000] if final_text else None)
-                    _record_agent_performance(get_project_id(), lbl, task_kind, "error" if is_error else "success")
+                    _record_agent_performance(get_project_id(), lbl, task_kind, "error" if is_error else "success",
+                                               result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms)
 
                     if is_error:
                         # A LiveSection já mostrou o erro e o detalhe ao fechar —
