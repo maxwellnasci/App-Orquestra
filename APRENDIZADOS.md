@@ -179,6 +179,33 @@ alterados". **Fix:** `_is_noise_path()` filtra `__pycache__`, `*.pyc`,
   `_run_worker_headless`/`_resolve_worker`/`_build_*`, atualiza os dois.
 - **`save_screenshot()` da Textual não captura `textual-image`** — o teste
   headless mostra a imagem como pontos; num terminal de verdade é imagem real.
+- **`RichLog(min_width=...)` — o default do Textual é 78.** `render_width =
+  max(render_width, self.min_width)` (código-fonte do Textual) força esse piso
+  mesmo quando o painel real é mais estreito (`shrink=True` calcula certo, mas
+  o `max()` sobrescreve). Com os painéis Arquivos/Editor abertos, o chat ficava
+  mais estreito que 78 e a mensagem "vazava", exigindo rolagem horizontal pra
+  ler. Fix: `min_width=1` na construção do `RichLog` do chat.
+- **`TabbedContent.add_pane(pane)` agenda o mount, não é síncrono.** Quem chama
+  `_open_file_in_editor()` e precisa do `TextArea` da aba NOVA na mesma
+  chamada (não só depois, num próximo `pilot.pause()`/frame) não pode confiar
+  em `query_one(f"#code-{pane_id}")` logo em seguida — dá `NoMatches`. Fix:
+  `_open_file_in_editor` guarda a referência do `TextArea` que ela mesma criou
+  (variável local `editor`) e **retorna esse objeto direto**, em vez de só o
+  `pane_id`. Objetos Python já existem antes de montar no DOM; só a *consulta*
+  por seletor CSS (`query_one`) depende do mount ter terminado.
+- **`opencode agent list`** mostra os agentes pré-definidos e a permissão de
+  cada um em JSON — o agente **`plan`** tem `{"permission":"edit","pattern":"*",
+  "action":"deny"}`, ou seja, é o equivalente read-only do `--permission-mode
+  plan`/`--mode plan`/`--sandbox read-only` dos outros motores. Testado: bloqueia
+  escrita sem travar em modo headless (sem TTY), mesmo sem `--auto`.
+- **`_binary_from_model()` decide o motor pelo `model_id` com `in` (substring),
+  não por prefixo exato** — um `model_id` novo pode colidir com um check
+  antigo por acaso. Os IDs do OpenCode/OpenRouter (`openrouter/deepseek/...`,
+  `openrouter/qwen/...`, `openrouter/z-ai/...`) bateriam nos checks de
+  `"deepseek"`/`"qwen"`/`"glm"` já existentes se o check de `"openrouter"` não
+  vier **primeiro** na função. Regra geral: todo motor novo cujo `model_id`
+  possa conter substrings de motores existentes precisa de um check mais
+  específico ANTES dos genéricos.
 
 ---
 
@@ -225,3 +252,48 @@ recebe o `git diff` pronto no prompt, filtra o rodapé de métricas (`AI Credits
 | `19902c7` | `agy` não enxergava a pasta + validação de modelo dos operários |
 | `14686b0` | Orquestrador usa as contas LOGADAS no terminal (agy/claude/codex) |
 | `af26769` | `APRENDIZADOS.md` (este arquivo) |
+| `5fff54d` | docs: §6 status verificado — Copilot/Cão de Guarda testado OK |
+| `8f25404` | fix(tui): chat aceita colar texto grande/multi-linha |
+
+---
+
+## 9. Sessão de 03/09/2026 — Editor de verdade, `<MOSTRAR>`, Modo Aprendizado, OpenCode, Sugestões
+
+Cinco blocos grandes numa sessão só, todos planejados em modo plano antes de
+implementar (cada um com `EnterPlanMode`/`ExitPlanMode`, plano salvo, testado
+headless antes de considerar pronto). Visão geral — detalhes de cada mecanismo
+já estão nas seções certas acima (§5 gotchas, "Editor" e "Tags" em
+`AGENTES.md`):
+
+1. **Editor com abas de verdade** (`TabbedContent`, um `TextArea` por arquivo,
+   `Ctrl+S`/`Ctrl+W`, dirty-tracking, sintaxe por extensão). Fundação dos
+   outros 4 blocos — todos reabrem/editam arquivo através dele.
+2. **`<MOSTRAR arquivo="...">`** — Orquestrador (zero ferramentas) ganha uma
+   árvore de arquivos leve no prompt (`_project_file_tree`, `git ls-files`) e
+   pode abrir um arquivo no Editor durante a conversa, sem esperar o usuário.
+3. **Modo Aprendizado** — toggle `🎓`; usuário escreve, Revisor só comenta
+   (read-only de verdade, não por convenção de prompt — ver regra 7 do
+   `AGENTES.md`). Revisão automática ao salvar (cooldown 20s) + botão de
+   revisão profunda.
+4. **Motor OpenCode/OpenRouter** — `Op:`/`Rev:` ganham modelos chineses
+   (DeepSeek, Qwen, GLM, Kimi, MiniMax) via a CLI `opencode` já logada
+   (mesmo padrão "conta logada" do claude/agy/codex, sem API key no cofre).
+5. **Sugestões inline** — Revisor (Modo Aprendizado) pode propor
+   `<SUGESTAO arquivo="..." linha_inicio="N" linha_fim="M" motivo="...">`,
+   vira cartão com Aceitar/Recusar por trecho, aplicado via `TextArea.replace`.
+
+**Testes:** tudo passou por `python3 test_orquestra.py` (backend, sem
+Textual/rede/subprocessos de agente) ou por scripts headless com
+`app.run_test()` do Textual (UI, mockando `_run_worker_headless`/
+`_run_orchestrator_stream` quando precisava simular resposta de um agente sem
+gastar chamada real). O comando `opencode` foi testado com chamadas reais
+(barato, poucos centavos) pra confirmar formato de saída e comportamento
+read-only antes de desenhar o parser — não dá pra confiar só na `--help`.
+
+**Como retomar amanhã:** os 5 blocos estão testados headless, mas **não
+testados numa sessão de uso real do zero, do início ao fim, num projeto novo**
+(o usuário testou os Blocos 1+2 ao vivo e confirmou "funcionando", os outros
+3 ficaram só no headless). Primeira coisa a validar: Modo Aprendizado ligado,
+escrever um bug de propósito, `Ctrl+S`, conferir que o cartão de sugestão
+aparece e que Aceitar aplica certo; trocar o `Rev:` pra um modelo OpenCode e
+repetir.

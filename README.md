@@ -14,7 +14,30 @@ o que quer e a equipe executa, com você aprovando cada mudança.
 | 🔍 **Revisor** | Revisão sob demanda | Caça bugs, avalia arquitetura e segurança de um trecho ou de um diff. Você aciona pelo botão "🔍 Revisar". | Claude Code (`claude-opus-5`) |
 | 🐕 **Cão de Guarda** | Automático e silencioso | Depois de cada edição, audita o `git diff` no rodapé. Fica verde se está tudo certo, vermelho só se achar bug. | GitHub Copilot |
 
-Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Rev:`).
+Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Rev:`) —
+inclusive por modelos chineses via OpenRouter (DeepSeek, Qwen, GLM, Kimi, MiniMax),
+usando a CLI `opencode` já logada na máquina.
+
+## 🎓 Modo Aprendizado
+
+Um segundo jeito de trabalhar: em vez de delegar tudo pro Operador, você mesmo
+escreve o código no painel Editor e o Revisor entra como mentor.
+
+- Liga no botão **🎓 Aprendizado** no topo.
+- `Ctrl+S` salva o arquivo **e** dispara uma revisão automática em background
+  (cooldown de 20s), 100% em modo leitura — o Revisor comenta, nunca escreve.
+- Botão **🔍 Revisão profunda** (aparece no painel Editor com o modo ligado)
+  pede uma revisão completa do arquivo aberto, sob demanda.
+- Quando o Revisor aponta uma correção objetiva, ela vira um **cartão** no
+  Editor com **✅ Aceitar** (aplica de verdade no arquivo) / **❌ Recusar**
+  — por trecho, não por diff inteiro.
+
+## 📝 Editor
+
+Painel com abas de verdade (um arquivo por aba, sintaxe colorida por
+extensão). `Ctrl+S` salva no disco, `Ctrl+W` fecha a aba ativa. Abre sozinho
+quando o Operador toca um arquivo (GPS) ou quando o próprio Orquestrador
+decide mostrar código real durante a conversa (`<MOSTRAR arquivo="...">`).
 
 ## Como funciona um turno
 
@@ -36,6 +59,7 @@ ln -sf "$PWD/orquestra" ~/.local/bin/orquestra
 ```
 
 Ferramentas externas (no PATH): `claude`, `agy`, `codex`, `gh` (com `gh copilot`),
+`opencode` (opcional — motor OpenRouter/LLMs chinesas, já logado na conta),
 e `chromium`/`google-chrome` (renderiza a prévia do Open Design dentro da TUI).
 Cérebro do Orquestrador: `~/.claude-deepseek-env` (chave DeepSeek) ou o `kimi` CLI
 (Ollama Cloud). Open Design: seção `open_design` no `~/.orquestra.json` (auto-semeada
@@ -66,7 +90,8 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 | `<texto livre>` | Fala com o Orquestrador. |
 | `/modo chat` \| `/modo tecnico` | Bolhas limpas × narração crua de tool calls. |
 | `/detalhe minimal` \| `normal` \| `full` | Quanto do trabalho ao vivo aparece. |
-| Botões do topo | Trocam o modelo do Orquestrador / Operador / Revisor. |
+| Botões do topo | Trocam o modelo do Orquestrador / Operador / Revisor, ou ligam o `🎓 Aprendizado`. |
+| `Ctrl+S` / `Ctrl+W` | Salva / fecha a aba ativa do Editor. |
 
 ## Arquivos
 

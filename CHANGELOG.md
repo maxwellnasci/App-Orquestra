@@ -1,5 +1,40 @@
 # Changelog Orquestra
 
+## V5 — Editor de verdade, Orquestrador proativo, Modo Aprendizado, OpenCode (set/2026)
+
+- **Editor multi-abas de verdade** — o painel Editor era um único `TextArea`
+  fixo em `language="python"`, sem salvar. Agora: `TabbedContent` com uma aba
+  por arquivo (abrir um arquivo já aberto só foca a aba, nunca recarrega e
+  perde edição não salva), sintaxe por extensão (`.py/.md/.json/.js/.sql/...`),
+  `Ctrl+S` salva de verdade no disco, indicador `●` de "não salvo" na aba,
+  `Ctrl+W` fecha a aba ativa. GPS (arquivos tocados pelo Operador) e a árvore
+  de arquivos reaproveitam o mesmo mecanismo.
+- **`<MOSTRAR arquivo="...">`** — o Orquestrador (zero ferramentas, não lê
+  arquivo) agora sabe a árvore de arquivos do projeto (injetada no prompt,
+  via `git ls-files`) e pode abrir um arquivo no Editor sozinho durante a
+  conversa ("vou te mostrar o arquivo X"), sem o usuário precisar clicar em
+  nada. Validação de path própria (só dentro da pasta do projeto).
+- **Modo Aprendizado** (toggle `🎓` no topo) — pro usuário escrever código à
+  mão e ter o Revisor como mentor, não como substituto: revisão automática em
+  background a cada `Ctrl+S` (cooldown de 20s) + botão "🔍 Revisão profunda"
+  sob demanda. Roda em modo **plano/read-only de verdade** (mesmas flags do
+  Orquestrador: `--permission-mode plan`/`--mode plan`/`--sandbox read-only`/
+  `--agent plan`) — o Revisor comenta, nunca escreve, garantido pela CLI, não
+  só por texto no prompt.
+- **Sugestões inline com Aceitar/Recusar** — o Revisor (no Modo Aprendizado)
+  pode emitir `<SUGESTAO arquivo="..." linha_inicio="N" linha_fim="M"
+  motivo="...">código</SUGESTAO>`; vira um cartão no painel Editor com
+  ✅ Aceitar (aplica via `TextArea.replace` + salva) / ❌ Recusar (descarta),
+  por trecho — não por diff inteiro.
+- **Motor novo: OpenCode/OpenRouter** — `Op:`/`Rev:` agora também listam
+  modelos chineses via OpenRouter (DeepSeek, Qwen, GLM, Kimi, MiniMax), usando
+  a CLI `opencode` já logada na máquina (sem API key no cofre — mesmo padrão
+  "conta logada" do claude/agy/codex).
+- **Fix: chat vazando pra fora da caixa** — o `RichLog` do chat tinha
+  `min_width=78` (padrão do Textual), que nunca deixava a linha quebrar abaixo
+  disso — com os painéis Arquivos/Editor abertos e o chat mais estreito, a
+  mensagem "vazava" e exigia rolagem horizontal pra ler. `min_width=1` resolve.
+
 ## V4 — TUI + arquitetura de 3 agentes (set/2026)
 
 - **A TUI (`orquestra_tui.py`) virou a interface oficial.** `orquestra` abre a TUI;

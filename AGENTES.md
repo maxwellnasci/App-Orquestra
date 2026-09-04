@@ -69,6 +69,25 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
   `~/.orquestra.json` (`repo_path`, `node_bin_dir`, `agent`), auto-semeada por `load_config()`
   se o clone existir. `linkedDirs` NÃO é read-only — se o Open Design escrever nos arquivos
   reais, a TUI mostra o aviso e cai no gate de aprovação. Também: comando `/design <o que prever>`.
+- `<MOSTRAR arquivo="caminho/relativo">` — abre esse arquivo no painel Editor na hora,
+  durante a conversa (sem esperar o usuário clicar em nada). O Orquestrador não lê
+  arquivo — só sabe que `caminho/relativo` existe porque `build_orchestrator_prompt()`
+  injeta uma árvore de arquivos leve (`_project_file_tree`, via `git ls-files`) no
+  prompt. `orquestra_tui._run_orchestrator` extrai `MOSTRAR_RE` **antes** do parsing
+  de PLANO/DELEGATE/PIPELINE — se entrasse no mesmo corte de "texto visível", o texto
+  escrito depois da tag sumiria da bolha do chat. `_mostrar_resolve_path()` valida que
+  o caminho fica dentro da pasta do projeto (mais restrito que `_bridge_path_ok`, que
+  também aceita HOME/tempdir — não faz sentido aqui).
+
+### Tags que o Revisor emite (Modo Aprendizado)
+
+- `<SUGESTAO arquivo="..." linha_inicio="N" linha_fim="M" motivo="...">código</SUGESTAO>`
+  — vira um cartão no painel Editor com ✅ Aceitar / ❌ Recusar. Aceitar aplica via
+  `TextArea.replace()` (não escrita direta em disco pelo Revisor — ele está em modo
+  leitura) e chama `action_save_file()`. Só existe hoje nos dois fluxos do Modo
+  Aprendizado (revisão automática ao salvar / botão "Revisão profunda"), que já
+  revisam um arquivo específico com `read_only=True` — não no "🔍 Revisar" tradicional
+  (git diff, potencialmente multi-arquivo).
 
 ---
 
@@ -91,6 +110,15 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
 6. **Assinaturas compartilhadas:** `_run_worker_headless`, `_resolve_worker`,
    `_build_worker_cmd`, `_build_orchestrator_cmd`, `build_orchestrator_prompt` são
    usadas pela TUI **e** pelo REPL — mudou uma, atualize os dois callers.
+7. **Modo Aprendizado (`read_only=True`) precisa ser read-only DE VERDADE, não só por
+   texto no prompt.** Mesmo princípio da regra 1: pedir "só revise, não edite" numa
+   instrução não segura nada — o Revisor normal roda com
+   `--permission-mode bypassPermissions`/`--dangerously-skip-permissions`/
+   `--sandbox workspace-write`, com poder de escrita real. `_build_worker_cmd(...,
+   read_only=True)` troca pras mesmas flags plano/read-only do Orquestrador
+   (`--permission-mode plan`/`--mode plan`/`--sandbox read-only`/`--agent plan` no
+   opencode) — testado que bloqueiam escrita sem travar em modo headless. Se adicionar
+   um motor novo, ele só serve pro Modo Aprendizado se tiver um modo read-only real.
 
 ---
 
@@ -107,7 +135,7 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
     "revisor":    { "binary": "claude", "model": "claude-opus-5" },
     "cao_guarda": { "binary": "copilot", "model": "auto" }
   },
-  "ui": { "mode": "chat", "detail": "normal" }
+  "ui": { "mode": "chat", "detail": "normal", "learning_mode": false }
 }
 ```
 
@@ -140,6 +168,36 @@ Ou seja: **as contas já logadas no terminal (agy/claude/codex) funcionam sem AP
 | `agy` | Antigravity | `-p --output-format stream-json --dangerously-skip-permissions` |
 | `codex` | Codex CLI | `exec --json --sandbox workspace-write` |
 | `copilot` | `gh copilot` | `-p --no-ask-user` (texto puro) |
+| `opencode` | OpenCode (OpenRouter) | `run <instrução> --format json --dir <projeto> --auto` |
+
+Todos aceitam `read_only=True` em `_build_worker_cmd`, que troca as flags de permissão
+pra modo plano/read-only (ver regra 7) — usado pelo Modo Aprendizado.
+
+---
+
+## Editor (`orquestra_tui.py`)
+
+Painel com `TabbedContent` — um `TextArea` por aba (`id=f"code-{pane_id}"`), não um
+único widget reaproveitado. Estado em dois dicts na `App`:
+`self._open_files: dict[pane_id -> {"path","original_text","dirty"}]` e
+`self._path_to_pane: dict[caminho_absoluto -> pane_id]` (evita abrir a mesma aba
+duas vezes vinda de fontes diferentes — clique na árvore, GPS, `<MOSTRAR>`).
+
+- **`_open_file_in_editor(filepath)`** — abre OU foca (nunca recarrega do disco se
+  já está aberto, senão perderia edição não salva). Retorna o `TextArea` direto (não
+  só o `pane_id`) porque `tabs.add_pane(...)` agenda o mount de forma assíncrona —
+  quem chama e precisa mexer no widget na mesma sincronia (ex: `_accept_suggestion`)
+  usaria `query_one` e quebraria com `NoMatches` (bug real, corrigido — ver
+  `APRENDIZADOS.md`).
+- **`action_save_file(editor=None)`** — `Ctrl+S`. Aceita o `TextArea` já resolvido
+  opcionalmente, pelo mesmo motivo acima.
+- **Dirty-tracking** — `on_text_area_changed` compara `editor.text` com
+  `info["original_text"]` (string inteira, não um bool ingênuo — cobre desfazer até
+  o texto original). `TextArea.replace()` (usado por `_accept_suggestion`) dispara
+  `Changed` normal, então o dirty-tracking pega de graça.
+- **Linguagem por extensão** — `_EXT_TO_LANGUAGE`, só as nativas do Textual
+  (`BUILTIN_LANGUAGES`); fora da lista cai em `language=None` (texto puro, sem
+  highlight, sem crash).
 
 ---
 
