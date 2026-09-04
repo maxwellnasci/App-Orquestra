@@ -15,10 +15,11 @@ import os
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, Container
-from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree
+from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 from textual.screen import ModalScreen
 from textual.message import Message
+from textual.binding import Binding
 from textual import work, events
 
 
@@ -37,6 +38,67 @@ def shorten_name(name: str) -> str:
     if len(name) > 18:
         name = name[:16] + ".."
     return name
+
+
+# ─── Editor: linguagem por extensão (só as nativas do Textual/tree-sitter) ───
+
+_EXT_TO_LANGUAGE = {
+    ".py": "python", ".pyw": "python",
+    ".md": "markdown", ".markdown": "markdown",
+    ".json": "json",
+    ".toml": "toml",
+    ".yml": "yaml", ".yaml": "yaml",
+    ".html": "html", ".htm": "html",
+    ".css": "css",
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".rs": "rust",
+    ".go": "go",
+    ".sql": "sql",
+    ".java": "java",
+    ".sh": "bash", ".bash": "bash",
+    ".xml": "xml",
+}
+
+
+def _language_for_path(path: str) -> str | None:
+    """Linguagem do TextArea pela extensão. None = texto puro (sem highlight)."""
+    return _EXT_TO_LANGUAGE.get(Path(path).suffix.lower())
+
+
+# ─── Modo Aprendizado: instruções do Revisor read-only ────────────────────────
+
+_SUGESTAO_FORMAT_HINT = (
+    "\n\nPara cada problema com correção objetiva, emita também um bloco:\n"
+    '<SUGESTAO arquivo="caminho/relativo" linha_inicio="N" linha_fim="M" motivo="frase curta">\n'
+    "código corrigido, já pronto pra substituir as linhas N a M\n"
+    "</SUGESTAO>\n"
+    "O usuário vê isso como um cartão com Aceitar/Recusar — não repita esse código no texto "
+    "solto, só a explicação. Use linha_inicio/linha_fim EXATAMENTE como aparecem no arquivo "
+    "(a primeira linha é 1, não 0). Se o problema não tiver uma correção objetiva de código "
+    "(ex: sugestão arquitetural ampla), só comente em texto, sem <SUGESTAO>."
+)
+
+
+def _auto_review_instruction(path: str) -> str:
+    return (
+        f"Modo Aprendizado: o usuário acabou de salvar o arquivo {path} manualmente "
+        "(ele mesmo escreveu — você está em modo leitura, não pode editar nada). "
+        "Dê um feedback RÁPIDO e direto: bugs, riscos de segurança ou pontos de estilo "
+        "importantes. Se estiver tudo bem, diga isso em 1 frase curta. Seja objetivo — "
+        "não repita o código de volta."
+        + _SUGESTAO_FORMAT_HINT
+    )
+
+
+def _deep_review_instruction(path: str) -> str:
+    return (
+        f"Modo Aprendizado: faça uma revisão PROFUNDA do arquivo {path}, que o usuário "
+        "escreveu manualmente (você está em modo leitura, não pode editar nada). Aponte "
+        "bugs, riscos de segurança, problemas de arquitetura e boas práticas — explique "
+        "o PORQUÊ de cada ponto, como um mentor ensinando, não só corrigindo. Estruture "
+        "a resposta em tópicos."
+        + _SUGESTAO_FORMAT_HINT
+    )
 
 
 # ─── Modal de Seleção de Modelos ──────────────────────────────────────────────
@@ -162,6 +224,11 @@ class ChatInput(TextArea):
 
 class OrquestraTUI(App):
     """Interface Orquestra Terminal IDE v3.0"""
+
+    BINDINGS = [
+        Binding("ctrl+s", "save_file", "Salvar", show=False),
+        Binding("ctrl+w", "close_tab", "Fechar aba", show=False),
+    ]
 
     CSS = """
     Screen {
@@ -334,6 +401,39 @@ class OrquestraTUI(App):
         display: none;
     }
 
+    #editor-toolbar {
+        height: 3;
+        layout: horizontal;
+        align: center middle;
+        padding: 0 1;
+        background: $boost;
+        border-bottom: solid $primary-background;
+    }
+
+    #suggestions-panel {
+        height: auto;
+        max-height: 12;
+        overflow-y: auto;
+        background: $boost;
+        border-bottom: solid $primary-background;
+    }
+
+    .suggestion-card {
+        height: auto;
+        padding: 1;
+        border-bottom: solid $primary-background;
+    }
+
+    .suggestion-label {
+        color: $text;
+        margin-bottom: 1;
+    }
+
+    .suggestion-buttons {
+        height: 3;
+        layout: horizontal;
+    }
+
     .action-btn {
         margin: 0 1;
         min-width: 18;
@@ -353,6 +453,7 @@ class OrquestraTUI(App):
                 yield Button("📁 Arquivos", id="btn-files", classes="toggle-btn")
                 yield Button("📝 Editor", id="btn-editor", classes="toggle-btn")
                 yield Button("🎨 Idea Studio", id="btn-idea", classes="toggle-btn")
+                yield Button("🎓 Aprendizado", id="btn-learning", classes="toggle-btn")
             with Container(id="models"):
                 yield Button("Carregando...", id="btn-sel-orq", classes="model-btn")
                 yield Button("Carregando...", id="btn-sel-op", classes="model-btn")
@@ -366,7 +467,10 @@ class OrquestraTUI(App):
 
             with Vertical(id="editor-panel", classes="panel hidden"):
                 yield Label("📝 EDITOR", id="editor-title", classes="panel-title")
-                yield TextArea("", language="python", id="code-editor")
+                with Container(id="editor-toolbar", classes="hidden"):
+                    yield Button("🔍 Revisão profunda", id="btn-deep-review", classes="action-btn")
+                yield Vertical(id="suggestions-panel", classes="hidden")
+                yield TabbedContent(id="editor-tabs")
 
             with Vertical(id="idea-panel", classes="panel hidden"):
                 yield Label("🎨 IDEA STUDIO", classes="panel-title")
@@ -379,7 +483,12 @@ class OrquestraTUI(App):
 
             with Vertical(id="chat-panel", classes="panel"):
                 yield Label("💬 CHAT CENTRAL", classes="panel-title")
-                yield RichLog(id="chat-log", markup=True, wrap=True)
+                # min_width baixo: o RichLog nunca quebra linha abaixo do seu
+                # min_width (default 78!), então com os painéis Arquivos/Editor
+                # abertos e o chat mais estreito, a mensagem "vazava" e exigia
+                # rolagem horizontal pra ler. Com min_width baixo, ele sempre
+                # quebra no tamanho real do painel (que tem min-width: 40 no CSS).
+                yield RichLog(id="chat-log", markup=True, wrap=True, min_width=1)
                 yield Label("", id="status-indicator", classes="hidden")
                 # Barra do PLANO — aparece quando o Orquestrador propõe um <PLANO>
                 with Container(id="plan-bar", classes="hidden"):
@@ -413,12 +522,18 @@ class OrquestraTUI(App):
         self._op_model: str = ops.get("model", "claude-sonnet-5")
         self._rev_model: str = rev.get("model", "claude-opus-5")
 
-        self._current_file: str | None = None   # GPS: arquivo aberto no editor
+        self._open_files: dict[str, dict] = {}   # pane_id -> {"path", "original_text", "dirty"}
+        self._path_to_pane: dict[str, str] = {}  # caminho absoluto -> pane_id
+        self._tab_counter: int = 0
         self._task_pending: bool = False        # Há tarefa aguardando aprovação?
         self._pending_changes: str = ""         # Resumo das mudanças do Operador
         self._plan_pending: str = ""            # <PLANO> aguardando "Executar"
         self._last_user_prompt: str = ""        # último pedido do usuário (p/ re-enviar no "Executar")
         self._pipeline_rest = None              # etapas restantes de um <PIPELINE> pausado na aprovação
+        self._learning_mode: bool = bool(cfg.get("ui", {}).get("learning_mode", False))
+        self._last_auto_review: float = 0.0     # cooldown da revisão automática ao salvar
+        self._pending_suggestions: dict[str, dict] = {}  # sug_id -> {"path","linha_inicio","linha_fim","motivo","codigo"}
+        self._suggestion_counter: int = 0
 
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold cyan]🎼 Orquestrador[/bold cyan] Bem-vindo ao Orquestra. Converse comigo — eu planejo e a equipe executa.\n")
@@ -426,6 +541,12 @@ class OrquestraTUI(App):
         self.query_one("#btn-sel-orq").label = f"Orq: {shorten_name(self._orq_model)}"
         self.query_one("#btn-sel-op").label  = f"Op: {shorten_name(self._op_model)}"
         self.query_one("#btn-sel-rev").label = f"Rev: {shorten_name(self._rev_model)}"
+
+        if self._learning_mode:
+            btn = self.query_one("#btn-learning")
+            btn.add_class("active")
+            btn.label = "🎓 Aprendizado [✓]"
+            self.query_one("#editor-toolbar").remove_class("hidden")
 
         self._load_models_and_config()
 
@@ -442,13 +563,14 @@ class OrquestraTUI(App):
         ]
 
         loop = asyncio.get_running_loop()
-        (orq_raw, claude_raw, copilot_raw, deepseek_raw, codex_raw, ollama_raw) = await asyncio.gather(
+        (orq_raw, claude_raw, copilot_raw, deepseek_raw, codex_raw, ollama_raw, opencode_raw) = await asyncio.gather(
             loop.run_in_executor(None, orquestra._fetch_agy_models),
             loop.run_in_executor(None, orquestra._fetch_claude_models),
             loop.run_in_executor(None, orquestra._fetch_copilot_models),
             loop.run_in_executor(None, orquestra._fetch_deepseek_models),
             loop.run_in_executor(None, orquestra._fetch_codex_models),
             loop.run_in_executor(None, orquestra._fetch_ollama_models),
+            loop.run_in_executor(None, orquestra._fetch_opencode_models),
         )
 
         if not orq_raw:
@@ -462,6 +584,7 @@ class OrquestraTUI(App):
             "🛸 GitHub Copilot":        [(label, val) for val, label in copilot_raw],
             "🐋 DeepSeek":             [(label, val) for val, label in deepseek_raw],
             "🤖 OpenAI Codex":         [(label, val) for val, label in codex_raw],
+            "🌐 OpenCode (OpenRouter)": [(label, val) for val, label in opencode_raw],
         }
 
         # value do modelo → provedor (pra saber como falar com ele).
@@ -472,6 +595,7 @@ class OrquestraTUI(App):
             "🛸 GitHub Copilot": "copilot",
             "🐋 DeepSeek": "deepseek",
             "🤖 OpenAI Codex": "openai",
+            "🌐 OpenCode (OpenRouter)": "opencode",
         }
         self._model_provider = {}
         for company, models in self.grouped_models.items():
@@ -485,6 +609,8 @@ class OrquestraTUI(App):
     def _binary_from_model(self, model_id: str) -> str:
         """Infere qual binary usar a partir do ID do modelo."""
         m = model_id.lower()
+        if "openrouter" in m:
+            return "opencode"  # ANTES dos outros checks: "deepseek"/"qwen"/"glm" bateriam errado
         if "claude" in m and "haiku" not in m and "deepseek" not in m:
             return "claude"
         if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
@@ -602,6 +728,38 @@ class OrquestraTUI(App):
                 event.button.label = f"{base_label} [✓]"
             return
 
+        # Toggle Modo Aprendizado — flag de comportamento, não abre/fecha painel
+        if event.button.id == "btn-learning":
+            import orquestra, json
+            self._learning_mode = not self._learning_mode
+            event.button.set_class(self._learning_mode, "active")
+            event.button.label = "🎓 Aprendizado [✓]" if self._learning_mode else "🎓 Aprendizado"
+            self.query_one("#editor-toolbar").set_class(not self._learning_mode, "hidden")
+            config = orquestra.load_config()
+            config.setdefault("ui", {})["learning_mode"] = self._learning_mode
+            with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            return
+
+        # Revisão profunda sob demanda (Modo Aprendizado) do arquivo aberto no Editor
+        if event.button.id == "btn-deep-review":
+            tabs = self.query_one("#editor-tabs", TabbedContent)
+            pane_id = tabs.active
+            info = self._open_files.get(pane_id) if pane_id else None
+            if info is None:
+                self.notify("Abra um arquivo no Editor primeiro.", severity="warning")
+                return
+            self._run_worker("revisor", _deep_review_instruction(info["path"]), read_only=True)
+            return
+
+        # Cartões de sugestão (Bloco 5) — Aceitar/Recusar por trecho
+        if event.button.id and event.button.id.startswith("sug-accept-"):
+            self._accept_suggestion(event.button.id.removeprefix("sug-accept-"))
+            return
+        if event.button.id and event.button.id.startswith("sug-reject-"):
+            self._reject_suggestion(event.button.id.removeprefix("sug-reject-"))
+            return
+
         # Seleção de Modelos
         if event.button.id == "btn-sel-orq":
             # O Orquestrador roda em MODO PLANO (read-only). Gemini→login do agy,
@@ -703,28 +861,198 @@ class OrquestraTUI(App):
         """Abre o arquivo clicado no Editor. Se o painel estiver oculto, abre-o."""
         self._open_file_in_editor(str(event.path))
 
-    def _open_file_in_editor(self, filepath: str) -> None:
-        """Carrega um arquivo no TextArea do Editor e atualiza o título do painel."""
+    def _open_file_in_editor(self, filepath: str) -> "TextArea | None":
+        """Abre um arquivo numa aba do Editor. Se já estiver aberto, só foca a
+        aba (nunca recarrega do disco — preservaria uma edição não salva).
+        Retorna o TextArea da aba (novo ou existente) — útil pra quem precisa
+        mexer nele na hora, sem esperar o mount assíncrono do add_pane."""
+        abs_path = str(Path(filepath).resolve())
+        tabs = self.query_one("#editor-tabs", TabbedContent)
+
+        existing_pane_id = self._path_to_pane.get(abs_path)
+        if existing_pane_id is not None:
+            tabs.active = existing_pane_id
+            self._reveal_editor_panel()
+            return self.query_one(f"#code-{existing_pane_id}", TextArea)
+
         try:
-            content = Path(filepath).read_text(encoding="utf-8")
-        except Exception:
-            return  # Ignora arquivos binários ou sem permissão
+            content = Path(abs_path).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            self.notify(f"Arquivo binário, não é possível editar: {Path(abs_path).name}", severity="warning")
+            return None
+        except Exception as e:
+            self.notify(f"Não foi possível abrir {Path(abs_path).name}: {e}", severity="error")
+            return None
 
-        editor = self.query_one("#code-editor", TextArea)
-        editor.text = content
-        self._current_file = filepath
+        self._tab_counter += 1
+        pane_id = f"tab-{self._tab_counter}"
+        filename = Path(abs_path).name
+        editor = TextArea(content, language=_language_for_path(abs_path), id=f"code-{pane_id}")
+        pane = TabPane(filename, editor, id=pane_id)
 
-        # Atualiza o título do painel com o nome do arquivo
-        filename = Path(filepath).name
-        self.query_one("#editor-title").update(f"📝 EDITOR — {filename}")
+        tabs.add_pane(pane)
+        tabs.active = pane_id
 
-        # Garante que o painel do editor está visível
+        self._open_files[pane_id] = {"path": abs_path, "original_text": content, "dirty": False}
+        self._path_to_pane[abs_path] = pane_id
+
+        self._reveal_editor_panel()
+        return editor
+
+    def _reveal_editor_panel(self) -> None:
+        """Garante que o painel do Editor está visível e o botão marcado ativo."""
         editor_panel = self.query_one("#editor-panel")
         if editor_panel.has_class("hidden"):
             editor_panel.remove_class("hidden")
             btn = self.query_one("#btn-editor")
             btn.add_class("active")
             btn.label = "📝 Editor [✓]"
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Marca a aba como suja (●) quando o texto diverge do que está no disco."""
+        editor_id = event.text_area.id or ""
+        if not editor_id.startswith("code-"):
+            return
+        pane_id = editor_id.removeprefix("code-")
+        info = self._open_files.get(pane_id)
+        if info is None:
+            return
+
+        is_dirty = event.text_area.text != info["original_text"]
+        if is_dirty == info["dirty"]:
+            return  # evita reescrever o label da aba a cada tecla
+
+        info["dirty"] = is_dirty
+        tabs = self.query_one("#editor-tabs", TabbedContent)
+        filename = Path(info["path"]).name
+        tabs.get_tab(pane_id).label = f"● {filename}" if is_dirty else filename
+
+    def action_save_file(self, editor: "TextArea | None" = None) -> None:
+        """Ctrl+S: grava a aba ativa do Editor no disco. Aceita opcionalmente
+        o TextArea já resolvido (ex: logo após _open_file_in_editor, cuja aba
+        pode ainda não estar montada no DOM pro query_one achar sozinho)."""
+        tabs = self.query_one("#editor-tabs", TabbedContent)
+        pane_id = tabs.active
+        if not pane_id:
+            return
+        info = self._open_files.get(pane_id)
+        if info is None:
+            return
+
+        if editor is None:
+            editor = self.query_one(f"#code-{pane_id}", TextArea)
+        text = editor.text
+
+        try:
+            Path(info["path"]).write_text(text, encoding="utf-8")
+        except PermissionError:
+            self.notify(f"Sem permissão para salvar {Path(info['path']).name}", severity="error")
+            return
+        except OSError as e:
+            self.notify(f"Erro ao salvar {Path(info['path']).name}: {e}", severity="error")
+            return
+
+        info["original_text"] = text
+        info["dirty"] = False
+        tabs.get_tab(pane_id).label = Path(info["path"]).name
+        self.notify(f"Salvo: {Path(info['path']).name}", timeout=2)
+
+        if self._learning_mode:
+            import time
+            now = time.time()
+            if now - self._last_auto_review >= 20:
+                self._last_auto_review = now
+                self._run_worker("revisor", _auto_review_instruction(info["path"]), read_only=True)
+
+    def _add_suggestion_card(self, sug_id: str, sug: dict) -> None:
+        """Monta um cartão de sugestão (Aceitar/Recusar) no painel do Editor."""
+        panel = self.query_one("#suggestions-panel")
+        filename = Path(sug["path"]).name
+        card = Vertical(
+            Label(f"📍 {filename}:{sug['linha_inicio']}-{sug['linha_fim']} — {sug['motivo']}",
+                  classes="suggestion-label"),
+            Horizontal(
+                Button("✅ Aceitar", id=f"sug-accept-{sug_id}", classes="action-btn", variant="success"),
+                Button("❌ Recusar", id=f"sug-reject-{sug_id}", classes="action-btn", variant="error"),
+                classes="suggestion-buttons",
+            ),
+            id=f"sug-card-{sug_id}", classes="suggestion-card",
+        )
+        panel.mount(card)
+        panel.remove_class("hidden")
+
+    def _remove_suggestion_card(self, sug_id: str) -> None:
+        try:
+            self.query_one(f"#sug-card-{sug_id}").remove()
+        except Exception:
+            pass
+        if not self._pending_suggestions:
+            self.query_one("#suggestions-panel").add_class("hidden")
+
+    def _accept_suggestion(self, sug_id: str) -> None:
+        """Aplica a sugestão de verdade no arquivo (TextArea.replace + save),
+        reaproveitando o mesmo mecanismo de save do Bloco 1."""
+        sug = self._pending_suggestions.pop(sug_id, None)
+        if sug is None:
+            return
+        self._remove_suggestion_card(sug_id)
+
+        try:
+            current_lines = Path(sug["path"]).read_text(encoding="utf-8").count("\n") + 1
+        except OSError as e:
+            self.notify(f"Não foi possível ler {Path(sug['path']).name}: {e}", severity="error")
+            return
+        if sug["linha_fim"] > current_lines:
+            self.notify(
+                f"Sugestão desatualizada (arquivo mudou desde a revisão) — ignorada: {Path(sug['path']).name}",
+                severity="warning")
+            return
+
+        editor = self._open_file_in_editor(sug["path"])
+        if editor is None:
+            return
+        codigo = sug["codigo"]
+        if not codigo.endswith("\n"):
+            codigo += "\n"
+        editor.replace(codigo, (sug["linha_inicio"] - 1, 0), (sug["linha_fim"], 0))
+        self.action_save_file(editor=editor)
+        self.notify(f"Sugestão aplicada em {Path(sug['path']).name}", timeout=2)
+
+    def _reject_suggestion(self, sug_id: str) -> None:
+        self._pending_suggestions.pop(sug_id, None)
+        self._remove_suggestion_card(sug_id)
+
+    def _warn_pending_manual_edits(self, cwd: str, log: "RichLog") -> None:
+        """Se já havia edição manual (Ctrl+S no Editor) não commitada antes de um
+        worker começar, avisa no chat — evita confundir a origem de uma mudança
+        no diff que o worker/Cão de Guarda vai revisar. Chamado de dentro de uma
+        thread de worker; usa call_from_thread pra escrever no log com segurança."""
+        import orquestra
+        try:
+            dirty = orquestra._git_dirty_files(cwd)
+        except Exception:
+            return
+        if dirty:
+            arquivos = ", ".join(sorted(dirty))
+            self.call_from_thread(
+                log.write,
+                f"\n[dim]ℹ️ Havia edição manual pendente em: {arquivos} — "
+                f"será incluída no diff revisado junto com o que for feito agora.[/dim]\n",
+            )
+
+    def action_close_tab(self) -> None:
+        """Ctrl+W: fecha a aba ativa do Editor."""
+        tabs = self.query_one("#editor-tabs", TabbedContent)
+        pane_id = tabs.active
+        if not pane_id:
+            return
+        info = self._open_files.pop(pane_id, None)
+        if info is None:
+            return
+        self._path_to_pane.pop(info["path"], None)
+        if info["dirty"]:
+            self.notify(f"Fechado sem salvar: {Path(info['path']).name}", severity="warning")
+        tabs.remove_pane(pane_id)
 
     # ── Chat: Recebe o Enter do usuário ───────────────────────────────────────
 
@@ -858,6 +1186,23 @@ class OrquestraTUI(App):
 
         orquestra.save_chat_message("orquestrador", "assistant", final_text)
 
+        # <MOSTRAR arquivo="..."> — extrai e remove ANTES do parsing de
+        # PLANO/DELEGATE/PIPELINE, senão o corte de "texto visível" (abaixo)
+        # jogaria fora qualquer coisa escrita depois da tag.
+        MOSTRAR_MAX = 3
+        mostrar_hits = list(orquestra.MOSTRAR_RE.finditer(final_text))[:MOSTRAR_MAX]
+        final_text = orquestra.MOSTRAR_RE.sub("", final_text).replace("</MOSTRAR>", "")
+        for hit in mostrar_hits:
+            rel_path = hit.group(1).strip()
+            abs_path = orquestra._mostrar_resolve_path(rel_path)
+            if abs_path:
+                self.call_from_thread(self._open_file_in_editor, abs_path)
+            else:
+                self.call_from_thread(
+                    log.write,
+                    f"\n[dim]⚠ Orquestrador citou um arquivo que não existe no projeto ({rel_path}) — ignorado.[/dim]\n",
+                )
+
         plano = orquestra.PLANO_RE.search(final_text)
         pipelines = [
             [(m.group(1).lower(), m.group(2).strip())
@@ -902,13 +1247,18 @@ class OrquestraTUI(App):
     # ── Worker: Operário (Implementador) ─────────────────────────────────────
 
     @work(thread=True)
-    def _run_worker(self, binary_tag: str, instruction: str) -> None:
+    def _run_worker(self, binary_tag: str, instruction: str, read_only: bool = False) -> None:
         """Roda um operário (Operador ou Revisor) em thread separada, com GPS e
-        barra de aprovação quando ele mexe em arquivos."""
+        barra de aprovação quando ele mexe em arquivos.
+
+        read_only=True (Modo Aprendizado): roda em modo plano/read-only de
+        verdade (mesmas flags do Orquestrador) — o agente lê e comenta, nunca
+        escreve. Sem GPS (nada deveria mudar no disco)."""
         import orquestra
 
         log = self.query_one("#chat-log", RichLog)
         cwd = orquestra.get_project_dir()
+        self._warn_pending_manual_edits(cwd, log)
 
         config = orquestra.load_config()
         worker_cfg, actual_binary, label, icon, color = orquestra._resolve_worker(config, binary_tag)
@@ -920,9 +1270,10 @@ class OrquestraTUI(App):
         if chosen:
             worker_cfg["model"] = chosen
 
-        cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction)
+        cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction, read_only=read_only)
 
         # GPS: monitora quais arquivos o agente está editando em tempo real
+        # (pulado em read_only — nada deveria mudar no disco pra monitorar)
         gps_stop = threading.Event()
         files_seen: set[str] = set()
 
@@ -942,8 +1293,9 @@ class OrquestraTUI(App):
                 except Exception:
                     pass
 
-        gps_thread = threading.Thread(target=_gps_watch, daemon=True)
-        gps_thread.start()
+        if not read_only:
+            gps_thread = threading.Thread(target=_gps_watch, daemon=True)
+            gps_thread.start()
 
         def on_line(text: str):
             self.call_from_thread(log.write, text + "\n")
@@ -969,6 +1321,7 @@ class OrquestraTUI(App):
             is_agy=(actual_binary == "agy"),
             is_codex=(actual_binary == "codex"),
             is_copilot=(actual_binary == "copilot"),
+            is_opencode=(actual_binary == "opencode"),
             output_file=output_file,
         )
         
@@ -996,9 +1349,28 @@ class OrquestraTUI(App):
         if final_text:
             orquestra.save_chat_message("orquestrador", "assistant",
                                         f"[Resposta do {label}]:\n{final_text[:4000]}")
+
+            display_text = final_text
+            if read_only:
+                sugestoes = list(orquestra.SUGESTAO_RE.finditer(final_text))
+                if sugestoes:
+                    display_text = orquestra.SUGESTAO_RE.sub("", final_text).strip()
+                    for m in sugestoes:
+                        self._suggestion_counter += 1
+                        sug_id = f"sug-{self._suggestion_counter}"
+                        sug = {
+                            "path": str((Path(cwd) / m.group(1)).resolve()),
+                            "linha_inicio": int(m.group(2)),
+                            "linha_fim": int(m.group(3)),
+                            "motivo": m.group(4).strip(),
+                            "codigo": m.group(5).strip("\n"),
+                        }
+                        self._pending_suggestions[sug_id] = sug
+                        self.call_from_thread(self._add_suggestion_card, sug_id, sug)
+
             self.call_from_thread(
                 log.write,
-                f"\n[bold green]{icon} {label}[/bold green] {final_text[:2000]}\n"
+                f"\n[bold green]{icon} {label}[/bold green] {display_text[:2000]}\n"
             )
 
         if changes_summary:
@@ -1100,6 +1472,7 @@ class OrquestraTUI(App):
             pass
 
         log = self.query_one("#chat-log", RichLog)
+        self._warn_pending_manual_edits(cwd, log)
         self.call_from_thread(log.write, "\n[bold magenta]🎨 Open Design[/bold magenta] gerando a prévia (1-3 min)...\n")
 
         def on_status(text):
@@ -1199,6 +1572,7 @@ class OrquestraTUI(App):
         import orquestra
         log = self.query_one("#chat-log", RichLog)
         cwd = orquestra.get_project_dir()
+        self._warn_pending_manual_edits(cwd, log)
         config = orquestra.load_config()
 
         for idx, (tag, instruction) in enumerate(steps, 1):
@@ -1220,7 +1594,8 @@ class OrquestraTUI(App):
             final_text, is_error, err, changes = orquestra._run_worker_headless(
                 cmd, env, cwd, section,
                 is_agy=(actual_binary == "agy"), is_codex=(actual_binary == "codex"),
-                is_copilot=(actual_binary == "copilot"), output_file=out_file,
+                is_copilot=(actual_binary == "copilot"), is_opencode=(actual_binary == "opencode"),
+                output_file=out_file,
             )
             if out_file:
                 try:

@@ -120,11 +120,19 @@ DEFAULT_CONFIG = {
             "icon": "🤖",
             "label": "Motor Codex",
             "description": "Atalho: força o Codex CLI (OpenAI)."
+        },
+        "opencode": {
+            "binary": "opencode",
+            "model": "",
+            "icon": "🌐",
+            "label": "Motor OpenCode",
+            "description": "Atalho: força o OpenCode CLI (OpenRouter)."
         }
     },
     "ui": {
         "mode": "chat",
-        "detail": "normal"
+        "detail": "normal",
+        "learning_mode": False
     },
     # Open Design (nexu-io/open-design) — prévia visual real de mudanças de UI.
     # repo_path = clone; node_bin_dir = Node oficial (o do Kali não roda TS);
@@ -1387,6 +1395,40 @@ def _fetch_codex_models() -> list[tuple[str, str]]:
     'padrão' como primeira opção segura (ver _CODEX_FALLBACK)."""
     return _CODEX_FALLBACK
 
+# Motor OpenCode (CLI já logada no OpenRouter — sem API key no cofre). Foco em
+# LLMs chinesas, que é o que o usuário pediu — o catálogo completo do
+# OpenRouter via opencode tem 350+ modelos, filtrar por provedor evita afogar
+# o picker.
+_OPENCODE_PROVIDERS = ("deepseek", "qwen", "z-ai", "moonshotai", "minimax")
+
+_OPENCODE_FALLBACK = [
+    ("openrouter/deepseek/deepseek-v4-flash", "deepseek-v4-flash       (DeepSeek — rápido)"),
+    ("openrouter/deepseek/deepseek-v4-pro",   "deepseek-v4-pro         (DeepSeek — mais capaz)"),
+    ("openrouter/qwen/qwen3-max",             "qwen3-max               (Qwen — mais capaz)"),
+    ("openrouter/qwen/qwen3-coder-plus",      "qwen3-coder-plus        (Qwen — foco em código)"),
+    ("openrouter/z-ai/glm-4.6",               "glm-4.6                 (Z-AI/GLM)"),
+    ("openrouter/moonshotai/kimi-k2",         "kimi-k2                 (Moonshot AI)"),
+    ("openrouter/minimax/minimax-m3",         "minimax-m3              (MiniMax)"),
+]
+
+def _fetch_opencode_models() -> list[tuple[str, str]]:
+    """Busca os modelos disponíveis via OpenCode/OpenRouter em tempo real,
+    filtrados aos provedores de LLM chinesa em _OPENCODE_PROVIDERS."""
+    try:
+        result = subprocess.run(["opencode", "models"], capture_output=True, text=True, timeout=15)
+        models = []
+        for line in result.stdout.splitlines():
+            model_id = line.strip()
+            if not model_id.startswith("openrouter/"):
+                continue
+            parts = model_id.split("/")
+            if len(parts) < 3 or parts[1] not in _OPENCODE_PROVIDERS:
+                continue
+            models.append((model_id, model_id.removeprefix("openrouter/")))
+        return models if models else _OPENCODE_FALLBACK
+    except Exception:
+        return _OPENCODE_FALLBACK
+
 _OLLAMA_FALLBACK = [
     ("gpt-oss:120b", "GPT-OSS 120b (Ollama Cloud)"),
     ("kimi-k2.7-code", "Kimi 2.7 Code (Ollama Cloud)"),
@@ -1460,6 +1502,7 @@ _FAMILIA_CHOICES = [
     ("deepseek", "💙 Claude-DeepSeek        (claude) — DeepSeek V4"),
     ("gemini",   "💚 Antigravity            (agy)    — Google"),
     ("copilot",  "🐕 Copilot                (copilot)— GitHub"),
+    ("opencode", "🌐 OpenCode               (opencode) — OpenRouter"),
 ]
 
 # Cérebros para o ORQUESTRADOR (chat puro, ZERO ferramentas — só planeja e delega).
@@ -1507,6 +1550,10 @@ def _apply_familia(target: dict, familia: str, modelo: str):
         target["env_file"] = str(DEEPSEEK_ENV)
     elif familia == "copilot":
         target["binary"] = "copilot"
+        target["model"] = modelo
+        target.pop("env_file", None)
+    elif familia == "opencode":
+        target["binary"] = "opencode"
         target["model"] = modelo
         target.pop("env_file", None)
     else:  # codex
@@ -1586,6 +1633,8 @@ def interactive_agent_selection(config: dict):
                 model_choices = _fetch_copilot_models()
             elif familia == "brain-ollama":
                 model_choices = _fetch_ollama_models()
+            elif familia == "opencode":
+                model_choices = _fetch_opencode_models()
             else:
                 model_choices = _fetch_codex_models()
             console.print("\r                                        \r", end="")
@@ -2249,6 +2298,33 @@ def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: 
         section.tool_call("turno falhou.")
 
 
+def _narrate_opencode_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    """Parser do --format json do opencode: eventos step_start/tool_use/text/
+    step_finish/error. Cada evento 'text' já vem como bloco de texto completo
+    (testado com respostas de 1 e vários passos), então acumula com += em vez
+    de sobrescrever — cobre tanto resposta única quanto várias etapas."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    ev_type = d.get("type", "")
+    if ev_type == "text":
+        text = (d.get("part") or {}).get("text", "")
+        if text:
+            state["final_text"] += text
+    elif ev_type == "tool_use":
+        tool = (d.get("part") or {}).get("tool", "")
+        if detail in ("normal", "full"):
+            section.tool_call(f"{tool or 'executando'}...")
+    elif ev_type == "error":
+        state["is_error"] = True
+        msg = (d.get("error") or {}).get("message", "")
+        if msg:
+            state["final_text"] = f"[OpenCode] {msg}"
+        section.tool_call(f"⚠ {msg or 'erro'}")
+
+
 _BRAIN_DIR = Path(__file__).resolve().parent
 
 
@@ -2359,9 +2435,58 @@ animação, redesenho), primeiro <DELEGATE binary="open-design"> pedindo a prév
 ao usuário, e só peça a implementação real depois que ele aprovar. Pule só se ele disser
 que quer pular, ou se não houver nada visual.
 
+MOSTRAR: para exibir um arquivo real do projeto enquanto conversa (ensinar/mostrar
+código), escreva <MOSTRAR arquivo="caminho/relativo/ao/projeto.py"> no meio da sua
+resposta — o painel Editor abre esse arquivo sozinho, sem o usuário precisar clicar em
+nada. Pode escrever texto antes E depois da tag na mesma resposta, ex: "vou te mostrar
+o arquivo X <MOSTRAR arquivo="X"> repara que a função Y faz Z". Use SÓ caminhos que
+aparecem na lista "Arquivos do projeto" abaixo — você não lê arquivo nenhum pra
+confirmar que existe, e um caminho fora da lista simplesmente falha em silêncio. Se essa
+lista não aparecer abaixo (projeto sem git), você não tem essa capacidade agora — não
+invente a tag.
+
 COFRE: se o usuário precisar configurar uma API key ou senha, lembre-o de usar
 /senha NOME valor (fica criptografado, nunca aparece no chat).
 """
+
+
+def _project_file_tree(cwd: str, max_files: int = 300) -> str:
+    """Lista leve (só caminhos) dos arquivos versionados do projeto — é o que o
+    Orquestrador usa pra saber o que existe e poder citar em <MOSTRAR arquivo="...">.
+    git ls-files já resolve .gitignore de graça e só lista o que está versionado,
+    então não precisa reimplementar filtro nenhum. Projeto sem git (ou git falha) →
+    retorna vazio; o Orquestrador simplesmente não ganha a capacidade de MOSTRAR."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"], cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    files = sorted(f for f in result.stdout.splitlines() if f.strip() and not _is_noise_path(f))
+    if not files:
+        return ""
+    shown, total = files[:max_files], len(files)
+    body = "\n".join(f"- {f}" for f in shown)
+    if total > max_files:
+        body += f"\n... (+{total - max_files} arquivos, lista truncada)"
+    return body
+
+
+def _mostrar_resolve_path(rel_path: str) -> str | None:
+    """Resolve um caminho vindo de <MOSTRAR arquivo="..."> contra a raiz do projeto.
+    Mais restrito que _bridge_path_ok (que também aceita HOME/tempdir): aqui só a
+    pasta do projeto vale, porque a lista injetada em _project_file_tree só contém
+    caminhos de lá. Retorna o caminho absoluto se for seguro e existir, ou None."""
+    cwd = get_project_dir()
+    project_root = os.path.realpath(cwd)
+    abs_path = os.path.realpath(os.path.join(cwd, rel_path))
+    if abs_path != project_root and not abs_path.startswith(project_root + os.sep):
+        return None
+    if not os.path.isfile(abs_path):
+        return None
+    return abs_path
 
 
 def build_orchestrator_prompt(config: dict, history: list, memory_context: str = "") -> str:
@@ -2379,7 +2504,13 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
         f"\nFatos e lições conhecidos (memória de longo prazo, não é o histórico da conversa):\n{memory_context}\n"
         if memory_context else ""
     )
-    parts = [system, memory_block, "\nHistórico da Conversa:\n"]
+    file_tree = _project_file_tree(get_project_dir())
+    files_block = (
+        f'\nArquivos do projeto (use como referência pra <MOSTRAR arquivo="...">; '
+        f"só existem estes, não invente caminhos):\n{file_tree}\n"
+        if file_tree else ""
+    )
+    parts = [system, memory_block, files_block, "\nHistórico da Conversa:\n"]
     for msg in history[-20:]:
         prefix = "Usuário" if msg.get("role") == "user" else "Orquestra"
         parts.append(f"{prefix}: {msg.get('content', '')}\n")
@@ -2555,7 +2686,8 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
 
 
 def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection", is_agy: bool,
-                          detail: str = "normal", is_codex: bool = False, is_copilot: bool = False, output_file: str | None = None):
+                          detail: str = "normal", is_codex: bool = False, is_copilot: bool = False,
+                          is_opencode: bool = False, output_file: str | None = None):
     """Roda um operário headless, narrando eventos ao vivo na LiveSection — em
     NENHUM nível de detalhe fica em silêncio total (ver _detail_level). Abre e
     fecha a seção aqui mesmo, já com o resumo de erro embutido no fechamento.
@@ -2598,6 +2730,8 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
         parser = _narrate_copilot_line
     elif is_agy:
         parser = _narrate_agy_line
+    elif is_opencode:
+        parser = _narrate_opencode_line
     else:
         parser = _narrate_claude_line
 
@@ -2656,6 +2790,11 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 DELEGATE_RE = re.compile(r'<DELEGATE\s+binary="([^"]+)">(.*?)</DELEGATE>', re.DOTALL | re.IGNORECASE)
 PIPELINE_RE = re.compile(r'<PIPELINE>(.*?)</PIPELINE>', re.DOTALL | re.IGNORECASE)
 PLANO_RE   = re.compile(r'<PLANO>(.*?)</PLANO>', re.DOTALL | re.IGNORECASE)
+MOSTRAR_RE = re.compile(r'<MOSTRAR\s+arquivo="([^"]+)"\s*/?>', re.IGNORECASE)
+SUGESTAO_RE = re.compile(
+    r'<SUGESTAO\s+arquivo="([^"]+)"\s+linha_inicio="(\d+)"\s+linha_fim="(\d+)"\s+motivo="([^"]*)"\s*>(.*?)</SUGESTAO>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 # Defaults de label/ícone/cor/binary por tag — usados só quando o config não
@@ -2668,6 +2807,7 @@ _WORKER_TAG_DEFAULTS = {
     "agy":        ("agy",     "Motor Antigravity", "💚", "green"),
     "deepseek":   ("claude",  "Motor DeepSeek", "💙", "blue"),
     "codex":      ("codex",   "Motor Codex",    "🤖", "magenta"),
+    "opencode":   ("opencode", "Motor OpenCode", "🌐", "white"),
 }
 
 # Tags legadas (prompts/históricos antigos) → papel canônico da arquitetura de 3.
@@ -2706,14 +2846,20 @@ def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     )
 
 
-def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tuple:
+def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_only: bool = False) -> tuple:
     """Monta o comando headless e o env pra rodar um operário — mesma lógica pra
     chamada solta (<DELEGATE>) ou dentro de um <PIPELINE>. Retorna
     (cmd, worker_env, output_file) — output_file é None pra claude/agy (o texto
     final vem do streaming) e um caminho de arquivo temporário pro codex (a CLI
     dele não segue o padrão -p/--print + stream-json dos outros dois; usa
     subcomando `exec` + -o/--output-last-message pra escrever a resposta final
-    direto num arquivo, mais confiável que casar o evento certo no --json dele)."""
+    direto num arquivo, mais confiável que casar o evento certo no --json dele).
+
+    read_only=True troca as flags de permissão pelo modo plano/read-only já
+    testado em _build_orchestrator_cmd (claude --permission-mode plan,
+    agy --mode plan, codex --sandbox read-only) — usado pelo Modo Aprendizado,
+    onde o Revisor só pode ler e comentar, nunca escrever de verdade (texto no
+    prompt sozinho não segura isso, confirmado com o Orquestrador)."""
     worker_model = worker.get("model", "")
     worker_env_file = worker.get("env_file", "")
     output_file = None
@@ -2724,17 +2870,17 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
         # PRECISA ser caminho absoluto — "." é resolvido relativo ao scratch do
         # agy, não ao cwd do processo. Com --add-dir <abs> o agy roda os comandos
         # na pasta real do projeto (testado).
-        cmd = ["agy", "-p", instruction,
-               "--output-format", "stream-json",
-               "--dangerously-skip-permissions",
-               "--add-dir", get_project_dir()]
+        cmd = ["agy", "-p", instruction, "--output-format", "stream-json"]
+        cmd += ["--mode", "plan"] if read_only else ["--dangerously-skip-permissions"]
+        cmd += ["--add-dir", get_project_dir()]
         if worker_model:
             cmd.extend(["--model", worker_model])
     elif actual_binary == "codex":
         fd, output_file = tempfile.mkstemp(prefix="orquestra_codex_", suffix=".txt")
         os.close(fd)
+        sandbox = "read-only" if read_only else "workspace-write"
         cmd = ["codex", "exec", instruction,
-               "--json", "--sandbox", "workspace-write",
+               "--json", "--sandbox", sandbox,
                "--skip-git-repo-check",
                "-o", output_file]
         if worker_model:
@@ -2747,14 +2893,25 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str) -> tup
                "--no-ask-user"]
         if worker_model:
             cmd.extend(["--model", worker_model])
+    elif actual_binary == "opencode":
+        # opencode já vem com a conta OpenRouter logada (sem API key no cofre).
+        # --agent plan = agente com permissão de edição negada de verdade
+        # (testado: bloqueia escrita sem travar em modo headless); --auto =
+        # aprova as permissões que não forem explicitamente negadas.
+        cmd = ["opencode", "run", instruction,
+               "--format", "json", "--dir", get_project_dir()]
+        cmd += ["--agent", "plan"] if read_only else ["--auto"]
+        if worker_model:
+            cmd.extend(["-m", worker_model])
     else:
         # claude (inclui a tag "deepseek", que é claude + env_file) e qualquer
         # binary inesperado. Só passa --model se parecer um modelo que o claude
         # aceita (claude-* ou deepseek-* via env) — senão o claude rejeita e o
         # operário "não funciona" sem erro claro.
+        perm_mode = "plan" if read_only else "bypassPermissions"
         cmd = ["claude", "-p", instruction,
                "--output-format", "stream-json", "--verbose",
-               "--permission-mode", "bypassPermissions"]
+               "--permission-mode", perm_mode]
         _m = (worker_model or "").lower()
         if worker_model and (_m.startswith("claude") or _m.startswith("deepseek") or actual_binary == "claude"):
             cmd.extend(["--model", worker_model])
@@ -2909,7 +3066,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         final_text, is_error, error_detail, changes_summary = _run_worker_headless(
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
-            is_codex=(actual_binary == "codex"), is_copilot=(actual_binary == "copilot"), output_file=output_file,
+            is_codex=(actual_binary == "codex"), is_copilot=(actual_binary == "copilot"),
+            is_opencode=(actual_binary == "opencode"), output_file=output_file,
         )
         if output_file:
             try:
@@ -2921,7 +3079,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         # numa LiveSection NOVA (a anterior já foi fechada por _run_worker_headless).
         low_err = (error_detail or "").lower()
         if is_error and ("429" in low_err or "credit" in low_err or "quota" in low_err or "rate limit" in low_err):
-            fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude"}
+            fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude", "opencode": "copilot"}
             fb_bin = fb_map.get(actual_binary, "copilot")
             console.print(f"[bold yellow]⚠️ {label} atingiu limite — failover para {fb_bin}...[/bold yellow]")
             fb_cmd, fb_env, fb_out = _build_worker_cmd({"binary": fb_bin, "model": ""}, fb_bin, full_instruction)
@@ -2929,7 +3087,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             fb_section.open()
             final_text, is_error, error_detail, changes_summary = _run_worker_headless(
                 fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
-                is_codex=(fb_bin == "codex"), is_copilot=(fb_bin == "copilot"), output_file=fb_out,
+                is_codex=(fb_bin == "codex"), is_copilot=(fb_bin == "copilot"),
+                is_opencode=(fb_bin == "opencode"), output_file=fb_out,
             )
             if fb_out:
                 try:
@@ -3665,15 +3824,16 @@ def main():
                     is_agy = actual_binary == "agy"
                     is_codex = actual_binary == "codex"
                     is_copilot = actual_binary == "copilot"
+                    is_opencode = actual_binary == "opencode"
                     final_text, is_error, error_detail, changes_summary = _run_worker_headless(
                         w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
-                        is_codex=is_codex, is_copilot=is_copilot, output_file=output_file,
+                        is_codex=is_codex, is_copilot=is_copilot, is_opencode=is_opencode, output_file=output_file,
                     )
-                    
+
                     if is_error and ("429" in (error_detail or "") or "credit" in (error_detail or "").lower() or "quota" in (error_detail or "").lower()):
                         console.print(f"[bold yellow]⚠️ Failover Automático: {lbl} atingiu limite/erro. Tentando fallback...[/bold yellow]")
-                        # Simple fallback: if claude->copilot, deepseek->claude, codex->copilot, agy->copilot, copilot->claude
-                        fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude"}
+                        # Simple fallback: if claude->copilot, deepseek->claude, codex->copilot, agy->copilot, copilot->claude, opencode->copilot
+                        fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude", "opencode": "copilot"}
                         fb_bin = fb_map.get(actual_binary, "copilot")
                         fb_worker = {"binary": fb_bin, "model": ""}
                         fb_cmd, fb_env, fb_out = _build_worker_cmd(fb_worker, fb_bin, delegate_instruction)
@@ -3682,7 +3842,8 @@ def main():
                         fb_section.open()
                         final_text, is_error, error_detail, changes_summary = _run_worker_headless(
                             fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
-                            is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"), output_file=fb_out,
+                            is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"),
+                            is_opencode=(fb_bin=="opencode"), output_file=fb_out,
                         )
                         if fb_out:
                             try:
