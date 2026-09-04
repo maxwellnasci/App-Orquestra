@@ -2818,12 +2818,18 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
     return state["final_text"].strip(), True
 
 
-def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
+def _orchestrator_react(config: dict, event_label: str, raw_result: str,
+                         section: "LiveSection | None" = None) -> str:
     """Modo chat: depois que um operário termina, pede pro próprio orquestrador
     comentar o resultado em linguagem simples e dar continuidade à conversa,
     em vez de só despejar a resposta crua + uma linha fixa. Retorna "" (string
     vazia) em qualquer falha/timeout — quem chama trata isso como "sem reação"
-    e cai de volta no comportamento antigo (bolha crua)."""
+    e cai de volta no comportamento antigo (bolha crua).
+
+    section: opcional — passa uma LiveSection já aberta (ex.: a TUI passa um
+    _TUILiveSection, que implementa a mesma interface por duck typing, pra
+    narrar sem escrever no console Rich por baixo do Textual). Se None (uso
+    do REPL), cria e abre uma LiveSection normal, como sempre foi."""
     role = config.get("roles", {}).get("orquestrador", {})
 
     projeto = Path(get_project_dir()).name
@@ -2850,8 +2856,9 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str) -> str:
     if env_file:
         env.update(load_env_file(env_file))
 
-    section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
-    section.open()
+    if section is None:
+        section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
+        section.open()
     text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile)
     if not ok:
         return ""

@@ -563,6 +563,7 @@ class OrquestraTUI(App):
         self._pipeline_rest = None              # etapas restantes de um <PIPELINE> pausado na aprovação
         self._learning_mode: bool = bool(cfg.get("ui", {}).get("learning_mode", False))
         self._last_auto_review: float = 0.0     # cooldown da revisão automática ao salvar
+        self._last_editor_watchdog: float = 0.0  # cooldown do Cão de Guarda em edição manual
         self._pending_suggestions: dict[str, dict] = {}  # sug_id -> {"path","linha_inicio","linha_fim","motivo","codigo"}
         self._suggestion_counter: int = 0
         self._pending_attribution: dict | None = None  # agente/instrução/arquivos da mudança aguardando aprovação
@@ -1000,7 +1001,15 @@ class OrquestraTUI(App):
             now = time.time()
             if now - self._last_auto_review >= 20:
                 self._last_auto_review = now
-                self._run_worker("revisor", _auto_review_instruction(info["path"]), read_only=True)
+                self._run_worker("revisor", _auto_review_instruction(info["path"]), read_only=True,
+                                  orchestrator_react=True)
+            # Cão de Guarda: até aqui só auditava mudança do Operador antes de
+            # commitar — uma edição manual nunca passava por ele. Cooldown
+            # próprio (15s, igual ao _run_copilot_watchdog do REPL), desacoplado
+            # do cooldown do Revisor acima — são auditorias diferentes.
+            if now - self._last_editor_watchdog >= 15:
+                self._last_editor_watchdog = now
+                self._run_watchdog(commit_after=False)
 
     def _add_suggestion_card(self, sug_id: str, sug: dict) -> None:
         """Monta um cartão de sugestão (Aceitar/Recusar) no painel do Editor."""
@@ -1340,13 +1349,20 @@ class OrquestraTUI(App):
     # ── Worker: Operário (Implementador) ─────────────────────────────────────
 
     @work(thread=True)
-    def _run_worker(self, binary_tag: str, instruction: str, read_only: bool = False) -> None:
+    def _run_worker(self, binary_tag: str, instruction: str, read_only: bool = False,
+                     orchestrator_react: bool = False) -> None:
         """Roda um operário (Operador ou Revisor) em thread separada, com GPS e
         barra de aprovação quando ele mexe em arquivos.
 
         read_only=True (Modo Aprendizado): roda em modo plano/read-only de
         verdade (mesmas flags do Orquestrador) — o agente lê e comenta, nunca
-        escreve. Sem GPS (nada deveria mudar no disco)."""
+        escreve. Sem GPS (nada deveria mudar no disco).
+
+        orchestrator_react=True: depois de uma resposta bem-sucedida, o
+        Orquestrador comenta o resultado (mesmo padrão do modo chat do REPL,
+        _orchestrator_react) em vez de deixar só a bolha crua do worker — usado
+        pela revisão automática do Modo Aprendizado, pra o chat não parecer
+        mudo entre uma revisão e outra."""
         import orquestra
 
         log = self.query_one("#chat-log", RichLog)
@@ -1476,6 +1492,20 @@ class OrquestraTUI(App):
                 f"\n[bold green]{icon} {label}[/bold green] {display_text[:2000]}\n"
             )
 
+            if orchestrator_react:
+                orq_cfg = config.setdefault("roles", {}).setdefault("orquestrador", {})
+                orq_cfg["model"] = self._orq_model
+                orq_cfg["binary"] = self._orq_binary
+                orq_cfg["provider"] = self._orq_provider
+                react_section = _TUILiveSection("Orquestra", lambda t: None, lambda *a: None, None)
+                react_section.open()
+                comment = orquestra._orchestrator_react(config, label, display_text, section=react_section)
+                if comment:
+                    orquestra.save_chat_message("orquestrador", "assistant", comment)
+                    self.call_from_thread(
+                        log.write, f"\n[bold cyan]🎼 Orquestrador[/bold cyan] {comment[:2000]}\n"
+                    )
+
         if changes_summary:
             self.call_from_thread(log.write, f"\n[dim]{changes_summary}[/dim]\n")
             self._pending_changes = changes_summary
@@ -1562,15 +1592,20 @@ class OrquestraTUI(App):
                         )
             self._pending_attribution = None
 
-        # Se um <PIPELINE> ficou pausado nesta aprovação, retoma as etapas restantes.
-        rest = self._pipeline_rest
-        self._pipeline_rest = None
-        if rest and rest["steps"]:
-            self.call_from_thread(log.write, "\n[dim]🔗 Retomando o pipeline...[/dim]\n")
-            self.call_from_thread(lambda: self._run_pipeline_tui(rest["steps"], rest["previous"], is_resume=True))
-        else:
-            self.call_from_thread(self._clear_plan_panel)
-            self.call_from_thread(self._re_enable_input)
+        if commit_after:
+            # Se um <PIPELINE> ficou pausado nesta aprovação, retoma as etapas
+            # restantes. Só faz sentido quando esta chamada É a aprovação de
+            # verdade — uma auditoria de edição manual (commit_after=False,
+            # ver action_save_file) não deve mexer num pipeline pausado que
+            # não tem nada a ver com ela.
+            rest = self._pipeline_rest
+            self._pipeline_rest = None
+            if rest and rest["steps"]:
+                self.call_from_thread(log.write, "\n[dim]🔗 Retomando o pipeline...[/dim]\n")
+                self.call_from_thread(lambda: self._run_pipeline_tui(rest["steps"], rest["previous"], is_resume=True))
+            else:
+                self.call_from_thread(self._clear_plan_panel)
+                self.call_from_thread(self._re_enable_input)
 
     # ── Open Design (prévia visual dentro do Orquestra) ─────────────────────
 
