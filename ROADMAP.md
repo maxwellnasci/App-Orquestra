@@ -62,6 +62,70 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
   (mesma limitação de espaço do header já documentada em `NOTAS_TUI.md`)
 - [ ] *(anote as suas aqui...)*
 
+## 🧭 Direção estratégica (set/2026)
+
+Posicionamento: o Orquestra **não compete com Cursor/VS Code como editor** (LSP,
+extensões, debugger — corrida perdida). Ele rege; o editor que o usuário quiser
+toca (já existe a ponte com o Cursor). A aposta é no que as IDEs gringas não
+conseguem ou não querem fazer por conflito de modelo de negócio.
+
+### Onde o Orquestra já é diferente (manter e aprofundar)
+
+- **Multi-fornecedor de verdade** — DeepSeek planeja, Claude executa, Codex revisa,
+  Copilot audita, tudo com as assinaturas que o usuário já paga. Cursor/Copilot
+  não fazem porque revendem um motor só. É a parte mais rara do projeto.
+- **Orquestrador sem ferramentas + gate humano** — quem pensa não toca arquivo.
+  Base pra governança.
+- **Cão de Guarda** auditando todo diff antes do commit — nenhuma IDE tem nativo.
+- **Modo Aprendizado** — contra-tendência ao "vibe coding" que atrofia júnior.
+  Ninguém grande faz porque reduz uso do modelo (que é o que eles vendem).
+
+### Três apostas (escolher UMA pela dor sentida depois de ~2 semanas de uso real)
+
+- [ ] **1. Governança de dados (pitch empresa/LGPD)** — regra por caminho:
+  arquivos sensíveis (segredos, dados de cliente) só vão pra modelo local
+  (Ollama); o resto pode ir pra Claude/DeepSeek. Log por turno do que saiu da
+  máquina e pra qual fornecedor. Cofre por projeto já existe; é crescer em cima.
+- [ ] **2. Camada de segurança automática (perfil ciber + portfólio)** — engordar
+  o Cão de Guarda: varredura de segredo no diff, dependência com CVE, checklist
+  OWASP quando o arquivo é rota web. Skills do Kali já na máquina.
+- [ ] **3. Modo Aprendizado como produto** — histórico do que o Revisor corrigiu
+  ao longo das semanas, "seus erros mais comuns", trilha. A memória de lições no
+  SQLite já existe, só não está virada pro usuário. Mercado: bootcamp, faculdade,
+  empresa treinando júnior.
+
+Ganho rápido que ajuda as três: rodapé mostrando, por turno, qual fornecedor foi
+usado e quanto de cota gastou (transparência que o Cursor esconde).
+
+### 🛡️ Júri de Segurança (depois das apostas, não antes)
+
+Ideia: 3 modelos de fornecedores diferentes revisam o mesmo trecho em paralelo e o
+resultado destaca consenso / só um achou / divergência.
+
+O que já existe no código: DELEGATEs soltos rodam em paralelo; modo read-only
+funciona nos 4 motores; o Orquestrador (chat puro, barato) já recebe o resultado
+dos operários no histórico — **ele é o juiz, não precisa de 4º modelo**.
+
+Decisões de desenho:
+- Só segurança, não revisão genérica: CWE/OWASP dão taxonomia; cada jurado devolve
+  achados em formato fixo (arquivo, linhas, categoria, severidade) e o cruzamento
+  é feito **em código**, não por LLM. Mata o risco de "o juiz vira a resposta".
+- Latência = jurado mais lento (paralelo), não 3x. Custo é cota de assinatura.
+- Divergência entre modelos é sinal de aprendizado — encaixa no Modo Aprendizado.
+
+Ordem obrigatória:
+1. Experimento de custo zero: 3 arquivos com vulnerabilidade conhecida, botão
+   Revisar trocando o motor (Claude → Codex → DeepSeek/OpenCode), comparar na mão.
+   Se a divergência for trivial, a ideia morre barato.
+2. Se for interessante: botão "🛡️ Júri" ao lado do "🔍 Revisar" (MVP reaproveita
+   `_run_worker(read_only=True)` ×3 + prompt de síntese no Orquestrador).
+3. Validar com o Daniel / programador pleno usando um caso real, não a descrição.
+
+Referências de mercado: LLM Council (Karpathy), Poe (respostas lado a lado),
+CodeRabbit (ensemble escondido), plugin Claude Security da Anthropic (painel
+adversarial de 3 agentes com contagem em código). A tendência é confirmada; o
+diferencial é o júri **multi-fornecedor**.
+
 ## 🐛 Bugs conhecidos
 
 - Nenhum aberto no momento.
