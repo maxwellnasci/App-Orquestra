@@ -375,3 +375,44 @@ commit mudou), não "nenhum worker rodando".
 por linha; o gate por risco não cobre o fluxo do Open Design (gate próprio,
 mais raro); não há selo visual de autoria na aba do Editor (só `/quem` via
 chat).
+
+**Follow-up, mesmo dia — `/risco on|off` e dois gaps do Modo Aprendizado
+achados testando na prática (commits `dca0c8d`, `895e0a6`):**
+
+- **`/risco on|off`** — faltava jeito de ligar `risk_gates` sem editar
+  `~/.orquestra.json` na mão. Comando novo mostra status + padrões
+  configurados sem argumento, liga/desliga com argumento, persiste na
+  config real. Usado pra ligar de verdade o gate por risco no projeto
+  (dogfooding, não só teste em `/tmp`).
+- **Cão de Guarda não reagia a edição manual.** `watchdog_verdict`/
+  `_run_watchdog` só eram acionados depois do Operador + Aprovar
+  (`_handle_approval`) — uma edição manual no Editor (Ctrl+S, o fluxo do
+  Modo Aprendizado) nunca passava por ele. `action_save_file` agora chama
+  `_run_watchdog(commit_after=False)` com cooldown próprio de 15s (separado
+  do cooldown de 20s do Revisor — são auditorias diferentes, não devem
+  competir pelo mesmo timer). **Cuidado se mexer em `_run_watchdog` de
+  novo:** a lógica de retomar `<PIPELINE>` pausado e limpar o painel de
+  plano ficou condicionada a `commit_after=True` — sem essa condição, uma
+  chamada de auditoria de edição manual abandonaria silenciosamente um
+  pipeline pausado que não tem nada a ver com ela (achado ao revisar o
+  código antes de ligar, não em produção — mas era um bug real na primeira
+  versão do fix).
+- **Orquestrador ficava mudo depois do Revisor comentar.** Tecnicamente já
+  "sabia" via histórico (`save_chat_message` salva tudo em
+  `orquestrador.json`), mas nunca reagia sozinho — só o Revisor falava.
+  `_orchestrator_react` (antes só do REPL) ganhou um parâmetro `section`
+  opcional, aceita por duck typing um `_TUILiveSection` da TUI em vez de
+  criar sua própria `LiveSection` do Rich console (que escreveria por baixo
+  do Textual e corromperia a tela — mesma classe de problema do bug de
+  `patch_stdout` já documentado). `_run_worker` ganhou `orchestrator_react=True`,
+  ligado só na revisão automática do Modo Aprendizado (não em toda chamada
+  de worker — era especificamente o que foi pedido).
+- **Como foi validado:** screenshot do usuário mostrando o Revisor
+  comentando um bug de verdade (`primeiro.py`) e o rodapé do Cão de Guarda
+  parado em "Aguardando alterações..." → decisão confirmada com o usuário
+  via pergunta direta (quer o Cão de Guarda auditando edição manual? quer o
+  Orquestrador reagindo?) antes de implementar, não assumido. Depois,
+  testado de ponta a ponta num repo isolado em `/tmp` (Operador/Revisor,
+  `watchdog_verdict` e `_orchestrator_react` mockados, só a fiação de verdade
+  rodando): save no Modo Aprendizado disparou os três — Revisor comentou,
+  Cão de Guarda atualizou o rodapé, Orquestrador reagiu depois.
