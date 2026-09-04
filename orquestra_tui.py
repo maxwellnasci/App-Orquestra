@@ -1141,6 +1141,26 @@ class OrquestraTUI(App):
             with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
             log.write(f"\n[green]Detalhe: {parts[1]}[/green]\n")
+        elif head in ("/risco", "/risk"):
+            config = orquestra.load_config()
+            gates = config.setdefault("risk_gates", dict(orquestra.DEFAULT_CONFIG["risk_gates"]))
+            if len(parts) > 1 and parts[1].lower() in ("on", "ligado", "ativar", "true"):
+                gates["enabled"] = True
+            elif len(parts) > 1 and parts[1].lower() in ("off", "desligado", "desativar", "false"):
+                gates["enabled"] = False
+            elif len(parts) > 1:
+                log.write("\n[dim]Uso: /risco on | off (sem argumento mostra o status atual)[/dim]\n")
+                return
+            if len(parts) > 1:
+                with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+            estado = "[green]ligado[/green]" if gates.get("enabled") else "[dim]desligado[/dim]"
+            padroes = ", ".join(gates.get("always_confirm_patterns", []))
+            log.write(
+                f"\n🛡️ Gate por risco: {estado}\n"
+                f"[dim]Quando ligado, pula a pausa de Aprovar se nenhum arquivo tocado bater nestes "
+                f"padrões (e o Cão de Guarda não achar nada): {padroes}[/dim]\n"
+            )
         elif head in ("/quem", "/autor"):
             if len(parts) < 2:
                 log.write("\n[dim]Uso: /quem <caminho/do/arquivo>[/dim]\n")
@@ -1186,7 +1206,7 @@ class OrquestraTUI(App):
         elif head in ("/ajuda", "/help"):
             log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
                       "/modo chat|tecnico · /detalhe minimal|normal|full · "
-                      "/quem <arquivo> · /uso · /saldo · "
+                      "/risco on|off · /quem <arquivo> · /uso · /saldo · "
                       "botões do topo trocam os modelos[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
