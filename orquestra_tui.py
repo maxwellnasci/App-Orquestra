@@ -574,6 +574,18 @@ class OrquestraTUI(App):
         log = self.query_one("#chat-log", RichLog)
         log.write("[bold cyan]🎼 Orquestrador[/bold cyan] Bem-vindo ao Orquestra. Converse comigo — eu planejo e a equipe executa.\n")
 
+        # Transparência: sem isso, um projeto sem git faz Aprovar/Rejeitar,
+        # Cão de Guarda, autoria por IA e gate por risco ficarem silenciosamente
+        # inertes — o usuário via as coisas acontecendo sem nenhuma rede de
+        # segurança visível e sem saber por quê.
+        if not (Path(orquestra.get_project_dir()) / ".git").is_dir():
+            log.write(
+                "\n[bold yellow]⚠ Esta pasta não é um repositório git.[/bold yellow] "
+                "[dim]Aprovar/Rejeitar, Cão de Guarda, autoria por IA e gate por risco "
+                "dependem de git e ficam sem efeito aqui. Rode `git init` na pasta se "
+                "quiser essas proteções ativas.[/dim]\n"
+            )
+
         self.query_one("#btn-sel-orq").label = f"Orq: {shorten_name(self._orq_model)}"
         self.query_one("#btn-sel-op").label  = f"Op: {shorten_name(self._op_model)}"
         self.query_one("#btn-sel-rev").label = f"Rev: {shorten_name(self._rev_model)}"
@@ -1381,6 +1393,15 @@ class OrquestraTUI(App):
 
         cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction, read_only=read_only)
 
+        # Transparência: antes disto, a instrução real mandada pro agente
+        # nunca aparecia em lugar nenhum da tela — só o resultado. Uma linha
+        # apagada (dim) antes de disparar, não uma bolha grande — visível se
+        # você quiser olhar, mas não compete com a resposta.
+        prompt_preview = instruction if len(instruction) <= 500 else instruction[:500] + "…"
+        self.call_from_thread(
+            log.write, f"\n[dim]📤 Prompt para {icon} {label}:[/dim]\n[dim italic]{prompt_preview}[/dim italic]\n"
+        )
+
         # GPS: monitora quais arquivos o agente está editando em tempo real
         # (pulado em read_only — nada deveria mudar no disco pra monitorar)
         gps_stop = threading.Event()
@@ -1789,6 +1810,10 @@ class OrquestraTUI(App):
                 self.call_from_thread(self._render_plan_panel)
 
             self.call_from_thread(log.write, f"\n[dim]🔗 Etapa {label} ({idx} de {len(steps)} restante(s))[/dim]\n")
+            prompt_preview = instruction if len(instruction) <= 500 else instruction[:500] + "…"
+            self.call_from_thread(
+                log.write, f"[dim]📤 Prompt para {icon} {label}:[/dim]\n[dim italic]{prompt_preview}[/dim italic]\n"
+            )
             cmd, env, out_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, full)
 
             # Atividade ao vivo: antes, o pipeline passava callbacks no-op e

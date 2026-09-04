@@ -1914,6 +1914,34 @@ def _preview(value, limit=160) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _friendly_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Traduz uma tool call do Claude Code pra uma frase legível — usada no
+    indicador de atividade ao vivo (detail='normal', o que o modo chat vê).
+    detail='full' continua mostrando o preview cru (_preview), pra quem quer
+    o detalhe técnico de verdade. Sem isso, todo mundo via algo tipo
+    'Bash({"command": "cd ... && ls"})' — informação real, mas ilegível pra
+    quem só quer saber 'o que ele tá fazendo agora'."""
+    inp = tool_input or {}
+    if tool_name in ("Read",):
+        return f"📖 Lendo {Path(inp.get('file_path', '?')).name}"
+    if tool_name in ("Write",):
+        return f"📝 Criando {Path(inp.get('file_path', '?')).name}"
+    if tool_name in ("Edit",):
+        return f"✏️ Editando {Path(inp.get('file_path', '?')).name}"
+    if tool_name in ("Bash",):
+        cmd = (inp.get("command") or "").strip()
+        return f"💻 Rodando: {cmd[:80]}" if cmd else "💻 Rodando comando"
+    if tool_name in ("Grep",):
+        return f"🔍 Procurando \"{inp.get('pattern', '?')}\""
+    if tool_name in ("Glob",):
+        return f"🔍 Listando arquivos ({inp.get('pattern', '?')})"
+    if tool_name in ("WebFetch", "WebSearch"):
+        return "🌐 Pesquisando na web"
+    if tool_name in ("TodoWrite",):
+        return "📋 Atualizando a lista de tarefas"
+    return f"🔧 {tool_name}"
+
+
 _IMG_MD_RE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
 _IMG_PATH_RE = re.compile(r'/\S+\.(?:png|jpe?g|gif|webp|svg)\b', re.IGNORECASE)
 
@@ -2294,7 +2322,11 @@ def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail:
                     section.write(text)
             elif btype == "tool_use" and detail in ("normal", "full"):
                 tool_name = block.get("name", "?")
-                section.tool_call(f"{tool_name}({_preview(block.get('input', {}))})")
+                tool_input = block.get("input", {})
+                if detail == "full":
+                    section.tool_call(f"{tool_name}({_preview(tool_input)})")
+                else:
+                    section.tool_call(_friendly_tool_call(tool_name, tool_input))
 
     elif etype == "user":
         if detail == "full":
