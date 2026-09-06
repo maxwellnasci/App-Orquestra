@@ -238,7 +238,18 @@ class OrquestraTUI(App):
     BINDINGS = [
         Binding("ctrl+s", "save_file", "Salvar", show=False),
         Binding("ctrl+w", "close_tab", "Fechar aba", show=False),
+        # PLANO_PALCO_CHAT.md, Etapa 1 — atalhos do palco/chat-dock.
+        Binding("ctrl+1", "stage_tab('stage-activity')", "Atividade", show=False),
+        Binding("ctrl+2", "stage_tab('stage-changes')", "Mudanças", show=False),
+        Binding("ctrl+3", "stage_tab('stage-editor')", "Editor", show=False),
+        Binding("ctrl+4", "stage_tab('stage-idea')", "Idea Studio", show=False),
+        Binding("ctrl+b", "toggle_files", "Arquivos", show=False),
+        Binding("ctrl+up", "resize_chat(1)", "Chat maior", show=False),
+        Binding("ctrl+down", "resize_chat(-1)", "Chat menor", show=False),
+        Binding("ctrl+l", "focus_chat", "Foco no chat", show=False),
     ]
+
+    _CHAT_DOCK_SIZES = ("compact", "normal", "tall")
 
     CSS = """
     Screen {
@@ -330,16 +341,9 @@ class OrquestraTUI(App):
         width: 25;
     }
 
-    #editor-panel {
+    #stage-tabs {
         width: 1fr;
-    }
-
-    #idea-panel {
-        width: 1fr;
-    }
-
-    #idea-panel.featured {
-        width: 3fr;
+        height: 1fr;
     }
 
     #idea-image {
@@ -355,22 +359,51 @@ class OrquestraTUI(App):
         overflow-y: auto;
     }
 
+    #chat-dock {
+        height: 14;
+        min-height: 8;
+        border-top: heavy $primary;
+        background: $surface;
+    }
+
+    #chat-dock.compact {
+        height: 8;
+    }
+
+    #chat-dock.tall {
+        height: 50%;
+    }
+
+    #chat-header {
+        height: 1;
+        background: $boost;
+        padding: 0 1;
+    }
+
+    #chat-title {
+        width: auto;
+        color: $primary;
+        text-style: bold;
+    }
+
     #status-indicator {
-        margin: 1 0;
-        text-align: left;
+        width: 1fr;
+        text-align: right;
+        color: $text-muted;
     }
 
     #chat-input {
-        width: 1fr;
-        min-width: 40;
-        height: 5;
-        border-right: none;
+        height: 3;
     }
 
-    #chat-panel {
-        width: 1fr;
-        min-width: 40;
-        border-right: none;
+    #activity-log, #diff-log {
+        height: 1fr;
+    }
+
+    #changes-header {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
     }
 
     .hidden {
@@ -425,6 +458,10 @@ class OrquestraTUI(App):
         padding: 1;
     }
 
+    #chat-log {
+        padding: 0 1;
+    }
+
     #action-bar, #plan-bar {
         height: 3;
         layout: horizontal;
@@ -475,71 +512,69 @@ class OrquestraTUI(App):
         margin: 0 1;
         min-width: 18;
     }
-
-    ChatInput {
-        dock: bottom;
-        margin: 1;
-    }
     """
 
     def compose(self) -> ComposeResult:
         # ── Header ───────────────────────────────────────────────────────────
+        # PLANO_PALCO_CHAT.md, Etapa 1: Editor/Idea Studio saem do header —
+        # viram abas do palco (#stage-tabs), não mais toggles independentes.
         with Container(id="top-bar"):
             with Container(id="controls"):
                 yield Label("🎼 ORQUESTRA", id="app-title")
                 yield Button("📁 Arquivos", id="btn-files", classes="toggle-btn")
-                yield Button("📝 Editor", id="btn-editor", classes="toggle-btn")
-                yield Button("🎨 Idea Studio", id="btn-idea", classes="toggle-btn")
                 yield Button("🎓 Aprendizado", id="btn-learning", classes="toggle-btn")
             with Container(id="models"):
                 yield Button("Carregando...", id="btn-sel-orq", classes="model-btn")
                 yield Button("Carregando...", id="btn-sel-op", classes="model-btn")
                 yield Button("Carregando...", id="btn-sel-rev", classes="model-btn")
 
-        # ── Painéis ───────────────────────────────────────────────────────────
+        # ── Palco: Atividade ao vivo / Mudanças (diff) / Editor / Idea Studio ──
         with Horizontal(id="main-content"):
             with Vertical(id="file-panel", classes="panel hidden"):
                 yield Label("📁 ARQUIVOS", classes="panel-title")
                 yield DirectoryTree("./")
 
-            with Vertical(id="editor-panel", classes="panel hidden"):
-                yield Label("📝 EDITOR", id="editor-title", classes="panel-title")
-                with Container(id="editor-toolbar", classes="hidden"):
-                    yield Button("🔍 Revisão profunda", id="btn-deep-review", classes="action-btn")
-                yield Vertical(id="suggestions-panel", classes="hidden")
-                yield TabbedContent(id="editor-tabs")
+            with TabbedContent(id="stage-tabs", initial="stage-activity"):
+                with TabPane("⚡ Atividade", id="stage-activity"):
+                    yield RichLog(id="activity-log", markup=True, wrap=True, min_width=1)
+                with TabPane("± Mudanças", id="stage-changes"):
+                    yield Label("Nenhuma mudança pendente.", id="changes-header")
+                    yield RichLog(id="diff-log", markup=True, wrap=False, min_width=1)
+                with TabPane("📝 Editor", id="stage-editor"):
+                    with Container(id="editor-toolbar", classes="hidden"):
+                        yield Button("🔍 Revisão profunda", id="btn-deep-review", classes="action-btn")
+                    yield Vertical(id="suggestions-panel", classes="hidden")
+                    yield TabbedContent(id="editor-tabs")
+                with TabPane("🎨 Idea Studio", id="stage-idea"):
+                    yield Container(id="idea-image")
+                    yield Markdown(
+                        "As prévias visuais do **Open Design** são renderizadas aqui, "
+                        "dentro do Orquestra — sem abrir navegador.",
+                        id="idea-md",
+                    )
 
-            with Vertical(id="idea-panel", classes="panel hidden"):
-                yield Label("🎨 IDEA STUDIO", classes="panel-title")
-                yield Container(id="idea-image")
-                yield Markdown(
-                    "As prévias visuais do **Open Design** são renderizadas aqui, "
-                    "dentro do Orquestra — sem abrir navegador.",
-                    id="idea-md",
-                )
-
-            with Vertical(id="chat-panel", classes="panel"):
-                yield Label("💬 CHAT CENTRAL", classes="panel-title")
-                # min_width baixo: o RichLog nunca quebra linha abaixo do seu
-                # min_width (default 78!), então com os painéis Arquivos/Editor
-                # abertos e o chat mais estreito, a mensagem "vazava" e exigia
-                # rolagem horizontal pra ler. Com min_width baixo, ele sempre
-                # quebra no tamanho real do painel (que tem min-width: 40 no CSS).
-                yield RichLog(id="chat-log", markup=True, wrap=True, min_width=1)
+        # ── Chat: pequeno, embaixo, largura cheia (não é mais coluna lateral) ──
+        with Vertical(id="chat-dock"):
+            with Horizontal(id="chat-header"):
+                yield Label("💬 Orquestrador", id="chat-title")
                 yield Label("", id="status-indicator", classes="hidden")
-                # Painel "📋 Plano" — checklist persistente do <PLANO>/<PIPELINE>
-                # ativo (some quando Aprovar/Rejeitar resolve a tarefa).
-                yield Vertical(id="plan-panel", classes="hidden")
-                # Barra do PLANO — aparece quando o Orquestrador propõe um <PLANO>
-                with Container(id="plan-bar", classes="hidden"):
-                    yield Button("▶ Executar plano", id="btn-exec-plan", classes="action-btn", variant="success")
-                    yield Button("✏️ Ajustar", id="btn-adjust-plan", classes="action-btn")
-                # Barra de aprovação — aparece só quando o Operador termina
-                with Container(id="action-bar", classes="hidden"):
-                    yield Button("✅ Aprovar", id="btn-approve", classes="action-btn", variant="success")
-                    yield Button("❌ Rejeitar", id="btn-reject", classes="action-btn", variant="error")
-                    yield Button("🔍 Revisar", id="btn-review", classes="action-btn")
-                yield ChatInput(placeholder="Digite aqui... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
+            # min_width baixo: o RichLog nunca quebra linha abaixo do seu
+            # min_width (default 78!) — sem isso a mensagem "vazava" e exigia
+            # rolagem horizontal pra ler.
+            yield RichLog(id="chat-log", markup=True, wrap=True, min_width=1)
+            # Painel "📋 Plano" — checklist persistente do <PLANO>/<PIPELINE>
+            # ativo (some quando Aprovar/Rejeitar resolve a tarefa).
+            yield Vertical(id="plan-panel", classes="hidden")
+            # Barra do PLANO — aparece quando o Orquestrador propõe um <PLANO>
+            with Container(id="plan-bar", classes="hidden"):
+                yield Button("▶ Executar plano", id="btn-exec-plan", classes="action-btn", variant="success")
+                yield Button("✏️ Ajustar", id="btn-adjust-plan", classes="action-btn")
+            # Barra de aprovação — aparece só quando o Operador termina
+            with Container(id="action-bar", classes="hidden"):
+                yield Button("✅ Aprovar", id="btn-approve", classes="action-btn", variant="success")
+                yield Button("❌ Rejeitar", id="btn-reject", classes="action-btn", variant="error")
+                yield Button("🔍 Revisar", id="btn-review", classes="action-btn")
+            yield ChatInput(placeholder="Digite aqui... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
 
         # ── Rodapés ───────────────────────────────────────────────────────────
         yield Label("🐕 Watchdog: Aguardando alterações para revisão...", id="watchdog-footer")
@@ -767,10 +802,11 @@ class OrquestraTUI(App):
     # ── Eventos de UI: Toggles e Modelos ──────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        # PLANO_PALCO_CHAT.md, Etapa 1: Editor e Idea Studio saíram daqui —
+        # agora são abas do palco (#stage-tabs), trocadas por _stage_show.
+        # Só o painel Arquivos continua sendo um toggle de mostrar/ocultar.
         panel_map = {
-            "btn-files":  ("#file-panel",   "📁 Arquivos"),
-            "btn-editor": ("#editor-panel", "📝 Editor"),
-            "btn-idea":   ("#idea-panel",   "🎨 Idea Studio"),
+            "btn-files": ("#file-panel", "📁 Arquivos"),
         }
 
         # Toggles de painéis
@@ -779,7 +815,6 @@ class OrquestraTUI(App):
             panel = self.query_one(panel_id)
             panel.toggle_class("hidden")
             if panel.has_class("hidden"):
-                panel.remove_class("featured")
                 event.button.remove_class("active")
                 event.button.label = base_label
             else:
@@ -907,11 +942,7 @@ class OrquestraTUI(App):
         else:
             self._pipeline_rest = None  # o usuário assumiu a revisão manualmente
             log.write("\n[yellow]🔍 Revisor analisando as mudanças...[/yellow]\n")
-            editor_panel = self.query_one("#editor-panel")
-            if editor_panel.has_class("hidden"):
-                editor_panel.remove_class("hidden")
-                self.query_one("#btn-editor").add_class("active")
-                self.query_one("#btn-editor").label = "📝 Editor [✓]"
+            self._stage_show("stage-changes")
             self._run_worker("revisor",
                              "Revise as mudanças não commitadas deste projeto (git diff). "
                              "Aponte bugs, riscos de segurança e problemas de arquitetura. Seja direto.")
@@ -922,18 +953,27 @@ class OrquestraTUI(App):
         """Abre o arquivo clicado no Editor. Se o painel estiver oculto, abre-o."""
         self._open_file_in_editor(str(event.path))
 
-    def _open_file_in_editor(self, filepath: str) -> "TextArea | None":
+    def _open_file_in_editor(self, filepath: str, switch_stage: bool = True) -> "TextArea | None":
         """Abre um arquivo numa aba do Editor. Se já estiver aberto, só foca a
         aba (nunca recarrega do disco — preservaria uma edição não salva).
         Retorna o TextArea da aba (novo ou existente) — útil pra quem precisa
-        mexer nele na hora, sem esperar o mount assíncrono do add_pane."""
+        mexer nele na hora, sem esperar o mount assíncrono do add_pane.
+
+        switch_stage=False (PLANO_PALCO_CHAT.md, Etapa 2 — GPS não pode
+        chamar _stage_show): o GPS (thread que abre no Editor cada arquivo
+        tocado pelo Operador, a cada 2s, DURANTE a tarefa) chama com
+        switch_stage=False — ele só precisa que a aba exista no Editor, não
+        que o palco seja puxado da Atividade pra lá a cada arquivo novo. Os
+        outros chamadores (clique na árvore, <MOSTRAR>, aceitar sugestão) são
+        ação explícita do usuário/Orquestrador e usam o default True."""
         abs_path = str(Path(filepath).resolve())
         tabs = self.query_one("#editor-tabs", TabbedContent)
 
         existing_pane_id = self._path_to_pane.get(abs_path)
         if existing_pane_id is not None:
             tabs.active = existing_pane_id
-            self._reveal_editor_panel()
+            if switch_stage:
+                self._stage_show("stage-editor")
             return self.query_one(f"#code-{existing_pane_id}", TextArea)
 
         try:
@@ -957,17 +997,14 @@ class OrquestraTUI(App):
         self._open_files[pane_id] = {"path": abs_path, "original_text": content, "dirty": False}
         self._path_to_pane[abs_path] = pane_id
 
-        self._reveal_editor_panel()
+        if switch_stage:
+            self._stage_show("stage-editor")
         return editor
 
-    def _reveal_editor_panel(self) -> None:
-        """Garante que o painel do Editor está visível e o botão marcado ativo."""
-        editor_panel = self.query_one("#editor-panel")
-        if editor_panel.has_class("hidden"):
-            editor_panel.remove_class("hidden")
-            btn = self.query_one("#btn-editor")
-            btn.add_class("active")
-            btn.label = "📝 Editor [✓]"
+    def _stage_show(self, pane_id: str) -> None:
+        """Traz uma aba do palco (#stage-tabs) pra frente. Chamar só na thread
+        da UI (via call_from_thread se vier de background)."""
+        self.query_one("#stage-tabs", TabbedContent).active = pane_id
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Marca a aba como suja (●) quando o texto diverge do que está no disco."""
@@ -1122,6 +1159,39 @@ class OrquestraTUI(App):
         if info["dirty"]:
             self.notify(f"Fechado sem salvar: {Path(info['path']).name}", severity="warning")
         tabs.remove_pane(pane_id)
+
+    # ── Atalhos do palco/chat-dock (PLANO_PALCO_CHAT.md, Etapa 1) ────────────
+
+    def action_stage_tab(self, pane_id: str) -> None:
+        """Ctrl+1..4: troca a aba ativa do palco direto pelo teclado."""
+        self._stage_show(pane_id)
+
+    def action_toggle_files(self) -> None:
+        """Ctrl+B: mostra/oculta o painel Arquivos (mesmo efeito do botão)."""
+        panel = self.query_one("#file-panel")
+        panel.toggle_class("hidden")
+        btn = self.query_one("#btn-files")
+        if panel.has_class("hidden"):
+            btn.remove_class("active")
+            btn.label = "📁 Arquivos"
+        else:
+            btn.add_class("active")
+            btn.label = "📁 Arquivos [✓]"
+
+    def action_resize_chat(self, direction: int) -> None:
+        """Ctrl+↑/Ctrl+↓: alterna o chat-dock entre compact ↔ normal ↔ tall."""
+        dock = self.query_one("#chat-dock")
+        current = "compact" if dock.has_class("compact") else ("tall" if dock.has_class("tall") else "normal")
+        idx = self._CHAT_DOCK_SIZES.index(current)
+        idx = max(0, min(len(self._CHAT_DOCK_SIZES) - 1, idx + direction))
+        dock.remove_class("compact", "tall")
+        new_size = self._CHAT_DOCK_SIZES[idx]
+        if new_size != "normal":
+            dock.add_class(new_size)
+
+    def action_focus_chat(self) -> None:
+        """Ctrl+L: foco direto no campo de texto do chat."""
+        self.query_one("#chat-input").focus()
 
     # ── Chat: Recebe o Enter do usuário ───────────────────────────────────────
 
@@ -1437,7 +1507,7 @@ class OrquestraTUI(App):
                         if filepath and filepath not in files_seen:
                             files_seen.add(filepath)
                             full_path = str(Path(cwd) / filepath)
-                            self.call_from_thread(self._open_file_in_editor, full_path)
+                            self.call_from_thread(self._open_file_in_editor, full_path, switch_stage=False)
                 except Exception:
                     pass
 
@@ -1762,11 +1832,7 @@ class OrquestraTUI(App):
                     box.mount(Label(f"(não consegui renderizar a imagem: {e})"))
             else:
                 box.mount(Label("(Chrome headless indisponível — sem prévia renderizada)"))
-            panel = self.query_one("#idea-panel")
-            panel.remove_class("hidden")
-            panel.add_class("featured")   # a prévia toma a maior parte da tela
-            btn = self.query_one("#btn-idea")
-            btn.add_class("active"); btn.label = "🎨 Idea Studio [✓]"
+            self._stage_show("stage-idea")  # a prévia toma a tela inteira do palco
         # guarda uma cópia PNG na pasta do projeto — se o terminal renderizar mal
         # (qterminal etc.), dá pra abrir num visualizador de imagem (não é navegador).
         if png:
