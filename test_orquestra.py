@@ -328,6 +328,46 @@ for _f in (_ofile, _ofile_ro):
         pass
 
 
+# ── PLANO_PALCO_CHAT.md Etapa 3: git_diff_for_display (aba "± Mudanças") ────
+print("git_diff_for_display (Etapa 3)")
+
+import subprocess as _sp
+
+_no_git = tempfile.mkdtemp()
+check(orquestra.git_diff_for_display(_no_git) == ("", []), "pasta sem git → vazio")
+
+_repo = tempfile.mkdtemp()
+_sp.run(["git", "init", "-q"], cwd=_repo)
+_sp.run(["git", "config", "user.email", "t@t.com"], cwd=_repo)
+_sp.run(["git", "config", "user.name", "t"], cwd=_repo)
+Path(_repo, "a.py").write_text("linha1\nlinha2\nlinha3\n")
+_sp.run(["git", "add", "-A"], cwd=_repo)
+_sp.run(["git", "commit", "-q", "-m", "base"], cwd=_repo)
+
+check(orquestra.git_diff_for_display(_repo) == ("", []), "repo limpo → vazio")
+
+Path(_repo, "a.py").write_text("linha1\nMUDOU\nlinha3\nlinha4\n")
+Path(_repo, "novo.py").write_text("print(1)\nprint(2)\n")
+_stat, _entries = orquestra.git_diff_for_display(_repo)
+check("2 arquivo" in _stat, "stat_text conta os 2 arquivos")
+_by_path = {e["path"]: e for e in _entries}
+check(set(_by_path) == {"a.py", "novo.py"}, "achou os 2 arquivos certos")
+check(_by_path["novo.py"]["added"] == 2 and _by_path["novo.py"]["removed"] == 0,
+      "arquivo novo: added/removed corretos")
+check(_by_path["novo.py"]["diff"] == "+print(1)\n+print(2)", "arquivo novo: diff sintético (tudo +)")
+check(_by_path["a.py"]["added"] == 2 and _by_path["a.py"]["removed"] == 1,
+      "arquivo rastreado: added/removed via --numstat")
+check("-linha2" in _by_path["a.py"]["diff"] and "+MUDOU" in _by_path["a.py"]["diff"],
+      "arquivo rastreado: diff de verdade")
+
+# a garantia central do achado nº4: git_diff_for_display NÃO pode mexer no
+# índice — senão revert_pending trataria novo.py como rastreado (checkout
+# HEAD, que não faz nada) em vez de limpar (git clean -fd).
+_status_after = _sp.run(["git", "status", "--porcelain"], cwd=_repo,
+                        capture_output=True, text=True).stdout
+check("?? novo.py" in _status_after, "novo.py continua '??' — índice intocado (achado nº4)")
+
+
 print()
 if FAILS:
     print(f"\033[31m✗ {len(FAILS)} falha(s):\033[0m")

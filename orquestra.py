@@ -652,6 +652,111 @@ def _git_status_paths(cwd: str) -> set:
             paths.add(path)
     return paths
 
+
+def git_diff_for_display(cwd: str, max_lines_per_file: int = 400) -> tuple:
+    """Retorna (stat_text, [{"path","added","removed","diff"}]) do diff não
+    commitado, pra aba "± Mudanças" da TUI (PLANO_PALCO_CHAT.md, Etapa 3).
+    Cwd sem git (ou sem mudança nenhuma) → ("", []).
+
+    Arquivo NOVO (untracked, "??" no `git status --porcelain`): `git diff`
+    sozinho não mostra o conteúdo dele. A tentação óbvia é `git add -N`
+    (intent-to-add) antes do diff — MAS isso muda o código de status daquele
+    arquivo de "??" pra um código de "tracked", e `revert_pending` decide
+    `git checkout HEAD` (rastreado) vs `git clean -fd` (novo) EXATAMENTE por
+    esse código. Um arquivo "marcado" por `git add -N` e nunca desfeito
+    viraria candidato a `checkout HEAD` — que não faz nada porque o arquivo
+    não existe no HEAD — e o "Rejeitar" pararia de limpar esse arquivo de
+    verdade. Por isso aqui o conteúdo de arquivo novo é lido DIRETO DO DISCO
+    e montado como um diff sintético (toda linha como adição), sem `git add`
+    nenhum — zero efeito colateral no índice.
+
+    Contagem de added/removed de arquivo rastreado vem de `git diff --numstat`
+    (mais robusto que contar +/- na mão — evita contar as linhas de cabeçalho
+    `+++`/`---` ou se confundir com arquivo binário)."""
+    if not (Path(cwd) / ".git").is_dir():
+        return "", []
+
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=cwd,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return "", []
+    if res.returncode != 0:
+        return "", []
+
+    tracked, untracked = [], []
+    for line in res.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        code, path = line[:2], line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if not path or _is_noise_path(path):
+            continue
+        (untracked if code == "??" else tracked).append(path)
+
+    if not tracked and not untracked:
+        return "", []
+
+    entries = []
+    total_added = total_removed = 0
+
+    for path in sorted(untracked):
+        try:
+            content = (Path(cwd) / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            content = ""
+        lines = content.splitlines()
+        added, removed = len(lines), 0
+        shown = lines[:max_lines_per_file]
+        diff_lines = [f"+{l}" for l in shown]
+        if len(lines) > max_lines_per_file:
+            diff_lines.append(f"... (+{len(lines) - max_lines_per_file} linhas, truncado)")
+        total_added += added
+        entries.append({"path": path, "added": added, "removed": removed,
+                        "diff": "\n".join(diff_lines)})
+
+    for path in sorted(tracked):
+        added = removed = 0
+        try:
+            numstat = subprocess.run(
+                ["git", "diff", "--numstat", "--", path], cwd=cwd,
+                capture_output=True, text=True, timeout=10,
+            )
+            if numstat.returncode == 0 and numstat.stdout.strip():
+                parts = numstat.stdout.strip().split("\t")
+                if len(parts) >= 2:
+                    added = int(parts[0]) if parts[0].isdigit() else 0
+                    removed = int(parts[1]) if parts[1].isdigit() else 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError):
+            pass
+
+        diff_text = ""
+        try:
+            diff_res = subprocess.run(
+                ["git", "diff", "--", path], cwd=cwd,
+                capture_output=True, text=True, timeout=15,
+            )
+            if diff_res.returncode == 0:
+                diff_lines = diff_res.stdout.splitlines()
+                if len(diff_lines) > max_lines_per_file:
+                    diff_lines = diff_lines[:max_lines_per_file] + [
+                        f"... (+{len(diff_lines) - max_lines_per_file} linhas, truncado)"
+                    ]
+                diff_text = "\n".join(diff_lines)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+        total_added += added
+        total_removed += removed
+        entries.append({"path": path, "added": added, "removed": removed, "diff": diff_text})
+
+    stat_text = f"{len(entries)} arquivo(s) · +{total_added} −{total_removed}"
+    return stat_text, entries
+
+
 def commit_pending(cwd: str, message: str) -> str:
     """Commita os arquivos com mudança não commitada (ignora ruído tipo
     __pycache__). Retorna a lista de arquivos commitados, ou '' se nada."""

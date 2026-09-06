@@ -657,6 +657,7 @@ class OrquestraTUI(App):
             self.query_one("#editor-toolbar").remove_class("hidden")
 
         self._update_usage_footer()
+        self._refresh_changes_panel()  # mudança pendente de uma sessão anterior, se houver
         self._load_models_and_config()
 
     @work(exclusive=True)
@@ -953,7 +954,7 @@ class OrquestraTUI(App):
                 log.write(f"\n[bold red]❌ Rejeitado — revertido:[/bold red] {revertidos}\n")
             else:
                 log.write("\n[bold red]❌ Rejeitado.[/bold red] (nada a reverter)\n")
-            self._set_changes_badge(0)
+            self._refresh_changes_panel()
             self._re_enable_input()
         else:
             self._pipeline_rest = None  # o usuário assumiu a revisão manualmente
@@ -1039,6 +1040,63 @@ class OrquestraTUI(App):
         except Exception:
             pass
 
+    def _refresh_changes_panel(self) -> None:
+        """Recalcula o diff de verdade (PLANO_PALCO_CHAT.md, Etapa 3) e
+        redesenha a aba "± Mudanças". Faz I/O bloqueante (subprocess/disco) —
+        por isso quem chama de uma thread de fundo (GPS, fim de worker) chama
+        ESTE método direto ali mesmo (já está numa thread), não via
+        call_from_thread; só a pintura final dos widgets
+        (_render_changes_panel) precisa de call_from_thread."""
+        import orquestra
+        cwd = orquestra.get_project_dir()
+        stat_text, entries = orquestra.git_diff_for_display(cwd)
+        if threading.current_thread() is threading.main_thread():
+            self._render_changes_panel(stat_text, entries)
+        else:
+            self.call_from_thread(self._render_changes_panel, stat_text, entries)
+
+    def _render_changes_panel(self, stat_text: str, entries: list) -> None:
+        """Só pintura de widget — chamar na thread da UI (ou via
+        call_from_thread).
+
+        Nota: `RichLog.write()` adia a renderização até o widget ter um
+        tamanho conhecido (docs do Textual) — como "± Mudanças" pode não ser
+        a aba ativa no momento em que isto roda, o `#diff-log` só mostra o
+        conteúdo de verdade quando o usuário abre a aba (a fila de
+        `_deferred_renders` é esvaziada no primeiro resize com tamanho real).
+        Não é bug: o título da aba (`_set_changes_badge`) e o `#changes-header`
+        (um `Label`, sem esse adiamento) já avisam que há mudança pendente
+        antes disso — confirmado com teste headless."""
+        import orquestra
+        header = self.query_one("#changes-header", Label)
+        diff_log = self.query_one("#diff-log", RichLog)
+        diff_log.clear()
+
+        if not entries:
+            if not (Path(orquestra.get_project_dir()) / ".git").is_dir():
+                header.update("⚠ Esta pasta não é um repositório git — sem diff pra mostrar.")
+            else:
+                header.update("Nenhuma mudança pendente.")
+            self._set_changes_badge(0)
+            return
+
+        header.update(f"{stat_text} · aguardando aprovação")
+        self._set_changes_badge(len(entries))
+        for entry in entries:
+            diff_log.write(f"[bold]━━ {rich_escape(entry['path'])} "
+                           f"(+{entry['added']} −{entry['removed']})[/bold]")
+            for line in entry["diff"].splitlines():
+                esc = rich_escape(line)
+                if line.startswith("+") and not line.startswith("+++"):
+                    diff_log.write(f"[green]{esc}[/green]")
+                elif line.startswith("-") and not line.startswith("---"):
+                    diff_log.write(f"[red]{esc}[/red]")
+                elif line.startswith("@@"):
+                    diff_log.write(f"[cyan]{esc}[/cyan]")
+                else:
+                    diff_log.write(f"[dim]{esc}[/dim]")
+            diff_log.write("")
+
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Marca a aba como suja (●) quando o texto diverge do que está no disco."""
         editor_id = event.text_area.id or ""
@@ -1087,6 +1145,7 @@ class OrquestraTUI(App):
         info["dirty"] = False
         tabs.get_tab(pane_id).label = Path(info["path"]).name
         self.notify(f"Salvo: {Path(info['path']).name}", timeout=2)
+        self._refresh_changes_panel()
 
         if self._learning_mode:
             import time
@@ -1547,18 +1606,25 @@ class OrquestraTUI(App):
         files_seen: set[str] = set()
 
         def _gps_watch():
-            """Thread que detecta arquivos modificados e os abre no editor."""
+            """Thread que detecta arquivos modificados e os abre no editor —
+            e também mantém a aba "± Mudanças" atualizada ao vivo (Etapa 3),
+            já que roda o mesmo `git diff --name-only` a cada 2s de qualquer
+            forma."""
             while not gps_stop.wait(2):
                 try:
                     result = subprocess.run(
                         ["git", "diff", "--name-only"],
                         cwd=cwd, capture_output=True, text=True, timeout=5
                     )
+                    novos = False
                     for filepath in result.stdout.strip().splitlines():
                         if filepath and filepath not in files_seen:
                             files_seen.add(filepath)
+                            novos = True
                             full_path = str(Path(cwd) / filepath)
                             self.call_from_thread(self._open_file_in_editor, full_path, switch_stage=False)
+                    if novos:
+                        self._refresh_changes_panel()
                 except Exception:
                     pass
 
@@ -1666,7 +1732,7 @@ class OrquestraTUI(App):
 
         if changes_summary:
             self._activity(icon, label, changes_summary)
-            self.call_from_thread(self._set_changes_badge, len(result.changed_files))
+            self._refresh_changes_panel()
             self.call_from_thread(
                 log.write,
                 f"\n[dim]{changes_summary} · ver ± Mudanças (Ctrl+2)[/dim]\n",
@@ -1751,7 +1817,7 @@ class OrquestraTUI(App):
             commited = orquestra.commit_pending(orquestra.get_project_dir(), "Orquestra: mudança aprovada")
             if commited:
                 self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
-                self.call_from_thread(self._set_changes_badge, 0)
+                self._refresh_changes_panel()
                 # Autoria por IA — índice paralelo (file_authorship): só grava
                 # depois que o commit de verdade aconteceu; se fosse Rejeitar,
                 # _handle_approval descarta o buffer sem chamar isto.
@@ -2026,7 +2092,7 @@ class OrquestraTUI(App):
             self.call_from_thread(log.write, f"\n[bold green]{icon} {label}[/bold green] {previous[:1500]}\n")
             if changes:
                 self._activity(icon, label, changes)
-                self.call_from_thread(self._set_changes_badge, len(result.changed_files))
+                self._refresh_changes_panel()
                 self.call_from_thread(log.write, f"\n[dim]{changes} · ver ± Mudanças (Ctrl+2)[/dim]\n")
                 self._pending_changes = changes
                 attribution = None

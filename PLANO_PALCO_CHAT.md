@@ -15,15 +15,21 @@
 > interações entre a ideia nova e comportamento que já existe, não erros de
 > não ter lido o projeto.
 >
-> **Progresso real (não só o documento):** Etapas 0, 1 e 2 implementadas e
+> **Progresso real (não só o documento):** Etapas 0, 1, 2 e 3 implementadas e
 > testadas — `test_orquestra.py` verde + boot headless via `app.run_test()`
 > cobrindo os atalhos novos, as 4 abas do palco, a distinção GPS/ação-explícita
-> do achado nº1, e os 3 fluxos reais (Operador de sucesso, Operador com
-> mudança de arquivo + gate por risco, `<PIPELINE>` de 2 etapas, `<PIPELINE>`
-> com erro, Orquestrador em chat puro) rodados num repo git isolado em `/tmp`
-> com os agentes mockados (mesma técnica do APRENDIZADOS.md §10). Faltam
-> Etapas 3-5 (diff de verdade na aba Mudanças, Orquestrador prestando contas
-> depois de cada tarefa, polimento).
+> do achado nº1, os fluxos reais (Operador de sucesso, Operador com mudança de
+> arquivo + gate por risco, `<PIPELINE>` de 2 etapas, `<PIPELINE>` com erro,
+> Orquestrador em chat puro) e o diff de verdade na aba Mudanças — tudo rodado
+> num repo git isolado em `/tmp` com os agentes mockados (mesma técnica do
+> APRENDIZADOS.md §10). **Achado durante a Etapa 3, não previsto no plano
+> original:** `RichLog.write()` adia a renderização até o widget ter tamanho
+> conhecido (docs do Textual) — como "± Mudanças" pode não ser a aba ativa no
+> momento do refresh, o conteúdo do diff só aparece quando o usuário abre a
+> aba (fila `_deferred_renders` esvazia no resize). Não é bug: badge da aba +
+> `#changes-header` (`Label`, sem esse adiamento) já avisam antes disso —
+> confirmado com teste headless, comentado em `_render_changes_panel`. Faltam
+> Etapas 4-5 (Orquestrador prestando contas depois de cada tarefa, polimento).
 
 ---
 
