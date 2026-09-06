@@ -28,8 +28,21 @@
 > momento do refresh, o conteúdo do diff só aparece quando o usuário abre a
 > aba (fila `_deferred_renders` esvazia no resize). Não é bug: badge da aba +
 > `#changes-header` (`Label`, sem esse adiamento) já avisam antes disso —
-> confirmado com teste headless, comentado em `_render_changes_panel`. Faltam
-> Etapas 4-5 (Orquestrador prestando contas depois de cada tarefa, polimento).
+> confirmado com teste headless, comentado em `_render_changes_panel`.
+>
+> **Etapa 4 também pronta:** `ui.orchestrator_reports` (default `true`) +
+> `/relato on|off`. Depois de um `<DELEGATE>` normal (Operador) ou de cada
+> etapa de `<PIPELINE>` terminar sem erro, o Orquestrador comenta o
+> resultado — o chat mostra **só** a bolha dele, não mais a bolha crua do
+> worker (que continua completa na Atividade). `suppress_report=True` mantém
+> o botão "🔍 Revisar" com o comportamento antigo (ele já É o retorno pedido
+> pelo usuário). `_orchestrator_react` ganhou `has_pending_changes` — avisa o
+> usuário que pode Aprovar/Rejeitar/Revisar só quando há arquivo tocado.
+> Testado: relato substitui a bolha crua (Operador e pipeline, 1 chamada por
+> etapa), `suppress_report` nunca chama `_orchestrator_react`, `/relato off`
+> grava a config de verdade, e com `orchestrator_reports=False` o
+> comportamento das Etapas 2/3 continua intacto (regressão). Falta só a
+> Etapa 5 (polimento, opcional).
 
 ---
 

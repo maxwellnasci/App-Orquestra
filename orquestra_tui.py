@@ -962,7 +962,8 @@ class OrquestraTUI(App):
             self._stage_show("stage-changes")
             self._run_worker("revisor",
                              "Revise as mudanças não commitadas deste projeto (git diff). "
-                             "Aponte bugs, riscos de segurança e problemas de arquitetura. Seja direto.")
+                             "Aponte bugs, riscos de segurança e problemas de arquitetura. Seja direto.",
+                             suppress_report=True)
 
     # ── Evento: Arquivo clicado na árvore → abre no Editor (GPS) ─────────────
 
@@ -1354,6 +1355,26 @@ class OrquestraTUI(App):
                 f"[dim]Quando ligado, pula a pausa de Aprovar se nenhum arquivo tocado bater nestes "
                 f"padrões (e o Cão de Guarda não achar nada): {padroes}[/dim]\n"
             )
+        elif head in ("/relato", "/report"):
+            config = orquestra.load_config()
+            ui_cfg = config.setdefault("ui", dict(orquestra.DEFAULT_CONFIG["ui"]))
+            if len(parts) > 1 and parts[1].lower() in ("on", "ligado", "ativar", "true"):
+                ui_cfg["orchestrator_reports"] = True
+            elif len(parts) > 1 and parts[1].lower() in ("off", "desligado", "desativar", "false"):
+                ui_cfg["orchestrator_reports"] = False
+            elif len(parts) > 1:
+                log.write("\n[dim]Uso: /relato on | off (sem argumento mostra o status atual)[/dim]\n")
+                return
+            if len(parts) > 1:
+                with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+            estado = "[green]ligado[/green]" if ui_cfg.get("orchestrator_reports", True) else "[dim]desligado[/dim]"
+            log.write(
+                f"\n🎼 Orquestrador presta contas: {estado}\n"
+                "[dim]Quando ligado, depois que o Operador (ou uma etapa de <PIPELINE>) termina, "
+                "o Orquestrador comenta o resultado em vez do chat só mostrar a resposta crua "
+                "do worker (custa 1 chamada extra por tarefa).[/dim]\n"
+            )
         elif head in ("/quem", "/autor"):
             if len(parts) < 2:
                 log.write("\n[dim]Uso: /quem <caminho/do/arquivo>[/dim]\n")
@@ -1399,7 +1420,7 @@ class OrquestraTUI(App):
         elif head in ("/ajuda", "/help"):
             log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
                       "/modo chat|tecnico · /detalhe minimal|normal|full · "
-                      "/risco on|off · /quem <arquivo> · /uso · /saldo · "
+                      "/risco on|off · /relato on|off · /quem <arquivo> · /uso · /saldo · "
                       "botões do topo trocam os modelos[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
@@ -1549,7 +1570,7 @@ class OrquestraTUI(App):
 
     @work(thread=True)
     def _run_worker(self, binary_tag: str, instruction: str, read_only: bool = False,
-                     orchestrator_react: bool = False) -> None:
+                     orchestrator_react: bool = False, suppress_report: bool = False) -> None:
         """Roda um operário (Operador ou Revisor) em thread separada, com GPS e
         barra de aprovação quando ele mexe em arquivos.
 
@@ -1561,16 +1582,24 @@ class OrquestraTUI(App):
         Orquestrador comenta o resultado (mesmo padrão do modo chat do REPL,
         _orchestrator_react) em vez de deixar só a bolha crua do worker — usado
         pela revisão automática do Modo Aprendizado, pra o chat não parecer
-        mudo entre uma revisão e outra."""
+        mudo entre uma revisão e outra.
+
+        suppress_report=True (PLANO_PALCO_CHAT.md, Etapa 4): desliga o "o
+        Orquestrador presta contas" desta chamada específica mesmo com
+        read_only=False e ui.orchestrator_reports ligado — usado só pelo botão
+        "🔍 Revisar" (_handle_approval), porque ali o Revisor JÁ É o retorno
+        por natureza (pedido explícito do usuário, não um <DELEGATE> do
+        Orquestrador). Sem afetar o Operador nem etapas de <PIPELINE>."""
         self.call_from_thread(self._start_task)
         try:
             self._run_worker_body(binary_tag, instruction, read_only=read_only,
-                                   orchestrator_react=orchestrator_react)
+                                   orchestrator_react=orchestrator_react,
+                                   suppress_report=suppress_report)
         finally:
             self.call_from_thread(self._end_task)
 
     def _run_worker_body(self, binary_tag: str, instruction: str, read_only: bool = False,
-                          orchestrator_react: bool = False) -> None:
+                          orchestrator_react: bool = False, suppress_report: bool = False) -> None:
         import orquestra
 
         log = self.query_one("#chat-log", RichLog)
@@ -1711,10 +1740,40 @@ class OrquestraTUI(App):
                         self.call_from_thread(self._add_suggestion_card, sug_id, sug)
 
             self._activity(icon, label, f"✅ terminou:\n{display_text}")
-            self.call_from_thread(
-                log.write,
-                f"\n[bold green]{icon} {label}[/bold green] {display_text[:2000]}\n"
-            )
+
+            # Etapa 4 (resolve A5): o Orquestrador presta contas em vez do
+            # chat só mostrar a bolha crua do worker — independente do
+            # parâmetro orchestrator_react abaixo (esse é só do Modo
+            # Aprendizado, sempre read_only=True; os dois nunca disparam na
+            # mesma chamada). suppress_report desliga isso só pro botão
+            # "🔍 Revisar" (o Revisor ali já É o retorno pedido pelo usuário).
+            reported = False
+            if not read_only and not suppress_report and config.get("ui", {}).get("orchestrator_reports", True):
+                self.call_from_thread(self._set_status, f"⠹ 🎼 Orquestrador resumindo o que {label} fez...")
+                orq_cfg = config.setdefault("roles", {}).setdefault("orquestrador", {})
+                orq_cfg["model"] = self._orq_model
+                orq_cfg["binary"] = self._orq_binary
+                orq_cfg["provider"] = self._orq_provider
+                react_section = _TUILiveSection("Orquestra", lambda t: None, lambda *a: None, None)
+                react_section.open()
+                report_input = f"{display_text}\n\n{changes_summary}".strip() if changes_summary else display_text
+                comment = orquestra._orchestrator_react(
+                    config, label, report_input, section=react_section,
+                    has_pending_changes=bool(changes_summary),
+                )
+                self.call_from_thread(self._set_status, "")
+                if comment:
+                    orquestra.save_chat_message("orquestrador", "assistant", comment)
+                    self.call_from_thread(
+                        log.write, f"\n[bold cyan]🎼 Orquestrador[/bold cyan] {comment[:2000]}\n"
+                    )
+                    reported = True
+
+            if not reported:
+                self.call_from_thread(
+                    log.write,
+                    f"\n[bold green]{icon} {label}[/bold green] {display_text[:2000]}\n"
+                )
 
             if orchestrator_react:
                 orq_cfg = config.setdefault("roles", {}).setdefault("orquestrador", {})
@@ -2089,7 +2148,36 @@ class OrquestraTUI(App):
             previous = (final_text or "").strip()
             orquestra.save_chat_message("orquestrador", "assistant", f"[Pipeline — {label}]:\n{previous[:4000]}")
             self._activity(icon, label, f"✅ terminou (etapa {step_no}):\n{previous}")
-            self.call_from_thread(log.write, f"\n[bold green]{icon} {label}[/bold green] {previous[:1500]}\n")
+
+            # Etapa 4 (resolve A5): mesmo relato do <DELEGATE> solto, ao fim
+            # de CADA etapa do pipeline — "só em Operador e etapas de
+            # pipeline" (não se aplica ao botão "🔍 Revisar", que não passa
+            # por aqui).
+            reported = False
+            if config.get("ui", {}).get("orchestrator_reports", True):
+                self.call_from_thread(self._set_status, f"⠹ 🎼 Orquestrador resumindo o que {label} fez...")
+                orq_cfg = config.setdefault("roles", {}).setdefault("orquestrador", {})
+                orq_cfg["model"] = self._orq_model
+                orq_cfg["binary"] = self._orq_binary
+                orq_cfg["provider"] = self._orq_provider
+                react_section = _TUILiveSection("Orquestra", lambda t: None, lambda *a: None, None)
+                react_section.open()
+                report_input = f"{previous}\n\n{changes}".strip() if changes else previous
+                comment = orquestra._orchestrator_react(
+                    config, label, report_input, section=react_section,
+                    has_pending_changes=bool(changes),
+                )
+                self.call_from_thread(self._set_status, "")
+                if comment:
+                    orquestra.save_chat_message("orquestrador", "assistant", comment)
+                    self.call_from_thread(
+                        log.write, f"\n[bold cyan]🎼 Orquestrador[/bold cyan] {comment[:2000]}\n"
+                    )
+                    reported = True
+
+            if not reported:
+                self.call_from_thread(log.write, f"\n[bold green]{icon} {label}[/bold green] {previous[:1500]}\n")
+
             if changes:
                 self._activity(icon, label, changes)
                 self._refresh_changes_panel()

@@ -134,7 +134,13 @@ DEFAULT_CONFIG = {
     "ui": {
         "mode": "chat",
         "detail": "normal",
-        "learning_mode": False
+        "learning_mode": False,
+        # PLANO_PALCO_CHAT.md, Etapa 4: depois de um <DELEGATE> normal (não
+        # read_only) terminar sem erro, o Orquestrador comenta o resultado em
+        # vez do chat só mostrar a bolha crua do worker. Independente do
+        # parâmetro orchestrator_react de _run_worker (esse é do Modo
+        # Aprendizado, sempre read_only=True — os dois não se misturam).
+        "orchestrator_reports": True,
     },
     # Open Design (nexu-io/open-design) — prévia visual real de mudanças de UI.
     # repo_path = clone; node_bin_dir = Node oficial (o do Kali não roda TS);
@@ -2992,7 +2998,8 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
 
 
 def _orchestrator_react(config: dict, event_label: str, raw_result: str,
-                         section: "LiveSection | None" = None) -> str:
+                         section: "LiveSection | None" = None,
+                         has_pending_changes: bool = False) -> str:
     """Modo chat: depois que um operário termina, pede pro próprio orquestrador
     comentar o resultado em linguagem simples e dar continuidade à conversa,
     em vez de só despejar a resposta crua + uma linha fixa. Retorna "" (string
@@ -3002,18 +3009,31 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     section: opcional — passa uma LiveSection já aberta (ex.: a TUI passa um
     _TUILiveSection, que implementa a mesma interface por duck typing, pra
     narrar sem escrever no console Rich por baixo do Textual). Se None (uso
-    do REPL), cria e abre uma LiveSection normal, como sempre foi."""
+    do REPL), cria e abre uma LiveSection normal, como sempre foi.
+
+    has_pending_changes (PLANO_PALCO_CHAT.md, Etapa 4): True quando o worker
+    mexeu em arquivo e a tarefa está pausada aguardando Aprovar/Rejeitar —
+    o Orquestrador é instruído a lembrar isso ao usuário. False (default,
+    mesmo comportamento de antes) na revisão automática do Modo Aprendizado,
+    que é sempre read_only e não teria nada pra aprovar."""
     role = config.get("roles", {}).get("orquestrador", {})
 
     projeto = Path(get_project_dir()).name
+    aprovacao_hint = (
+        "O resultado mexeu em arquivo(s) e está aguardando sua decisão — termine "
+        "lembrando que ele pode Aprovar, Rejeitar ou pedir pra Revisar antes de seguir.\n"
+        if has_pending_changes else ""
+    )
     prompt = (
         f"Você é o Orquestra, assistente do projeto '{projeto}'. Você pediu para "
         f"{event_label} executar uma tarefa e ele acabou de responder com isto:\n\n"
         f"{raw_result[:4000]}\n\n"
         "Comente esse resultado para o usuário, em português, em linguagem simples "
         "e natural — como se você estivesse continuando a conversa, não repetindo "
-        "o resultado inteiro. Resuma o que foi feito e destaque só o que importa. "
-        "Termine perguntando se o usuário quer ajustar algo ou seguir para outra coisa. "
+        "o resultado inteiro. Diga o que foi feito, o que mudou e o que falta. "
+        f"{aprovacao_hint}"
+        "Termine perguntando se o usuário quer ajustar algo ou seguir para outra coisa "
+        "(pule essa pergunta se já tiver dado o lembrete de aprovação acima). "
         "Responda só com o texto da sua fala, sem tags e sem formatação especial.\n\n"
         "Se (e SÓ se) esse resultado revelar algo genuinamente reutilizável no futuro — uma "
         "preferência clara do usuário, um fato específico do projeto, ou uma lição sobre o que "

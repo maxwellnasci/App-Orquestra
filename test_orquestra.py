@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import orquestra
 
@@ -366,6 +367,29 @@ check("-linha2" in _by_path["a.py"]["diff"] and "+MUDOU" in _by_path["a.py"]["di
 _status_after = _sp.run(["git", "status", "--porcelain"], cwd=_repo,
                         capture_output=True, text=True).stdout
 check("?? novo.py" in _status_after, "novo.py continua '??' — índice intocado (achado nº4)")
+
+
+# ── PLANO_PALCO_CHAT.md Etapa 4: _orchestrator_react "presta contas" ───────
+print("_orchestrator_react — has_pending_changes (Etapa 4)")
+
+_captured_prompt = {}
+
+def _fake_build_cmd(role, prompt):
+    _captured_prompt["text"] = prompt
+    return (["echo", "x"], "brain", None)
+
+with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
+     patch("orquestra._run_orchestrator_stream", return_value=("comentário do orquestrador", True)):
+    comment = orquestra._orchestrator_react(
+        orquestra.DEFAULT_CONFIG, "Operador", "editei X", has_pending_changes=True,
+    )
+    check(comment == "comentário do orquestrador", "retorna o texto de volta")
+    check("Aprovar, Rejeitar ou pedir pra Revisar" in _captured_prompt["text"],
+          "has_pending_changes=True: prompt pede lembrete de aprovação")
+
+    orquestra._orchestrator_react(orquestra.DEFAULT_CONFIG, "Revisor", "revisei Y")
+    check("Aprovar, Rejeitar ou pedir pra Revisar" not in _captured_prompt["text"],
+          "has_pending_changes=False (default): sem o lembrete de aprovação")
 
 
 print()
