@@ -18,6 +18,29 @@ Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Re
 inclusive por modelos chineses via OpenRouter (DeepSeek, Qwen, GLM, Kimi, MiniMax),
 usando a CLI `opencode` já logada na máquina.
 
+## A tela: Palco + Chat
+
+```
+┌ 🎼 ORQUESTRA   [📁 Arquivos] [🎓 Aprendizado]         Orq: | Op: | Rev: ┐
+├──────────┬───────────────────────────────────────────────────────────────┤
+│ 📁       │ ⚡ Atividade │ ± Mudanças │ 📝 Editor │ 🎨 Idea Studio         │  ← palco
+│ Arquivos │───────────────────────────────────────────────────────────────│
+│ (toggle) │ narração ao vivo de cada agente, com timestamp e cor          │
+├──────────┴───────────────────────────────────────────────────────────────┤
+│ 💬 Orquestrador                    ⠹ 🔨 Operador editando... 12s        │  ← chat, embaixo
+│ conversa limpa — sem narração crua de worker                            │
+│ [✅ Aprovar] [❌ Rejeitar] [🔍 Revisar]                                   │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+Em cima, um **palco** com 4 abas: **⚡ Atividade** (o que a equipe está
+fazendo agora — prompt completo, texto ao vivo, tool calls), **± Mudanças**
+(diff colorido do que ainda não foi aprovado), **📝 Editor**, **🎨 Idea
+Studio**. Embaixo, um **chat** fino de largura cheia — só conversa, nunca a
+narração crua de um worker. O palco pula sozinho pra Atividade quando uma
+tarefa começa (`/seguir off` desliga isso); se você trocar de aba na mão
+enquanto algo roda, ele respeita e avisa quando terminar.
+
 ## 🎓 Modo Aprendizado
 
 Um segundo jeito de trabalhar: em vez de delegar tudo pro Operador, você mesmo
@@ -34,18 +57,24 @@ escreve o código no painel Editor e o Revisor entra como mentor.
 
 ## 📝 Editor
 
-Painel com abas de verdade (um arquivo por aba, sintaxe colorida por
-extensão). `Ctrl+S` salva no disco, `Ctrl+W` fecha a aba ativa. Abre sozinho
-quando o Operador toca um arquivo (GPS) ou quando o próprio Orquestrador
-decide mostrar código real durante a conversa (`<MOSTRAR arquivo="...">`).
+Aba do palco (não painel lateral mais) com abas de verdade dentro dela — um
+arquivo por aba, sintaxe colorida por extensão. `Ctrl+S` salva no disco,
+`Ctrl+W` fecha a aba ativa. Abre sozinho quando o Operador toca um arquivo
+(GPS, sem puxar o palco pra lá enquanto uma tarefa roda) ou quando você
+clica na árvore ou o próprio Orquestrador mostra código durante a conversa
+(`<MOSTRAR arquivo="...">`).
 
 ## Como funciona um turno
 
 1. Você pede algo. Dúvida conceitual → o Orquestrador responde na hora.
 2. Tarefa que mexe em código → ele escreve um `<PLANO>` e **para**. Você clica
    **▶ Executar plano** (ou **✏️ Ajustar**).
-3. O Operador executa. Os arquivos tocados abrem no painel Editor em tempo real (GPS).
-4. Ele terminou e mexeu em arquivos → barra **✅ Aprovar / ❌ Rejeitar / 🔍 Revisar**.
+3. O Operador executa — acompanhe em **⚡ Atividade**. Os arquivos tocados
+   abrem no Editor em tempo real (GPS).
+4. Ele termina → o Orquestrador comenta o resultado no chat (`/relato off`
+   desliga isso e volta a mostrar a resposta crua do Operador). Se mexeu em
+   arquivo → barra **✅ Aprovar / ❌ Rejeitar / 🔍 Revisar**, com o diff
+   colorido em **± Mudanças**.
    - **Aprovar** → commit limpo no Git + o Cão de Guarda roda.
    - **Rejeitar** → `git reset` só dos arquivos daquela tarefa.
    - **Revisar** → o Revisor analisa o diff.
@@ -88,9 +117,23 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 | Comando | O que faz |
 |---|---|
 | `<texto livre>` | Fala com o Orquestrador. |
-| `/modo chat` \| `/modo tecnico` | Bolhas limpas × narração crua de tool calls. |
-| `/detalhe minimal` \| `normal` \| `full` | Quanto do trabalho ao vivo aparece. |
+| `/detalhe minimal` \| `normal` \| `full` | Quanto do trabalho ao vivo aparece em ⚡ Atividade (o `/modo chat`\|`tecnico` do README antigo é só do REPL `--repl`, não afeta a TUI). |
+| `/relato on` \| `off` | O Orquestrador comenta o resultado do Operador/pipeline no chat (liga por padrão). |
+| `/seguir on` \| `off` | O palco pula sozinho pra ⚡ Atividade a cada tarefa nova (liga por padrão). |
+| `/risco on` \| `off` | Gate por risco — pula a pausa de Aprovar se nada bater em padrão sensível. |
+| `/quem <arquivo>` | Quem foi o último agente a editar aquele arquivo (autoria por IA). |
+| `/uso` \| `/saldo` | Gasto/tokens da sessão · saldo real da DeepSeek. |
 | Botões do topo | Trocam o modelo do Orquestrador / Operador / Revisor, ou ligam o `🎓 Aprendizado`. |
+
+### Atalhos de teclado
+
+| Atalho | O que faz |
+|---|---|
+| `Ctrl+1` … `Ctrl+4` | Abre a aba do palco: Atividade, Mudanças, Editor, Idea Studio. |
+| `Ctrl+B` | Mostra/oculta o painel Arquivos. |
+| `Ctrl+↑` / `Ctrl+↓` | Tamanho do chat: compact ↔ normal ↔ tall (fica salvo). |
+| `Ctrl+K` | Limpa a aba Atividade (não mexe no chat nem no histórico). |
+| `Ctrl+L` | Foco direto no campo de texto do chat. |
 | `Ctrl+S` / `Ctrl+W` | Salva / fecha a aba ativa do Editor. |
 
 ## Arquivos
@@ -103,6 +146,7 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 | `orchestrator_brain.py` | O cérebro do Orquestrador — chat puro, zero ferramentas. |
 | `vault.py` | Cofre de credenciais por projeto. |
 | `AGENTES.md` | Documentação de arquitetura para contribuir. |
+| `PLANO_PALCO_CHAT.md` | Plano do layout Palco + Chat (histórico, 6 etapas, todas feitas). |
 | `~/.orquestra.json` | Configuração (roles, workers, ui). |
 | `~/.orquestra_chats/memory.db` | Fila de tarefas + memória de lições (SQLite). |
 

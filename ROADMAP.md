@@ -3,7 +3,15 @@
 Documento vivo. Conforme for usando a TUI no dia a dia, anote aqui o que incomoda e
 o que dá pra melhorar.
 
-## Arquitetura atual (V5)
+## Arquitetura atual (V6 — Palco + Chat)
+
+TUI reorganizada em **palco** (abas ⚡ Atividade / ± Mudanças / 📝 Editor /
+🎨 Idea Studio, em cima, grande) + **chat** (faixa pequena embaixo, largura
+cheia, só conversa — nunca narração crua de worker). Ver `PLANO_PALCO_CHAT.md`
+pro plano completo (6 etapas, todas implementadas e testadas) e `AGENTES.md`
+pros IDs fixos e as regras que não podem quebrar.
+
+## Arquitetura anterior (V5)
 
 TUI (Textual) como interface oficial. 3 agentes + Cão de Guarda, produtividade
 + aprendizado em segurança/código:
@@ -62,8 +70,24 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
   aprovação se nenhum arquivo tocado bate em padrão sensível (`.env`,
   `secret`, `auth`, etc.) E o Cão de Guarda não achou nada — só no ponto de
   aprovação, não no `<PLANO>` (ainda não há arquivo pra classificar ali)
+- [x] **Palco + Chat (set/2026, `PLANO_PALCO_CHAT.md`)** — layout novo:
+  ⚡ Atividade / ± Mudanças / 📝 Editor / 🎨 Idea Studio como abas de um palco
+  único em cima; chat vira faixa fina embaixo, largura cheia, só conversa.
+  Orquestrador narra tool calls mesmo em modo plano (Codex/Claude/Agy); Codex
+  como Operador/Revisor destravado (`[PAPEL: ...]` vs. `~/.codex/AGENTS.md`
+  global); `/detalhe` finalmente com efeito na TUI; diff de verdade na aba
+  Mudanças (sem tocar no índice do git — `git add -N` quebraria o
+  `revert_pending`); Orquestrador presta contas depois de cada tarefa
+  (`/relato on|off`); cor por agente, `/seguir on|off`, tamanho do chat
+  persistido. 5 commits, testado em cada etapa (repo git isolado em `/tmp`,
+  agentes mockados).
 
 ## 💡 Próximas ideias
+
+- [ ] `codex exec resume --last` (existe no Codex CLI 0.152) em vez de
+  reenviar o histórico inteiro a cada turno do Orquestrador — anotado na
+  Etapa 5 do `PLANO_PALCO_CHAT.md`, não implementado ainda: precisa testar
+  se o `resume` mantém `--sandbox read-only` e `-o`/`--output-last-message`.
 
 - [ ] Menu `/agentes trocar` completo dentro da TUI (hoje só os botões do topo)
 - [ ] `/goal` no REPL ainda usa o prompt antigo de estrategista — realinhar com o cérebro novo

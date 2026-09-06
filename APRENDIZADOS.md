@@ -467,3 +467,88 @@ no disco) antes de qualquer código (commit `5c9bbb8`):**
   proporcionalmente à quantidade de coisa nova rodando ao mesmo tempo. Se o
   usuário voltar a sentir isso, a pergunta certa não é "que feature falta"
   — é "o que dá pra tirar".
+
+## 11. Sessão de 05/09/2026 — Palco + Chat (layout inspirado no Antigravity)
+
+Pedido do usuário: analisar se dava pra reformar a TUI no formato "palco
+central em cima (atividade/mudanças/terminal) + chat pequeno embaixo" que
+ele via no Antigravity do Linux — junção de Cursor + Manus AI, mas rodando
+em terminal. Fable analisou e escreveu `PLANO_PALCO_CHAT.md`; Sonnet revisou
+o plano contra o código real e implementou as 6 etapas, cada uma com commit
+próprio e teste antes de fechar (`ba75acf`, `8e8f6a6`, `10feee2`, `4d180b0`,
++ commit de polimento, + este de docs).
+
+**Confirmação, não achado:** o usuário chegou a suspeitar que o Fable tinha
+escrito o plano "sem ler o projeto". Não era o caso — as linhas citadas
+batiam com grep real, o mockup citava o modelo exato configurado em
+`~/.orquestra.json` (`gpt-5.6-terra`), e o diagnóstico usava os nomes reais
+de função (`_run_orchestrator_stream`, `_narrate_codex_line` etc.). Os "6
+furos" achados na revisão eram interações de segunda ordem entre a ideia
+nova e comportamento que já existia (GPS, `revert_pending`, paralelismo de
+`<DELEGATE>`), não sinal de leitura rasa — achar esse tipo de furo exige
+conhecer o código a fundo, não o contrário.
+
+**Os 6 furos da revisão, todos corrigidos antes de implementar** (detalhes
+no próprio `PLANO_PALCO_CHAT.md`, marcados `[REVISADO]`):
+1. GPS chamando `_stage_show` puxaria o palco da Atividade pro Editor a cada
+   arquivo tocado, brigando com a própria proposta — resolvido com
+   `_open_file_in_editor(..., switch_stage=False)` só pro GPS.
+2. `_task_running: bool` zeraria cedo com `<DELEGATE>` paralelos — virou
+   `_active_workers: int`.
+3. Narração amigável do Codex ("📖 Lendo X") não existe hoje — documentado
+   como limitação, não implementado (exigiria testar o schema `--json` real
+   do Codex antes).
+4. `git add -N` pra ver conteúdo de arquivo novo quebraria `revert_pending`
+   (mudaria `??` pra código "tracked", e `checkout HEAD` não faz nada nesse
+   caso) — resolvido lendo o arquivo novo direto do disco, sem tocar no
+   índice.
+5. Etapa 4 não podia reaproveitar o parâmetro `orchestrator_react` que já
+   existia (Modo Aprendizado, sempre `read_only=True`) — ficou como
+   checagem independente (`not read_only and ...`).
+6. `/modo` (chat|tecnico) nunca teve efeito na TUI — documentado como
+   limitação existente (é só do REPL), não confundir com `/detalhe`.
+
+**Achado NOVO durante a implementação, não previsto em nenhuma revisão
+anterior:** `RichLog.write()` (Textual) adia a renderização até o widget ter
+um tamanho conhecido (`_deferred_renders`, esvaziado no primeiro resize com
+largura real). Como "± Mudanças" pode não ser a aba ativa no momento em que
+`_refresh_changes_panel` roda, o diff só aparece de fato quando o usuário
+abre a aba — descoberto porque um teste headless checava `#diff-log.lines`
+logo depois do worker terminar, sem nunca ter ativado a aba, e via sempre 0
+linhas mesmo com `git_diff_for_display` retornando dados corretos (confirmado
+com trace: a função de render RODAVA com os dados certos, só não "aparecia").
+Não é bug — o título da aba (badge `± Mudanças (N)`) e o `#changes-header`
+(um `Label`, sem esse adiamento) já avisam antes disso. Documentado em
+`_render_changes_panel` e no plano. **Se mexer em qualquer `RichLog` dentro
+de uma aba que pode estar inativa:** não confiar em `.lines` logo após
+escrever sem ativar a aba primeiro no teste.
+
+**Metodologia de teste usada em toda etapa** (mesmo princípio do §10 — nunca
+gastar chamada real de agente, nunca contaminar com o `~/.orquestra.json`
+real do usuário):
+- Repo git isolado em `/tmp`, `orquestra.get_project_dir`/`get_project_id`
+  mockados pra apontar pra lá.
+- `orquestra._run_worker_headless`/`_build_worker_cmd`/`watchdog_verdict`/
+  `_orchestrator_react`/`_record_agent_performance` mockados conforme o
+  cenário — nunca sobe um binário `claude`/`codex`/`agy` de verdade.
+- `orquestra.load_config` mockado quando o cenário dependia de `risk_gates`
+  desligado — o `~/.orquestra.json` REAL do usuário tem `risk_gates.enabled:
+  true`, e sem isolar isso um teste "deveria pausar" cairia no caminho de
+  auto-commit por engano (achado direto, não hipotético — aconteceu na
+  prática ao escrever o teste da Etapa 2).
+- `app.workers.wait_for_complete()` **não** é confiável quando o app tem
+  outros workers de fundo (ex: `_load_models_and_config`, que roda sempre em
+  `on_mount`) — pode levantar `WorkerCancelled` de um worker sem relação
+  nenhuma com o que está sendo testado. Esperar por um **sinal concreto**
+  (texto aparecendo num log, uma classe CSS mudando) continua sendo a regra
+  certa, reforçando o que o §10 já tinha achado sobre `app.workers` vazio.
+- `app._run_worker(...)` só AGENDA a thread (`@work`) — checar
+  `app._active_workers == 0` imediatamente após chamar é ambíguo ("ainda não
+  começou" e "já terminou" têm o mesmo valor). Sempre esperar por um
+  marcador de conteúdo antes de checar contadores.
+
+**Não coberto por este ciclo:** a narração amigável do Codex ("📖 Lendo X",
+igual ao `_friendly_tool_call` do Claude) fica como próximo passo — precisa
+rodar `codex exec --json` de verdade numa tarefa de leitura pra confirmar o
+schema; `codex exec resume --last` como forma de não reenviar o histórico
+inteiro a cada turno também não foi implementado, só anotado no `ROADMAP.md`.

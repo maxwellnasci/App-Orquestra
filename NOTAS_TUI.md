@@ -1,5 +1,14 @@
 # Notas de Desenvolvimento da TUI (Textual)
 
+## Editor e Idea Studio saíram do header (set/2026, Palco + Chat)
+
+Desde `PLANO_PALCO_CHAT.md` os botões `📝 Editor` e `🎨 Idea Studio` não
+existem mais no header — viraram abas de `#stage-tabs` (o palco), trocadas
+por `_stage_show(pane_id)` ou pelos atalhos `Ctrl+1..4`. O header só tem
+`📁 Arquivos` e `🎓 Aprendizado` como toggles, além dos botões de modelo
+(`Orq:`/`Op:`/`Rev:`) — a nota abaixo sobre espaço/`min-width: 25` continua
+valendo (inclusive sobrou mais espaço com menos botões).
+
 ## Limitação de Espaço no Header (Botões de Modelos)
 
 **Problema Histórico:**

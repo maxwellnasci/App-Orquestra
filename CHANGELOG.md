@@ -1,5 +1,42 @@
 # Changelog Orquestra
 
+## V6 — Palco + Chat (set/2026)
+
+Layout novo (`PLANO_PALCO_CHAT.md`, plano revisado e implementado em 5 etapas):
+o chat deixa de ser uma coluna lateral que misturava conversa com narração
+crua, e vira uma faixa fina embaixo, largura cheia, só conversa. Em cima, um
+**palco** com abas: ⚡ Atividade, ± Mudanças, 📝 Editor, 🎨 Idea Studio.
+
+- **⚡ Atividade** — prompt completo mandado pro agente, texto ao vivo, tool
+  calls, resultado final, veredito do Cão de Guarda, commit — tudo com
+  timestamp e cor por agente (Orquestrador cyan, Operador green, Revisor
+  blue, Cão de Guarda yellow). Texto multi-linha colapsa (1ª linha + "(+N
+  linhas)") a menos que `/detalhe full`. `Ctrl+K` limpa.
+- **± Mudanças** — diff de verdade (`git_diff_for_display`), colorido (+
+  verde, − vermelho, `@@` ciano), com contador no título da aba. Arquivo novo
+  (untracked) lido direto do disco, sem `git add -N` — isso quebraria o
+  `revert_pending` (o "Rejeitar" pararia de limpar arquivo novo de verdade).
+- **Orquestrador narra mesmo em modo plano** — antes só um heartbeat
+  "pensando... (Ns)" aparecia; agora Codex/Claude/Agy mostram o que estão
+  lendo. O prompt do Orquestrador também para de dizer "não lê arquivos"
+  quando o motor de fato lê (modo plano/read-only).
+- **Codex como Operador/Revisor destravado** — o `~/.codex/AGENTS.md` global
+  (que define o Codex como Orquestrador, "nunca edita sozinho") sabotava
+  silenciosamente o Codex quando escolhido como motor do Operador. Prefixo
+  `[PAPEL: OPERADOR/REVISOR]` na instrução + cláusula de exceção no
+  AGENTS.md resolvem isso.
+- **`/detalhe` finalmente com efeito na TUI** — o parâmetro existia desde a
+  V5 mas nunca era repassado pro motor; `<PIPELINE>` também deixa de ficar
+  mudo entre etapas.
+- **O Orquestrador presta contas** — depois que o Operador (ou uma etapa de
+  `<PIPELINE>`) termina sem erro, o Orquestrador comenta o resultado; o chat
+  mostra só a bolha dele, não mais a resposta crua do worker (que continua
+  completa na Atividade). Toggle `/relato on|off` (liga por padrão).
+- **Atalhos novos**: `Ctrl+1..4` (aba do palco), `Ctrl+B` (Arquivos),
+  `Ctrl+↑/↓` (tamanho do chat, persistido), `Ctrl+K` (limpa Atividade),
+  `Ctrl+L` (foco no chat). `/seguir on|off` controla se o palco pula sozinho
+  pra Atividade a cada tarefa nova.
+
 ## V5 — Editor de verdade, Orquestrador proativo, Modo Aprendizado, OpenCode (set/2026)
 
 - **Editor multi-abas de verdade** — o painel Editor era um único `TextArea`

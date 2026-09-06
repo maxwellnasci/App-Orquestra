@@ -119,6 +119,14 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
    (`--permission-mode plan`/`--mode plan`/`--sandbox read-only`/`--agent plan` no
    opencode) — testado que bloqueiam escrita sem travar em modo headless. Se adicionar
    um motor novo, ele só serve pro Modo Aprendizado se tiver um modo read-only real.
+8. **Narração de worker nunca vai pro `#chat-log`.** Desde o layout Palco +
+   Chat (`PLANO_PALCO_CHAT.md`), todo texto ao vivo/tool-call de um worker
+   passa por `_activity()` (aba `⚡ Atividade`), não pelo `#chat-log`. No chat
+   só entram: fala do usuário, fala do Orquestrador (inclusive o relato da
+   Etapa 4), o resumo final de 1 linha do worker quando o relato falha, e as
+   barras de decisão (`plan-bar`/`action-bar`). Narração nova vai pra
+   `_activity()` por padrão — só entra no chat se for algo que o usuário
+   precisa ler na conversa em si.
 
 ---
 
@@ -175,7 +183,47 @@ pra modo plano/read-only (ver regra 7) — usado pelo Modo Aprendizado.
 
 ---
 
-## Editor (`orquestra_tui.py`)
+## Palco (`#stage-tabs`) + Chat (`#chat-dock`)
+
+Desde `PLANO_PALCO_CHAT.md` a tela não é mais "painéis lado a lado com o chat
+numa coluna". `#main-content` (Horizontal) tem só `#file-panel` (toggle) e
+`#stage-tabs` (um `TabbedContent` único: `stage-activity`, `stage-changes`,
+`stage-editor`, `stage-idea`). `#chat-dock` é um `Vertical` **fora** de
+`#main-content` — uma faixa de largura cheia embaixo, não uma coluna.
+
+**IDs fixos que não podem mudar** (código depende deles em vários pontos):
+`#chat-log`, `#chat-input`, `#status-indicator`, `#plan-panel`, `#plan-bar`,
+`#action-bar`, `#editor-tabs`, `#editor-toolbar`, `#suggestions-panel`,
+`#idea-image`, `#idea-md`, `#file-panel`, `#watchdog-footer`, `#usage-footer`,
+`#activity-log`, `#diff-log`, `#changes-header`, `#stage-tabs`, `#chat-dock`.
+
+- **`_stage_show(pane_id)`** — único jeito de trocar de aba do palco
+  (`self.query_one("#stage-tabs", TabbedContent).active = pane_id`). Não há
+  mais painéis com `hidden`/`featured` pro Editor/Idea Studio — são sempre
+  panes do mesmo `TabbedContent`.
+- **`_activity(icon, who, texto)`** — escreve na aba Atividade, thread-safe
+  (chama de qualquer thread). Regra 8 acima: é pra onde vai narração de
+  worker, nunca pro `#chat-log`.
+- **`_active_workers` (contador, não bool)** — `<DELEGATE>` soltos rodam em
+  paralelo; `_start_task`/`_end_task` incrementam/decrementam. `_stage_pinned`
+  deixa o usuário "prender" o palco numa aba manualmente durante uma tarefa
+  (`on_tabbed_content_tab_activated`), sem o próximo worker do mesmo lote
+  puxar de volta pra Atividade.
+- **GPS não é `_stage_show`.** `_open_file_in_editor(filepath, switch_stage=True)`
+  — a thread GPS (abre no Editor cada arquivo tocado, a cada 2s, DURANTE a
+  tarefa) chama com `switch_stage=False` de propósito: ela só deve popular a
+  aba no Editor, nunca puxar o palco pra lá enquanto a Atividade está sendo
+  seguida. Clique na árvore, `<MOSTRAR>` e aceitar sugestão usam o default
+  `True` (ação explícita).
+- **`git_diff_for_display`/`_refresh_changes_panel`** — o diff de "± Mudanças"
+  NUNCA usa `git add -N` pra ver conteúdo de arquivo novo (leia direto do
+  disco) — isso mudaria o código de status de `??` pra "tracked" e quebraria
+  `revert_pending` (regra pra qualquer função nova que precise inspecionar
+  arquivo não commitado). `RichLog.write()` adia renderização até o widget
+  ter tamanho conhecido — o diff só aparece de fato quando o usuário abre a
+  aba (não é bug, o badge da aba e o `#changes-header` já avisam antes).
+
+### Editor (dentro da aba `stage-editor`)
 
 Painel com `TabbedContent` — um `TextArea` por aba (`id=f"code-{pane_id}"`), não um
 único widget reaproveitado. Estado em dois dicts na `App`:
@@ -183,14 +231,14 @@ Painel com `TabbedContent` — um `TextArea` por aba (`id=f"code-{pane_id}"`), n
 `self._path_to_pane: dict[caminho_absoluto -> pane_id]` (evita abrir a mesma aba
 duas vezes vinda de fontes diferentes — clique na árvore, GPS, `<MOSTRAR>`).
 
-- **`_open_file_in_editor(filepath)`** — abre OU foca (nunca recarrega do disco se
-  já está aberto, senão perderia edição não salva). Retorna o `TextArea` direto (não
-  só o `pane_id`) porque `tabs.add_pane(...)` agenda o mount de forma assíncrona —
-  quem chama e precisa mexer no widget na mesma sincronia (ex: `_accept_suggestion`)
-  usaria `query_one` e quebraria com `NoMatches` (bug real, corrigido — ver
-  `APRENDIZADOS.md`).
+- **`_open_file_in_editor(filepath, switch_stage=True)`** — abre OU foca (nunca
+  recarrega do disco se já está aberto, senão perderia edição não salva).
+  Retorna o `TextArea` direto (não só o `pane_id`) porque `tabs.add_pane(...)`
+  agenda o mount de forma assíncrona — quem chama e precisa mexer no widget na
+  mesma sincronia (ex: `_accept_suggestion`) usaria `query_one` e quebraria
+  com `NoMatches` (bug real, corrigido — ver `APRENDIZADOS.md`).
 - **`action_save_file(editor=None)`** — `Ctrl+S`. Aceita o `TextArea` já resolvido
-  opcionalmente, pelo mesmo motivo acima.
+  opcionalmente, pelo mesmo motivo acima. Também dispara `_refresh_changes_panel()`.
 - **Dirty-tracking** — `on_text_area_changed` compara `editor.text` com
   `info["original_text"]` (string inteira, não um bool ingênuo — cobre desfazer até
   o texto original). `TextArea.replace()` (usado por `_accept_suggestion`) dispara
