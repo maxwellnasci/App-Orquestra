@@ -15,10 +15,15 @@
 > interações entre a ideia nova e comportamento que já existe, não erros de
 > não ter lido o projeto.
 >
-> **Progresso real (não só o documento):** Etapa 0 (commit `ba75acf`) e
-> Etapa 1 implementadas e testadas — `test_orquestra.py` verde + boot headless
-> via `app.run_test()` cobrindo os atalhos novos, as 4 abas do palco e a
-> distinção GPS/ação-explícita do achado nº1. Faltam Etapas 2-5.
+> **Progresso real (não só o documento):** Etapas 0, 1 e 2 implementadas e
+> testadas — `test_orquestra.py` verde + boot headless via `app.run_test()`
+> cobrindo os atalhos novos, as 4 abas do palco, a distinção GPS/ação-explícita
+> do achado nº1, e os 3 fluxos reais (Operador de sucesso, Operador com
+> mudança de arquivo + gate por risco, `<PIPELINE>` de 2 etapas, `<PIPELINE>`
+> com erro, Orquestrador em chat puro) rodados num repo git isolado em `/tmp`
+> com os agentes mockados (mesma técnica do APRENDIZADOS.md §10). Faltam
+> Etapas 3-5 (diff de verdade na aba Mudanças, Orquestrador prestando contas
+> depois de cada tarefa, polimento).
 
 ---
 

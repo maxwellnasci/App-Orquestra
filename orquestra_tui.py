@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import os
 from pathlib import Path
 from textual.app import App, ComposeResult
@@ -21,6 +22,7 @@ from textual.screen import ModalScreen
 from textual.message import Message
 from textual.binding import Binding
 from textual import work, events
+from rich.markup import escape as rich_escape
 
 
 # ─── Utilitário: encurtamento de nomes para o header ─────────────────────────
@@ -250,6 +252,7 @@ class OrquestraTUI(App):
     ]
 
     _CHAT_DOCK_SIZES = ("compact", "normal", "tall")
+    _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
     CSS = """
     Screen {
@@ -613,6 +616,18 @@ class OrquestraTUI(App):
         self._suggestion_counter: int = 0
         self._pending_attribution: dict | None = None  # agente/instrução/arquivos da mudança aguardando aprovação
         self._plan_steps: list[dict] = []       # [{"text","status"}] do <PLANO>/<PIPELINE> ativo — painel "📋 Plano"
+
+        # PLANO_PALCO_CHAT.md, Etapa 2 — palco segue a atividade + spinner.
+        # Contador, não bool (furo nº2 da revisão): <DELEGATE> soltos rodam em
+        # paralelo (várias chamadas de _run_worker sem esperar uma da outra) —
+        # um bool zeraria assim que o PRIMEIRO worker paralelo terminasse.
+        self._active_workers: int = 0
+        self._stage_pinned: bool = False        # usuário trocou de aba na mão durante uma tarefa
+        self._status_text: str = ""             # texto "cru" do status (sem frame do spinner)
+        self._spinner_idx: int = 0
+        self._spinner_started_at: float = 0.0
+        self._spinner_timer = None
+
         import orquestra
         self._session_usage = orquestra.get_session_usage_totals(orquestra.get_project_id())
 
@@ -938,6 +953,7 @@ class OrquestraTUI(App):
                 log.write(f"\n[bold red]❌ Rejeitado — revertido:[/bold red] {revertidos}\n")
             else:
                 log.write("\n[bold red]❌ Rejeitado.[/bold red] (nada a reverter)\n")
+            self._set_changes_badge(0)
             self._re_enable_input()
         else:
             self._pipeline_rest = None  # o usuário assumiu a revisão manualmente
@@ -1005,6 +1021,23 @@ class OrquestraTUI(App):
         """Traz uma aba do palco (#stage-tabs) pra frente. Chamar só na thread
         da UI (via call_from_thread se vier de background)."""
         self.query_one("#stage-tabs", TabbedContent).active = pane_id
+
+    def _set_activity_running(self, running: bool) -> None:
+        """Marca (ou some com) o "●" no título da aba Atividade — sinal visual
+        de que a equipe está trabalhando mesmo com outra aba em foco."""
+        try:
+            tab = self.query_one("#stage-tabs", TabbedContent).get_tab("stage-activity")
+            tab.label = "⚡ Atividade ●" if running else "⚡ Atividade"
+        except Exception:
+            pass
+
+    def _set_changes_badge(self, count: int) -> None:
+        """Atualiza o contador no título da aba "± Mudanças"."""
+        try:
+            tab = self.query_one("#stage-tabs", TabbedContent).get_tab("stage-changes")
+            tab.label = f"± Mudanças ({count})" if count else "± Mudanças"
+        except Exception:
+            pass
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Marca a aba como suja (●) quando o texto diverge do que está no disco."""
@@ -1337,17 +1370,20 @@ class OrquestraTUI(App):
 
         log = self.query_one("#chat-log", RichLog)
         self._last_user_prompt = prompt
+        self.call_from_thread(self._start_task)
+        try:
+            self._run_orchestrator_body(prompt, log)
+        finally:
+            self.call_from_thread(self._end_task)
+
+    def _run_orchestrator_body(self, prompt: str, log: "RichLog") -> None:
+        import orquestra
 
         def on_status(text: str):
-            def _update():
-                status_lbl = self.query_one("#status-indicator", Label)
-                if text:
-                    status_lbl.update(text)
-                    status_lbl.remove_class("hidden")
-                else:
-                    status_lbl.update("")
-                    status_lbl.add_class("hidden")
-            self.call_from_thread(_update)
+            self.call_from_thread(self._set_status, text)
+
+        def on_tool(text: str):
+            self._activity("🎼", "Orquestrador", text)
 
         config = orquestra.load_config()
         orq_role = dict(config.get("roles", {}).get("orquestrador", {}))
@@ -1367,8 +1403,11 @@ class OrquestraTUI(App):
             env.update(orquestra.load_env_file(ef))
 
         self.call_from_thread(log.write, f"\n[dim]🎼 Orquestrador ({shorten_name(self._orq_model)}) pensando...[/dim]\n")
+        self._activity("🎼", "Orquestrador", "começou a pensar...")
 
-        section = _TUILiveSection("Orquestrador", lambda t: None, lambda *a: None, on_status)
+        # on_tool (Etapa 0e/2): tool call do Orquestrador (lendo/rodando comando
+        # em modo plano) também narra na Atividade, além de ir pro status.
+        section = _TUILiveSection("Orquestrador", lambda t: None, lambda *a: None, on_status, on_tool)
         section.open()
         # Etapa 0d: Codex lendo um repo em modo read-only pode legitimamente
         # passar dos 150s que bastavam pro brain/DeepSeek (chat direto, sem
@@ -1421,6 +1460,7 @@ class OrquestraTUI(App):
         visible = (final_text[:tag.start()] if tag else final_text).strip()
         if visible:
             self.call_from_thread(log.write, f"\n[bold cyan]🎼 Orquestrador[/bold cyan] {visible}\n")
+            self._activity("🎼", "Orquestrador", "→ respondeu")
 
         if plano and not delegates and not pipelines:
             # Gate: mostra o plano e espera o usuário mandar executar.
@@ -1463,6 +1503,15 @@ class OrquestraTUI(App):
         _orchestrator_react) em vez de deixar só a bolha crua do worker — usado
         pela revisão automática do Modo Aprendizado, pra o chat não parecer
         mudo entre uma revisão e outra."""
+        self.call_from_thread(self._start_task)
+        try:
+            self._run_worker_body(binary_tag, instruction, read_only=read_only,
+                                   orchestrator_react=orchestrator_react)
+        finally:
+            self.call_from_thread(self._end_task)
+
+    def _run_worker_body(self, binary_tag: str, instruction: str, read_only: bool = False,
+                          orchestrator_react: bool = False) -> None:
         import orquestra
 
         log = self.query_one("#chat-log", RichLog)
@@ -1481,13 +1530,15 @@ class OrquestraTUI(App):
 
         cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction, read_only=read_only)
 
-        # Transparência: antes disto, a instrução real mandada pro agente
-        # nunca aparecia em lugar nenhum da tela — só o resultado. Uma linha
-        # apagada (dim) antes de disparar, não uma bolha grande — visível se
-        # você quiser olhar, mas não compete com a resposta.
-        prompt_preview = instruction if len(instruction) <= 500 else instruction[:500] + "…"
+        # Transparência: a instrução completa vai pra Atividade (histórico
+        # de verdade, sem limite de tamanho útil pra debugar depois); o chat
+        # só recebe um aviso curto apontando pra lá — PLANO_PALCO_CHAT.md,
+        # Etapa 2 (antes, o prompt inteiro competia com a conversa no mesmo
+        # #chat-log).
+        self._activity(icon, label, f"📤 prompt:\n{instruction}")
         self.call_from_thread(
-            log.write, f"\n[dim]📤 Prompt para {icon} {label}:[/dim]\n[dim italic]{prompt_preview}[/dim italic]\n"
+            log.write,
+            f"\n[dim]{icon} {label} começou · acompanhe em ⚡ Atividade (Ctrl+1)[/dim]\n",
         )
 
         # GPS: monitora quais arquivos o agente está editando em tempo real
@@ -1516,23 +1567,18 @@ class OrquestraTUI(App):
             gps_thread.start()
 
         def on_line(text: str):
-            self.call_from_thread(log.write, text + "\n")
+            self._activity(icon, label, text)
 
         def on_close(ok: bool, error_detail: str, changes_summary: str):
             pass
 
         def on_status(text: str):
-            def _update():
-                status_lbl = self.query_one("#status-indicator", Label)
-                if text:
-                    status_lbl.update(text)
-                    status_lbl.remove_class("hidden")
-                else:
-                    status_lbl.update("")
-                    status_lbl.add_class("hidden")
-            self.call_from_thread(_update)
+            self.call_from_thread(self._set_status, text)
 
-        section = _TUILiveSection(label, on_line, on_close, on_status)
+        def on_tool(text: str):
+            self._activity(icon, label, text)
+
+        section = _TUILiveSection(label, on_line, on_close, on_status, on_tool)
         section.open()
         result = orquestra._run_worker_headless(
             cmd, worker_env, cwd, section,
@@ -1541,6 +1587,7 @@ class OrquestraTUI(App):
             is_copilot=(actual_binary == "copilot"),
             is_opencode=(actual_binary == "opencode"),
             output_file=output_file,
+            detail=orquestra._detail_level(config),
         )
         final_text, is_error, error_detail, changes_summary = (
             result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -1567,6 +1614,7 @@ class OrquestraTUI(App):
         if is_error:
             orquestra.save_chat_message("orquestrador", "assistant",
                                         f"[Erro do {label}]: {(error_detail or '')[:1500]}")
+            self._activity(icon, label, f"❌ erro: {error_detail}")
             self.call_from_thread(
                 log.write,
                 f"\n[bold red]⚠ Erro no {label}:[/bold red] {error_detail[:500]}\n"
@@ -1596,6 +1644,7 @@ class OrquestraTUI(App):
                         self._pending_suggestions[sug_id] = sug
                         self.call_from_thread(self._add_suggestion_card, sug_id, sug)
 
+            self._activity(icon, label, f"✅ terminou:\n{display_text}")
             self.call_from_thread(
                 log.write,
                 f"\n[bold green]{icon} {label}[/bold green] {display_text[:2000]}\n"
@@ -1616,7 +1665,12 @@ class OrquestraTUI(App):
                     )
 
         if changes_summary:
-            self.call_from_thread(log.write, f"\n[dim]{changes_summary}[/dim]\n")
+            self._activity(icon, label, changes_summary)
+            self.call_from_thread(self._set_changes_badge, len(result.changed_files))
+            self.call_from_thread(
+                log.write,
+                f"\n[dim]{changes_summary} · ver ± Mudanças (Ctrl+2)[/dim]\n",
+            )
             self._pending_changes = changes_summary
             attribution = None
             if not read_only and result.changed_files:
@@ -1635,15 +1689,18 @@ class OrquestraTUI(App):
                     self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
                     self.call_from_thread(footer.add_class, "alert")
                     self.call_from_thread(log.write, f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
+                    self._activity("🐕", "Cão de Guarda", f"⚠ {wtext}")
                 else:
                     self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
                     self.call_from_thread(footer.remove_class, "alert")
+                    self._activity("🐕", "Cão de Guarda", wtext or "nada a apontar. ✅")
 
             if auto_ok and not has_bug:
                 self.call_from_thread(log.write, "\n[dim](gate por risco: seguindo sem pausar)[/dim]\n")
                 commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
                 if commited:
                     self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                    self._activity("📦", "git", f"commit criado: {commited}")
                     if attribution:
                         for fp in attribution["files"]:
                             orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
@@ -1694,6 +1751,7 @@ class OrquestraTUI(App):
             commited = orquestra.commit_pending(orquestra.get_project_dir(), "Orquestra: mudança aprovada")
             if commited:
                 self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                self.call_from_thread(self._set_changes_badge, 0)
                 # Autoria por IA — índice paralelo (file_authorship): só grava
                 # depois que o commit de verdade aconteceu; se fosse Rejeitar,
                 # _handle_approval descarta o buffer sem chamar isto.
@@ -1865,6 +1923,13 @@ class OrquestraTUI(App):
         etapa como contexto para a próxima. Se uma etapa mexe em arquivos, pausa
         na aprovação e guarda as etapas restantes em self._pipeline_rest —
         _run_watchdog retoma daqui depois do 'Aprovar'."""
+        self.call_from_thread(self._start_task)
+        try:
+            self._run_pipeline_tui_body(steps, previous=previous, is_resume=is_resume)
+        finally:
+            self.call_from_thread(self._end_task)
+
+    def _run_pipeline_tui_body(self, steps: list, previous: str = "", is_resume: bool = False) -> None:
         import orquestra
         log = self.query_one("#chat-log", RichLog)
         cwd = orquestra.get_project_dir()
@@ -1899,15 +1964,13 @@ class OrquestraTUI(App):
                 self.call_from_thread(self._render_plan_panel)
 
             self.call_from_thread(log.write, f"\n[dim]🔗 Etapa {label} ({idx} de {len(steps)} restante(s))[/dim]\n")
-            prompt_preview = instruction if len(instruction) <= 500 else instruction[:500] + "…"
-            self.call_from_thread(
-                log.write, f"[dim]📤 Prompt para {icon} {label}:[/dim]\n[dim italic]{prompt_preview}[/dim italic]\n"
-            )
+            self._activity(icon, label, f"📤 prompt (etapa {step_no}):\n{instruction}")
             cmd, env, out_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, full)
 
             # Atividade ao vivo: antes, o pipeline passava callbacks no-op e
             # nada aparecia entre uma etapa e a próxima — agora religa no mesmo
-            # #status-indicator que o <DELEGATE> solto já usa.
+            # #status-indicator que o <DELEGATE> solto já usa, e também escreve
+            # cada linha/tool-call na aba ⚡ Atividade (Etapa 2).
             def on_status(text: str, _label=label, _step=step_no, _total=len(steps) + offset):
                 def _update():
                     status_lbl = self.query_one("#status-indicator", Label)
@@ -1919,13 +1982,16 @@ class OrquestraTUI(App):
                         status_lbl.add_class("hidden")
                 self.call_from_thread(_update)
 
-            section = _TUILiveSection(label, lambda t: None, lambda *a: None, on_status)
+            def on_line(text: str, _icon=icon, _label=label):
+                self._activity(_icon, _label, text)
+
+            section = _TUILiveSection(label, on_line, lambda *a: None, on_status, on_line)
             section.open()
             result = orquestra._run_worker_headless(
                 cmd, env, cwd, section,
                 is_agy=(actual_binary == "agy"), is_codex=(actual_binary == "codex"),
                 is_copilot=(actual_binary == "copilot"), is_opencode=(actual_binary == "opencode"),
-                output_file=out_file,
+                output_file=out_file, detail=orquestra._detail_level(config),
             )
             final_text, is_error, err, changes = (
                 result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -1946,6 +2012,7 @@ class OrquestraTUI(App):
                 if offset + idx - 1 < len(self._plan_steps):
                     self._plan_steps[offset + idx - 1]["status"] = "error"
                     self.call_from_thread(self._render_plan_panel)
+                self._activity(icon, label, f"❌ erro: {err}")
                 self.call_from_thread(log.write, f"\n[bold red]⚠ Pipeline parou em {label}: {err[:400]}[/bold red]\n")
                 orquestra.save_chat_message("orquestrador", "assistant", f"[Pipeline parou em {label}]: {err[:1500]}")
                 self.call_from_thread(self._re_enable_input)
@@ -1955,8 +2022,12 @@ class OrquestraTUI(App):
                 self.call_from_thread(self._render_plan_panel)
             previous = (final_text or "").strip()
             orquestra.save_chat_message("orquestrador", "assistant", f"[Pipeline — {label}]:\n{previous[:4000]}")
+            self._activity(icon, label, f"✅ terminou (etapa {step_no}):\n{previous}")
             self.call_from_thread(log.write, f"\n[bold green]{icon} {label}[/bold green] {previous[:1500]}\n")
             if changes:
+                self._activity(icon, label, changes)
+                self.call_from_thread(self._set_changes_badge, len(result.changed_files))
+                self.call_from_thread(log.write, f"\n[dim]{changes} · ver ± Mudanças (Ctrl+2)[/dim]\n")
                 self._pending_changes = changes
                 attribution = None
                 if result.changed_files:
@@ -1975,9 +2046,11 @@ class OrquestraTUI(App):
                         self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
                         self.call_from_thread(footer.add_class, "alert")
                         self.call_from_thread(log.write, f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
+                        self._activity("🐕", "Cão de Guarda", f"⚠ {wtext}")
                     else:
                         self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
                         self.call_from_thread(footer.remove_class, "alert")
+                        self._activity("🐕", "Cão de Guarda", wtext or "nada a apontar. ✅")
 
                 if auto_ok and not has_bug:
                     # Gate por risco: nenhum caminho sensível e o Cão de Guarda não
@@ -1986,6 +2059,7 @@ class OrquestraTUI(App):
                     commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
                     if commited:
                         self.call_from_thread(log.write, f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                        self._activity("📦", "git", f"commit criado: {commited}")
                         if attribution:
                             for fp in attribution["files"]:
                                 orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
@@ -2008,6 +2082,16 @@ class OrquestraTUI(App):
 
         self.call_from_thread(self._re_enable_input)
 
+    # ── Evento: usuário troca de aba do palco na mão ──────────────────────────
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Se o usuário troca de aba do palco NA MÃO enquanto uma tarefa está
+        rodando, isso "prende" o palco naquela aba — _start_task não vai mais
+        forçar de volta pra Atividade até a tarefa atual terminar (senão o
+        usuário lendo o Editor levaria um "puxão" de volta a cada chamada)."""
+        if event.tabbed_content.id == "stage-tabs" and self._active_workers > 0:
+            self._stage_pinned = True
+
     # ── Helpers de UI (devem ser chamados na thread da UI) ────────────────────
 
     def _show_plan_bar(self) -> None:
@@ -2020,6 +2104,91 @@ class OrquestraTUI(App):
     def _re_enable_input(self) -> None:
         self.query_one("#chat-input").disabled = False
         self.query_one("#chat-input").focus()
+
+    def _activity(self, who_icon: str, who: str, text: str) -> None:
+        """Escreve uma linha na aba "⚡ Atividade" do palco — PLANO_PALCO_CHAT.md,
+        Etapa 2. Thread-safe: chama de qualquer thread, se encarrega do
+        call_from_thread sozinho (quem chama não precisa lembrar disso)."""
+        if not text or not text.strip():
+            return
+        ts = time.strftime("%H:%M:%S")
+        line = f"[dim]{ts}[/dim] {who_icon} [bold]{who}[/bold]  {rich_escape(text)}"
+
+        def _write():
+            try:
+                self.query_one("#activity-log", RichLog).write(line)
+            except Exception:
+                pass
+        if threading.current_thread() is threading.main_thread():
+            _write()
+        else:
+            self.call_from_thread(_write)
+
+    def _set_status(self, text: str) -> None:
+        """Atualiza a linha de status única do #chat-header. Chamar só na
+        thread da UI (quem chama de uma thread de fundo usa call_from_thread)."""
+        self._status_text = text
+        lbl = self.query_one("#status-indicator", Label)
+        if text:
+            lbl.update(text)
+            lbl.remove_class("hidden")
+        else:
+            lbl.update("")
+            lbl.add_class("hidden")
+
+    def _tick_spinner(self) -> None:
+        """set_interval enquanto houver worker ativo — redesenha o status com
+        um frame de spinner + segundos decorridos, pra nunca parecer travado."""
+        if not self._status_text:
+            return
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
+        elapsed = int(time.monotonic() - self._spinner_started_at)
+        frame = self._SPINNER_FRAMES[self._spinner_idx]
+        try:
+            self.query_one("#status-indicator", Label).update(f"{frame} {self._status_text} · {elapsed}s")
+        except Exception:
+            pass
+
+    def _start_task(self) -> None:
+        """Chamar (via call_from_thread) quando um worker/orquestrador/pipeline
+        começa a rodar. Contador, não bool — <DELEGATE> soltos rodam em
+        paralelo, um bool zeraria cedo demais com o primeiro que terminasse."""
+        self._active_workers += 1
+        if self._active_workers == 1:
+            # Início de um novo lote de trabalho (não de um <DELEGATE> paralelo
+            # adicional, que cai no ramo abaixo) — sempre reseta o pino e vai
+            # pra Atividade. Durante o lote, se o usuário trocar de aba na mão,
+            # on_tabbed_content_tab_activated marca _stage_pinned=True e mais
+            # nenhum worker deste MESMO lote força a volta (só chamamos
+            # _stage_show aqui, uma vez por lote, nunca de novo até zerar).
+            self._stage_pinned = False
+            self._spinner_started_at = time.monotonic()
+            if self._spinner_timer is None:
+                self._spinner_timer = self.set_interval(0.12, self._tick_spinner)
+            self._stage_show("stage-activity")
+            self._set_activity_running(True)
+
+    def _end_task(self) -> None:
+        """Chamar (via call_from_thread) quando um worker/orquestrador/pipeline
+        termina — só desliga o spinner e despina o palco quando NENHUM outro
+        worker paralelo ainda está rodando."""
+        self._active_workers = max(0, self._active_workers - 1)
+        if self._active_workers == 0:
+            self._set_activity_running(False)
+            if self._spinner_timer is not None:
+                self._spinner_timer.stop()
+                self._spinner_timer = None
+            # O usuário trocou de aba na mão (stage_pinned) e ficou olhando
+            # outra coisa (não a Atividade) enquanto isso terminava — um toast
+            # avisa sem forçar a troca de volta.
+            try:
+                stage = self.query_one("#stage-tabs", TabbedContent)
+                if self._stage_pinned and stage.active != "stage-activity":
+                    self.notify("A equipe terminou — veja em ⚡ Atividade (Ctrl+1).", timeout=5)
+            except Exception:
+                pass
+            self._stage_pinned = False
+            self._set_status("")
 
     def _should_auto_approve(self, config: dict, changed_files: list[str]) -> bool:
         """Gate por risco (nasce desligado): True só quando risk_gates.enabled
