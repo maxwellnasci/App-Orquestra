@@ -2583,13 +2583,28 @@ def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
     return cmd, "claude", None
 
 
+# PLANO_PALCO_CHAT.md, Etapa 0b: o bloco "QUEM VOCÊ É" depende do motor real.
+# binary="brain"/"ollama-cloud" → chat completions puro, zero ferramentas de verdade.
+# binary="agy"/"claude"/"codex" → roda em modo plano/read-only (_build_orchestrator_cmd):
+# LÊ arquivo e roda comando de leitura de verdade pra dar contexto melhor, só não
+# escreve. Dizer "não lê arquivos" pra esses motores é falso e contradiz o que o
+# próprio ~/.codex/AGENTS.md do usuário diz ("pode ler e analisar livremente").
+_ORCH_QUEM_VOCE_E_SEM_FERRAMENTAS = """QUEM VOCÊ É
+Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você NÃO
+tem ferramentas: não lê arquivos, não escreve código, não roda comandos — é incapaz
+disso por construção. Todo trabalho braçal é feito pela sua equipe."""
+
+_ORCH_QUEM_VOCE_E_READONLY = """QUEM VOCÊ É
+Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você roda
+em modo plano/read-only: PODE ler arquivos e rodar comandos de leitura pra entender o
+projeto de verdade antes de responder — mas NÃO escreve arquivo nem roda nada que
+altere o estado do projeto. Implementar é sempre delegado pra sua equipe, nunca feito
+por você mesmo."""
+
 _ORCH_SYSTEM = """Você é o Orquestra — o ESTRATEGISTA que coordena o projeto '{projeto}'.
 Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso total a ela).
 
-QUEM VOCÊ É
-Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você NÃO
-tem ferramentas: não lê arquivos, não escreve código, não roda comandos — é incapaz
-disso por construção. Todo trabalho braçal é feito pela sua equipe.
+{quem_voce_e}
 
 SUA EQUIPE (você aciona com a tag <DELEGATE>)
 - binary="operador"    → EXECUTA: lê o código, escreve, altera, roda comandos, cria
@@ -2702,10 +2717,16 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
     'Histórico da Conversa:\\n' é o ponto onde orchestrator_brain.py corta
     system/user, então não mude essa string."""
     import datetime as _dt
+    orq_binary = config.get("roles", {}).get("orquestrador", {}).get("binary", "brain")
+    quem_voce_e = (
+        _ORCH_QUEM_VOCE_E_READONLY if orq_binary in ("agy", "claude", "codex")
+        else _ORCH_QUEM_VOCE_E_SEM_FERRAMENTAS
+    )
     system = _ORCH_SYSTEM.format(
         projeto=Path(get_project_dir()).name,
         agora=_dt.datetime.now().strftime("%d/%m/%Y %H:%M"),
         cwd=get_project_dir(),
+        quem_voce_e=quem_voce_e,
     )
     memory_block = (
         f"\nFatos e lições conhecidos (memória de longo prazo, não é o histórico da conversa):\n{memory_context}\n"
@@ -2753,15 +2774,28 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
 
 
 def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection",
-                             timeout_s: int, output_file: str | None = None) -> tuple:
+                             timeout_s: int, output_file: str | None = None,
+                             detail: str = "normal") -> tuple:
     """Roda uma chamada do PRÓPRIO orquestrador (decisão inicial do turno ou
     _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
     silêncio total + spinner genérico de antes da reforma — e com um timeout
     de verdade (mata o processo se passar de timeout_s), a mesma garantia que
-    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok)."""
+    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok).
+
+    detail: narra tool calls/texto ao vivo (PLANO_PALCO_CHAT.md, Etapa 0a) —
+    reaproveita o mesmo parser do motor que os operários já usam
+    (_narrate_codex_line/_narrate_claude_line/_narrate_agy_line), só pelos
+    efeitos colaterais em section.write()/section.tool_call(). Quem decide
+    final_text/is_error de verdade continua sendo SÓ _capture_orchestrator_result
+    (+ o arquivo -o no Codex, tratado abaixo) — o narrador escreve num dict
+    descartável (narrator_state), nunca em `state`. brain/ollama-cloud não têm
+    tool calls (chat completions puro) — narrator fica None, nada muda pra eles."""
     state = {"final_text": "", "is_error": False}
     # brain/ollama-cloud emitem o mesmo envelope {"event":"result",...} que o agy
     kind = "agy" if binary in ("agy", "ollama-cloud", "brain") else ("codex" if binary == "codex" else "claude")
+    narrator = {"codex": _narrate_codex_line, "claude": _narrate_claude_line, "agy": _narrate_agy_line}.get(binary)
+    narrator_state = {"final_text": "", "is_error": False, "cost_usd": 0.0,
+                       "tokens_in": 0, "tokens_out": 0, "duration_ms": 0}
 
     try:
         proc = subprocess.Popen(
@@ -2807,6 +2841,8 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
             line = line.strip()
             if line:
                 _capture_orchestrator_result(line, kind, state)
+                if narrator is not None:
+                    narrator(line, section, narrator_state, detail=detail)
     finally:
         timer.cancel()
         stop_heartbeat.set()
@@ -2891,7 +2927,8 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     if section is None:
         section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
         section.open()
-    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile)
+    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile,
+                                        detail=_detail_level(config))
     if not ok:
         return ""
 
@@ -3117,7 +3154,29 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
         fd, output_file = tempfile.mkstemp(prefix="orquestra_codex_", suffix=".txt")
         os.close(fd)
         sandbox = "read-only" if read_only else "workspace-write"
-        cmd = ["codex", "exec", instruction,
+        # ~/.codex/AGENTS.md é GLOBAL: define o Codex como "Orquestrador" que só
+        # sugere, nunca executa sozinho. Isso é certo quando o Codex É o
+        # Orquestrador (_build_orchestrator_cmd) — mas aqui ele está rodando
+        # como Operador/Revisor (um worker de verdade, com permissão de
+        # escrita quando read_only=False). Sem este prefixo, o próprio Codex
+        # obedeceria o AGENTS.md global e recusaria editar, quebrando
+        # silenciosamente o Codex como operário (PLANO_PALCO_CHAT.md, achado
+        # A7/Etapa 0c). O AGENTS.md precisa ter a cláusula "[PAPEL: ...]
+        # prevalece" — ver seção "Se a instrução começar com [PAPEL: ...]".
+        papel = (
+            "[PAPEL: REVISOR — leitura, sem escrita]\n"
+            "As regras do AGENTS.md sobre \"Orquestrador\" NÃO se aplicam a esta "
+            "execução: você é o Revisor descrito naquele arquivo. Analise a tarefa "
+            "abaixo e responda com sua avaliação (bugs, riscos, sugestões) — você "
+            "está em sandbox read-only, não tente escrever nada.\n\n"
+            if read_only else
+            "[PAPEL: OPERADOR — executor com permissão de escrita]\n"
+            "As regras do AGENTS.md sobre \"Orquestrador\" NÃO se aplicam a esta "
+            "execução: você é o Operador descrito naquele arquivo. Execute a tarefa "
+            "abaixo de verdade (editar/criar arquivos, rodar comandos) — não pergunte "
+            "confirmação, você já foi autorizado a agir. Ao terminar, resuma o que fez.\n\n"
+        )
+        cmd = ["codex", "exec", papel + instruction,
                "--json", "--sandbox", sandbox,
                "--skip-git-repo-check",
                "-o", output_file]
@@ -3916,7 +3975,8 @@ def main():
                 cmd, cmd_binary, cmd_ofile = _build_orchestrator_cmd(role, prompt)
                 section = LiveSection(role_name.capitalize(), icon, color)
                 section.open()
-                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150, output_file=cmd_ofile)
+                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150,
+                                                    output_file=cmd_ofile, detail=_detail_level(config))
 
                 if not ok:
                     hard_fail = True

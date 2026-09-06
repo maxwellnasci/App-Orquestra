@@ -293,6 +293,41 @@ check(orquestra._detail_level({"ui": {"detail": "full"}}) == "full", "detalhe fu
 check(orquestra._detail_level({}) == "normal", "detalhe default normal")
 
 
+# ── PLANO_PALCO_CHAT.md Etapa 0b: prompt do Orquestrador coerente com o motor
+print("build_orchestrator_prompt — motor coerente (Etapa 0b)")
+
+_cfg_brain = {"roles": {"orquestrador": {"binary": "brain"}}}
+_p_brain = orquestra.build_orchestrator_prompt(_cfg_brain, [], "")
+check("NÃO\ntem ferramentas" in _p_brain, "brain: mantém 'NÃO tem ferramentas'")
+check("pode ler" not in _p_brain.lower(), "brain: não promete leitura")
+
+_cfg_codex = {"roles": {"orquestrador": {"binary": "codex"}}}
+_p_codex = orquestra.build_orchestrator_prompt(_cfg_codex, [], "")
+check("PODE ler arquivos" in _p_codex, "codex: promete que PODE ler")
+check("não lê arquivos" not in _p_codex, "codex: não nega mais a leitura")
+
+for _b in ("claude", "agy"):
+    _p = orquestra.build_orchestrator_prompt({"roles": {"orquestrador": {"binary": _b}}}, [], "")
+    check("PODE ler arquivos" in _p, f"{_b}: promete que PODE ler")
+
+
+# ── PLANO_PALCO_CHAT.md Etapa 0c: Codex operário recebe o papel explícito
+print("_build_worker_cmd — papel explícito pro Codex (Etapa 0c)")
+
+_worker = {"model": "", "env_file": ""}
+_cmd, _env, _ofile = orquestra._build_worker_cmd(_worker, "codex", "faz X", read_only=False)
+check(_cmd[2].startswith("[PAPEL: OPERADOR"), "codex operador: prefixo [PAPEL: OPERADOR")
+check("faz X" in _cmd[2], "codex operador: instrução original preservada")
+
+_cmd_ro, _env_ro, _ofile_ro = orquestra._build_worker_cmd(_worker, "codex", "revê Y", read_only=True)
+check(_cmd_ro[2].startswith("[PAPEL: REVISOR"), "codex revisor (read_only): prefixo [PAPEL: REVISOR")
+for _f in (_ofile, _ofile_ro):
+    try:
+        Path(_f).unlink()
+    except OSError:
+        pass
+
+
 print()
 if FAILS:
     print(f"\033[31m✗ {len(FAILS)} falha(s):\033[0m")

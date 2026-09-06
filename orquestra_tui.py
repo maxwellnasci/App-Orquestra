@@ -164,24 +164,34 @@ class ModelSelectionModal(ModalScreen[str]):
 class _TUILiveSection:
     """Shim que substitui a LiveSection do Rich por callbacks para a TUI.
     Permite chamar _run_worker_headless / _run_orchestrator_stream do orquestra.py
-    sem alterar nada naquele arquivo."""
-    def __init__(self, label: str, on_line, on_close, on_status=None):
+    sem alterar nada naquele arquivo.
+
+    on_tool (PLANO_PALCO_CHAT.md, Etapa 0e): callback opcional, separado de
+    on_status — cada tool_call() também é reportado aqui, além de ir pro
+    status. Hoje (antes do palco existir) fica None em todo mundo e o
+    comportamento é idêntico ao de sempre (tool_call só no status); quando a
+    aba "⚡ Atividade" existir (Etapa 2), passa a receber uma linha por
+    chamada, sem tirar o status de 1 linha que já funciona."""
+    def __init__(self, label: str, on_line, on_close, on_status=None, on_tool=None):
         self.label = label
         self._on_line = on_line
         self._on_close = on_close
         self._on_status = on_status
+        self._on_tool = on_tool
 
     def open(self): pass
     def end_line(self): pass
-    
+
     def write(self, text: str):
         if text.strip():
             self._on_line(text)
 
     def tool_call(self, text: str):
+        if self._on_tool:
+            self._on_tool(text)
         if self._on_status:
             self._on_status(f"[dim]⏳ {text}[/dim]")
-        else:
+        elif not self._on_tool:
             self._on_line(f"[dim]⏳ {text}[/dim]")
 
     def close(self, ok: bool = True, error_detail: str = "", changes_summary: str = ""):
@@ -1290,7 +1300,15 @@ class OrquestraTUI(App):
 
         section = _TUILiveSection("Orquestrador", lambda t: None, lambda *a: None, on_status)
         section.open()
-        final_text, ok = orquestra._run_orchestrator_stream(cmd, env, binary, section, timeout_s=150, output_file=ofile)
+        # Etapa 0d: Codex lendo um repo em modo read-only pode legitimamente
+        # passar dos 150s que bastavam pro brain/DeepSeek (chat direto, sem
+        # ferramenta nenhuma) — timeout curto pra ele virava "sem resposta"
+        # sem causa clara.
+        timeout_s = 300 if binary == "codex" else 150
+        final_text, ok = orquestra._run_orchestrator_stream(
+            cmd, env, binary, section, timeout_s=timeout_s, output_file=ofile,
+            detail=orquestra._detail_level(config),
+        )
         on_status("")
 
         if not ok or not final_text:
