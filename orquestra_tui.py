@@ -249,6 +249,7 @@ class OrquestraTUI(App):
         Binding("ctrl+up", "resize_chat(1)", "Chat maior", show=False),
         Binding("ctrl+down", "resize_chat(-1)", "Chat menor", show=False),
         Binding("ctrl+l", "focus_chat", "Foco no chat", show=False),
+        Binding("ctrl+k", "clear_activity", "Limpar Atividade", show=False),
     ]
 
     _CHAT_DOCK_SIZES = ("compact", "normal", "tall")
@@ -539,7 +540,7 @@ class OrquestraTUI(App):
 
             with TabbedContent(id="stage-tabs", initial="stage-activity"):
                 with TabPane("⚡ Atividade", id="stage-activity"):
-                    yield RichLog(id="activity-log", markup=True, wrap=True, min_width=1)
+                    yield RichLog(id="activity-log", markup=True, wrap=True, min_width=1, max_lines=2000)
                 with TabPane("± Mudanças", id="stage-changes"):
                     yield Label("Nenhuma mudança pendente.", id="changes-header")
                     yield RichLog(id="diff-log", markup=True, wrap=False, min_width=1)
@@ -655,6 +656,10 @@ class OrquestraTUI(App):
             btn.add_class("active")
             btn.label = "🎓 Aprendizado [✓]"
             self.query_one("#editor-toolbar").remove_class("hidden")
+
+        # Etapa 5: preferências de layout persistidas entre sessões.
+        self._apply_chat_dock_size(cfg.get("ui", {}).get("chat_dock_size", "normal"))
+        self._stage_follow: bool = bool(cfg.get("ui", {}).get("stage_follow", True))
 
         self._update_usage_footer()
         self._refresh_changes_panel()  # mudança pendente de uma sessão anterior, se houver
@@ -1272,19 +1277,34 @@ class OrquestraTUI(App):
             btn.label = "📁 Arquivos [✓]"
 
     def action_resize_chat(self, direction: int) -> None:
-        """Ctrl+↑/Ctrl+↓: alterna o chat-dock entre compact ↔ normal ↔ tall."""
+        """Ctrl+↑/Ctrl+↓: alterna o chat-dock entre compact ↔ normal ↔ tall.
+        Persiste em ui.chat_dock_size (Etapa 5) — sobrevive entre sessões."""
+        import orquestra, json
         dock = self.query_one("#chat-dock")
         current = "compact" if dock.has_class("compact") else ("tall" if dock.has_class("tall") else "normal")
         idx = self._CHAT_DOCK_SIZES.index(current)
         idx = max(0, min(len(self._CHAT_DOCK_SIZES) - 1, idx + direction))
-        dock.remove_class("compact", "tall")
         new_size = self._CHAT_DOCK_SIZES[idx]
-        if new_size != "normal":
-            dock.add_class(new_size)
+        self._apply_chat_dock_size(new_size)
+        config = orquestra.load_config()
+        config.setdefault("ui", {})["chat_dock_size"] = new_size
+        with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+    def _apply_chat_dock_size(self, size: str) -> None:
+        dock = self.query_one("#chat-dock")
+        dock.remove_class("compact", "tall")
+        if size in ("compact", "tall"):
+            dock.add_class(size)
 
     def action_focus_chat(self) -> None:
         """Ctrl+L: foco direto no campo de texto do chat."""
         self.query_one("#chat-input").focus()
+
+    def action_clear_activity(self) -> None:
+        """Ctrl+K: limpa a aba ⚡ Atividade (Etapa 5) — não mexe no chat nem
+        no histórico salvo, só a narração ao vivo acumulada na tela."""
+        self.query_one("#activity-log", RichLog).clear()
 
     # ── Chat: Recebe o Enter do usuário ───────────────────────────────────────
 
@@ -1375,6 +1395,26 @@ class OrquestraTUI(App):
                 "o Orquestrador comenta o resultado em vez do chat só mostrar a resposta crua "
                 "do worker (custa 1 chamada extra por tarefa).[/dim]\n"
             )
+        elif head in ("/seguir", "/follow"):
+            config = orquestra.load_config()
+            ui_cfg = config.setdefault("ui", dict(orquestra.DEFAULT_CONFIG["ui"]))
+            if len(parts) > 1 and parts[1].lower() in ("on", "ligado", "ativar", "true"):
+                ui_cfg["stage_follow"] = True
+            elif len(parts) > 1 and parts[1].lower() in ("off", "desligado", "desativar", "false"):
+                ui_cfg["stage_follow"] = False
+            elif len(parts) > 1:
+                log.write("\n[dim]Uso: /seguir on | off (sem argumento mostra o status atual)[/dim]\n")
+                return
+            if len(parts) > 1:
+                self._stage_follow = ui_cfg["stage_follow"]
+                with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+            estado = "[green]ligado[/green]" if ui_cfg.get("stage_follow", True) else "[dim]desligado[/dim]"
+            log.write(
+                f"\n🎯 Palco segue a atividade: {estado}\n"
+                "[dim]Quando ligado, o palco pula sozinho pra ⚡ Atividade a cada tarefa nova. "
+                "Desligado, você controla a aba na mão (Ctrl+1..4) o tempo todo.[/dim]\n"
+            )
         elif head in ("/quem", "/autor"):
             if len(parts) < 2:
                 log.write("\n[dim]Uso: /quem <caminho/do/arquivo>[/dim]\n")
@@ -1420,8 +1460,11 @@ class OrquestraTUI(App):
         elif head in ("/ajuda", "/help"):
             log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
                       "/modo chat|tecnico · /detalhe minimal|normal|full · "
-                      "/risco on|off · /relato on|off · /quem <arquivo> · /uso · /saldo · "
-                      "botões do topo trocam os modelos[/dim]\n")
+                      "/risco on|off · /relato on|off · /seguir on|off · "
+                      "/quem <arquivo> · /uso · /saldo · botões do topo trocam os modelos\n"
+                      "Atalhos: Ctrl+1..4 aba do palco · Ctrl+B Arquivos · "
+                      "Ctrl+↑/↓ tamanho do chat · Ctrl+K limpa a Atividade · "
+                      "Ctrl+L foco no chat · Ctrl+S/Ctrl+W salvar/fechar aba[/dim]\n")
         else:
             log.write(f"\n[dim]Comando não reconhecido: {cmd}[/dim]\n")
 
@@ -2259,14 +2302,35 @@ class OrquestraTUI(App):
         self.query_one("#chat-input").disabled = False
         self.query_one("#chat-input").focus()
 
+    # Etapa 5 (polimento) — cor por agente na Atividade. Baseado no `label`
+    # (não no worker_cfg["color"] repassado por 19 call sites diferentes —
+    # os nomes já são estáveis e conhecidos, então um lookup aqui é bem menos
+    # invasivo que passar `color` em toda chamada de `_activity`).
+    _ACTIVITY_COLORS = {
+        "Orquestrador": "cyan", "Orquestra": "cyan",
+        "Operador": "green", "Revisor": "blue", "Cão de Guarda": "yellow",
+    }
+
     def _activity(self, who_icon: str, who: str, text: str) -> None:
         """Escreve uma linha na aba "⚡ Atividade" do palco — PLANO_PALCO_CHAT.md,
         Etapa 2. Thread-safe: chama de qualquer thread, se encarrega do
-        call_from_thread sozinho (quem chama não precisa lembrar disso)."""
+        call_from_thread sozinho (quem chama não precisa lembrar disso).
+
+        Etapa 5: texto multi-linha colapsa pra 1ª linha + "(+N linhas)" —
+        `/detalhe full` mostra inteiro. Sem isso, um prompt/resposta de 40
+        linhas empurraria tudo mais pra fora da tela visível de uma vez só."""
         if not text or not text.strip():
             return
+        import orquestra
+        detail = orquestra._detail_level(orquestra.load_config())
+        esc = rich_escape(text)
+        lines = esc.splitlines()
+        body = esc if (detail == "full" or len(lines) <= 1) else f"{lines[0]} [dim](+{len(lines) - 1} linhas)[/dim]"
+
         ts = time.strftime("%H:%M:%S")
-        line = f"[dim]{ts}[/dim] {who_icon} [bold]{who}[/bold]  {rich_escape(text)}"
+        color = self._ACTIVITY_COLORS.get(who, "")
+        who_style = f"bold {color}" if color else "bold"
+        line = f"[dim]{ts}[/dim] {who_icon} [{who_style}]{who}[/{who_style}]  {body}"
 
         def _write():
             try:
@@ -2319,7 +2383,11 @@ class OrquestraTUI(App):
             self._spinner_started_at = time.monotonic()
             if self._spinner_timer is None:
                 self._spinner_timer = self.set_interval(0.12, self._tick_spinner)
-            self._stage_show("stage-activity")
+            # Etapa 5: ui.stage_follow=False (/seguir off) deixa o usuário
+            # gerenciar a aba do palco na mão o tempo todo, sem o "pulo"
+            # automático pra Atividade a cada tarefa nova.
+            if getattr(self, "_stage_follow", True):
+                self._stage_show("stage-activity")
             self._set_activity_running(True)
 
     def _end_task(self) -> None:

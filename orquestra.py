@@ -141,6 +141,10 @@ DEFAULT_CONFIG = {
         # parâmetro orchestrator_react de _run_worker (esse é do Modo
         # Aprendizado, sempre read_only=True — os dois não se misturam).
         "orchestrator_reports": True,
+        # Etapa 5 (polimento): preferências de layout do palco/chat que
+        # sobrevivem entre sessões.
+        "chat_dock_size": "normal",   # "compact" | "normal" | "tall"
+        "stage_follow": True,         # False = não pula sozinho pra Atividade ao disparar um worker
     },
     # Open Design (nexu-io/open-design) — prévia visual real de mudanças de UI.
     # repo_path = clone; node_bin_dir = Node oficial (o do Kali não roda TS);

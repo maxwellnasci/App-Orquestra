@@ -41,8 +41,20 @@
 > Testado: relato substitui a bolha crua (Operador e pipeline, 1 chamada por
 > etapa), `suppress_report` nunca chama `_orchestrator_react`, `/relato off`
 > grava a config de verdade, e com `orchestrator_reports=False` o
-> comportamento das Etapas 2/3 continua intacto (regressão). Falta só a
-> Etapa 5 (polimento, opcional).
+> comportamento das Etapas 2/3 continua intacto (regressão).
+>
+> **Etapa 5 (polimento) também pronta — plano completo, 6/6 etapas.** Cor
+> por agente na Atividade (lookup por `label`, não por parâmetro extra em 19
+> call sites), `Ctrl+K` limpa a Atividade, texto multi-linha colapsa (1ª
+> linha + "(+N linhas)", `/detalhe full` mostra tudo), `ui.chat_dock_size` e
+> `ui.stage_follow` persistidos (`/seguir on|off` novo, mesmo padrão de
+> `/risco`/`/relato`). `codex exec resume --last` deliberadamente NÃO
+> implementado — só anotado no `ROADMAP.md`, precisa validar primeiro se
+> mantém `--sandbox read-only`/`-o`. Documentação atualizada em
+> `README.md`/`AGENTES.md`/`NOTAS_TUI.md`/`CHANGELOG.md`/`ROADMAP.md`/
+> `APRENDIZADOS.md §11`. Ver `APRENDIZADOS.md §11` pro achado do
+> `RichLog.write()` adiando renderização em aba inativa — não previsto em
+> nenhuma revisão anterior, encontrado só ao escrever o teste da Etapa 3.
 
 ---
 
