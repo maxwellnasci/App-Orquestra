@@ -466,7 +466,7 @@ class OrquestraTUI(App):
         padding: 0 1;
     }
 
-    #action-bar, #plan-bar {
+    #action-bar, #plan-bar, #delegate-bar {
         height: 3;
         layout: horizontal;
         align: center middle;
@@ -475,7 +475,7 @@ class OrquestraTUI(App):
         border-top: solid $primary-background;
     }
 
-    #action-bar.hidden, #plan-bar.hidden {
+    #action-bar.hidden, #plan-bar.hidden, #delegate-bar.hidden {
         display: none;
     }
 
@@ -578,6 +578,12 @@ class OrquestraTUI(App):
                 yield Button("✅ Aprovar", id="btn-approve", classes="action-btn", variant="success")
                 yield Button("❌ Rejeitar", id="btn-reject", classes="action-btn", variant="error")
                 yield Button("🔍 Revisar", id="btn-review", classes="action-btn")
+            # Barra de confirmação de delegação avulsa (achado A1) — aparece
+            # quando o Orquestrador emite <DELEGATE>/<PIPELINE> sem que o usuário
+            # tenha aprovado um <PLANO> antes. `/auto on` some com ela.
+            with Container(id="delegate-bar", classes="hidden"):
+                yield Button("▶ Rodar agora", id="btn-run-delegates", classes="action-btn", variant="success")
+                yield Button("✋ Cancelar", id="btn-cancel-delegates", classes="action-btn", variant="error")
             yield ChatInput(placeholder="Digite aqui... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
 
         # ── Rodapés ───────────────────────────────────────────────────────────
@@ -617,6 +623,18 @@ class OrquestraTUI(App):
         self._suggestion_counter: int = 0
         self._pending_attribution: dict | None = None  # agente/instrução/arquivos da mudança aguardando aprovação
         self._plan_steps: list[dict] = []       # [{"text","status"}] do <PLANO>/<PIPELINE> ativo — painel "📋 Plano"
+        # Achado A2: o que já estava sujo ANTES da tarefa atual começar. A
+        # rejeição ("❌ Rejeitar") nunca reverte esses arquivos — são edição
+        # manual sua ou de outra tarefa. Preenchido em _warn_pending_manual_edits
+        # (chokepoint único: chamado no início de todo worker/pipeline/open-design).
+        self._task_baseline_dirty: set = set()
+        # Achado A1: True só na janela entre "▶ Executar plano" e a resposta do
+        # Orquestrador com os <DELEGATE> daquele plano — libera essa delegação
+        # sem re-confirmar. One-shot: lido e zerado no mesmo turno.
+        self._delegates_preapproved: bool = False
+        # Achado A1: {"delegates":[(tag,instr)], "pipelines":[[(tag,instr)]]}
+        # aguardando o clique em "▶ Rodar agora" da #delegate-bar.
+        self._pending_delegates: dict | None = None
 
         # PLANO_PALCO_CHAT.md, Etapa 2 — palco segue a atividade + spinner.
         # Contador, não bool (furo nº2 da revisão): <DELEGATE> soltos rodam em
@@ -722,22 +740,11 @@ class OrquestraTUI(App):
         # dos botões já foram setadas em on_mount.
 
     def _binary_from_model(self, model_id: str) -> str:
-        """Infere qual binary usar a partir do ID do modelo."""
-        m = model_id.lower()
-        if "openrouter" in m:
-            return "opencode"  # ANTES dos outros checks: "deepseek"/"qwen"/"glm" bateriam errado
-        if "claude" in m and "haiku" not in m and "deepseek" not in m:
-            return "claude"
-        if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
-            if "oss" in m: return "ollama-cloud"
-            return "codex"
-        if "copilot" in m or m.startswith("claude-haiku"):
-            return "copilot"
-        if "deepseek" in m:
-            return "claude"  # DeepSeek usa interface claude com endpoint alternativo
-        if "kimi" in m or "nemotron" in m or "mistral" in m or "minimax" in m or "glm" in m or "gemma" in m or "qwen" in m:
-            return "ollama-cloud"
-        return "agy"  # Gemini / Antigravity
+        """Infere qual binary usar a partir do ID do modelo. Delega pra
+        orquestra.engine_for_model (fonte única) — 'brain' aqui = chat puro
+        (gpt-oss/kimi/…), barrado no _set_worker_model."""
+        import orquestra
+        return orquestra.engine_for_model(model_id).get("binary", "agy")
 
     def _agent_models(self) -> dict:
         """Só provedores que têm CLI de agente com ferramentas (Operador/Revisor).
@@ -747,15 +754,36 @@ class OrquestraTUI(App):
     def _set_worker_model(self, slot: str, selected: str) -> bool:
         """Valida e persiste a troca de modelo de um operário. Retorna False
         (e avisa no chat) se o modelo não roda como agente com ferramentas."""
-        binary = self._binary_from_model(selected)
-        if binary in ("ollama-cloud", "brain"):
+        import orquestra
+        eng = orquestra.engine_for_model(selected)
+        if eng.get("binary") in ("ollama-cloud", "brain"):
             self.query_one("#chat-log", RichLog).write(
                 f"\n[yellow]⚠ '{selected}' é um modelo de chat puro (sem ferramentas) — "
                 f"não serve pro {slot}, que precisa ler/escrever arquivos. "
                 f"Escolha um Claude, Gemini, Codex ou DeepSeek.[/yellow]\n")
             return False
-        self._persist_agent(slot, binary=binary, model=selected)
+        # Persiste binary + model juntos; _persist_agent deriva o env_file do
+        # modelo (nunca fica binary=claude/env=deepseek com um modelo Gemini).
+        self._persist_agent(slot, binary=eng["binary"], model=selected)
         return True
+
+    def _sync_model_headers_from_disk(self, config: dict) -> None:
+        """Re-alinha os seletores Op:/Rev: com o que está salvo no disco. O
+        processo da TUI pode ficar de pé por horas; se a config mudou por fora
+        (outra sessão, edição manual), a memória do header fica velha e o
+        worker rodava com um modelo que não é mais o configurado. Chamar no
+        início de cada execução de operário."""
+        workers = config.get("workers", {})
+        disk_op = workers.get("operador", {}).get("model", "")
+        disk_rev = workers.get("revisor", {}).get("model", "")
+        if disk_op and disk_op != self._op_model:
+            self._op_model = disk_op
+            self.call_from_thread(
+                lambda: setattr(self.query_one("#btn-sel-op"), "label", f"Op: {shorten_name(disk_op)}"))
+        if disk_rev and disk_rev != self._rev_model:
+            self._rev_model = disk_rev
+            self.call_from_thread(
+                lambda: setattr(self.query_one("#btn-sel-rev"), "label", f"Rev: {shorten_name(disk_rev)}"))
 
     def _brain_provider_from_model(self, m: str) -> str:
         """Fallback quando o modelo não está no _model_provider (lista não carregou)."""
@@ -808,15 +836,23 @@ class OrquestraTUI(App):
             target = config.setdefault("roles", {}).setdefault("orquestrador", {})
         else:
             target = config.setdefault("workers", {}).setdefault(slot, {})
+        # env_file=None (ou "") nos fields = pedido explícito de REMOÇÃO.
+        for k, v in list(fields.items()):
+            if v is None:
+                fields.pop(k)
+                target.pop(k, None)
         target.update(fields)
         if slot == "orquestrador" and fields.get("binary") != "brain":
             target.pop("provider", None)   # agy/claude/codex não usam provider
-        _model = str(fields.get("model", ""))
-        _wants_ds_env = "deepseek-v4" in _model and fields.get("binary") == "claude"
-        if _wants_ds_env:
-            target["env_file"] = str(orquestra.DEEPSEEK_ENV)
-        elif fields.get("binary") in ("agy", "codex", "brain") or (slot != "orquestrador" and fields.get("binary") != "claude"):
-            target.pop("env_file", None)
+        # Coerência final: se dá pra derivar o motor do modelo salvo, o env_file
+        # segue o modelo (DeepSeek→env; qualquer outro→sem env). Só o
+        # Orquestrador (que tem rotas próprias) fica de fora.
+        if slot != "orquestrador":
+            eng = orquestra.engine_for_model(str(target.get("model", "")))
+            if eng.get("env_file"):
+                target["env_file"] = eng["env_file"]
+            else:
+                target.pop("env_file", None)
         with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
@@ -932,7 +968,24 @@ class OrquestraTUI(App):
             log = self.query_one("#chat-log", RichLog)
             log.write("\n[bold green]▶ Executando o plano...[/bold green]\n")
             self.query_one("#chat-input").disabled = True
+            # A1: o usuário aprovou este plano — os <DELEGATE> que o Orquestrador
+            # emitir no próximo turno já estão autorizados, não pedem confirmação.
+            self._delegates_preapproved = True
             self._run_orchestrator("Aprovado. Execute o plano agora — emita os <DELEGATE>/<PIPELINE>.")
+
+        elif event.button.id == "btn-run-delegates":
+            self._hide_delegate_bar()
+            data = self._pending_delegates or {"delegates": [], "pipelines": []}
+            self._pending_delegates = None
+            self.query_one("#chat-log", RichLog).write("\n[bold green]▶ Rodando a delegação...[/bold green]\n")
+            self._dispatch_delegates(data["delegates"], data["pipelines"])
+
+        elif event.button.id == "btn-cancel-delegates":
+            self._hide_delegate_bar()
+            self._pending_delegates = None
+            self.query_one("#chat-log", RichLog).write(
+                "\n[dim]✋ Delegação cancelada — nada rodou. Diga como quer seguir.[/dim]\n")
+            self._re_enable_input()
 
         elif event.button.id == "btn-adjust-plan":
             self.query_one("#plan-bar").add_class("hidden")
@@ -952,13 +1005,41 @@ class OrquestraTUI(App):
         elif decision == "reject":
             import orquestra
             self._pipeline_rest = None  # abandona o resto do pipeline
-            self._pending_attribution = None  # nada foi commitado — nada a atribuir
             self._clear_plan_panel()
-            revertidos = orquestra.revert_pending(orquestra.get_project_dir())
-            if revertidos:
-                log.write(f"\n[bold red]❌ Rejeitado — revertido:[/bold red] {revertidos}\n")
+            cwd = orquestra.get_project_dir()
+
+            # A2: reverter SÓ os arquivos desta tarefa. Antes, revert_pending()
+            # fazia checkout/clean da árvore inteira — apagava também edição
+            # manual sua e o trabalho de outra tarefa pendente no mesmo repo.
+            # 1ª fonte: a lista que o worker reportou (já é "sujo depois − sujo
+            # antes", calculada em _capture_worker_result). 2ª fonte (open-design
+            # e afins, sem atribuição): sujo agora − baseline desta tarefa.
+            task_files = {self._rel_to_repo(cwd, p)
+                          for p in ((self._pending_attribution or {}).get("files") or [])}
+            self._pending_attribution = None
+            if not task_files:
+                try:
+                    now_dirty = orquestra._git_dirty_files(cwd) or set()
+                except Exception:
+                    now_dirty = set()
+                task_files = now_dirty - self._task_baseline_dirty
+            protegidos = self._task_baseline_dirty & task_files
+            task_files -= protegidos
+
+            if task_files:
+                revertidos = orquestra.revert_pending(cwd, only=task_files)
+                log.write(f"\n[bold red]❌ Rejeitado — revertido:[/bold red] {revertidos or '(nada encontrado)'}\n")
             else:
-                log.write("\n[bold red]❌ Rejeitado.[/bold red] (nada a reverter)\n")
+                log.write(
+                    "\n[bold red]❌ Rejeitado.[/bold red] Não identifiquei com segurança os "
+                    "arquivos só desta tarefa, então não reverti nada sozinho — veja o diff em "
+                    "± Mudanças (Ctrl+2) e desfaça na mão o que não quiser "
+                    "([dim]git checkout -- <arquivo>[/dim]).\n"
+                )
+            if protegidos:
+                log.write(f"\n[dim]🛡️ Preservado (já estava modificado antes desta tarefa): "
+                          f"{', '.join(sorted(protegidos))}[/dim]\n")
+            self._task_baseline_dirty = set()
             self._refresh_changes_panel()
             self._re_enable_input()
         else:
@@ -1226,16 +1307,31 @@ class OrquestraTUI(App):
         self._pending_suggestions.pop(sug_id, None)
         self._remove_suggestion_card(sug_id)
 
+    @staticmethod
+    def _rel_to_repo(cwd: str, p: str) -> str:
+        """Normaliza um caminho pro formato do `git status --porcelain` (relativo
+        à raiz do repo) — o worker às vezes reporta caminho absoluto."""
+        try:
+            return str(Path(p).resolve().relative_to(Path(cwd).resolve()))
+        except (ValueError, OSError):
+            return p
+
     def _warn_pending_manual_edits(self, cwd: str, log: "RichLog") -> None:
         """Se já havia edição manual (Ctrl+S no Editor) não commitada antes de um
         worker começar, avisa no chat — evita confundir a origem de uma mudança
         no diff que o worker/Cão de Guarda vai revisar. Chamado de dentro de uma
-        thread de worker; usa call_from_thread pra escrever no log com segurança."""
+        thread de worker; usa call_from_thread pra escrever no log com segurança.
+
+        Chokepoint único de início de tarefa: aproveita pra guardar o baseline
+        de arquivos sujos (achado A2) — a rejeição nunca reverte o que já estava
+        modificado aqui. Delegações em paralelo compartilham este campo; a
+        rejeição prioriza a lista precisa que o worker reporta (_pending_attribution)."""
         import orquestra
         try:
-            dirty = orquestra._git_dirty_files(cwd)
+            dirty = orquestra._git_dirty_files(cwd) or set()
         except Exception:
-            return
+            dirty = set()
+        self._task_baseline_dirty = dirty
         if dirty:
             arquivos = ", ".join(sorted(dirty))
             self.call_from_thread(
@@ -1375,6 +1471,29 @@ class OrquestraTUI(App):
                 f"[dim]Quando ligado, pula a pausa de Aprovar se nenhum arquivo tocado bater nestes "
                 f"padrões (e o Cão de Guarda não achar nada): {padroes}[/dim]\n"
             )
+        elif head in ("/auto", "/autonomo", "/autônomo"):
+            config = orquestra.load_config()
+            ui_cfg = config.setdefault("ui", dict(orquestra.DEFAULT_CONFIG["ui"]))
+            # /auto ON = delegação avulsa roda sem pedir → confirm_delegates=False
+            if len(parts) > 1 and parts[1].lower() in ("on", "ligado", "ativar", "true"):
+                ui_cfg["confirm_delegates"] = False
+            elif len(parts) > 1 and parts[1].lower() in ("off", "desligado", "desativar", "false"):
+                ui_cfg["confirm_delegates"] = True
+            elif len(parts) > 1:
+                log.write("\n[dim]Uso: /auto on | off (sem argumento mostra o status atual)[/dim]\n")
+                return
+            if len(parts) > 1:
+                with open(orquestra.CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+            auto_on = not ui_cfg.get("confirm_delegates", True)
+            estado = "[green]ligado[/green]" if auto_on else "[dim]desligado[/dim]"
+            log.write(
+                f"\n⚡ Modo autônomo: {estado}\n"
+                "[dim]Ligado, um <DELEGATE>/<PIPELINE> que o Orquestrador emite fora de um "
+                "<PLANO> aprovado roda direto. Desligado (padrão), ele pede 1 confirmação antes — "
+                "o operário tem permissão total. Delegação dentro de um plano que você aprovou "
+                "nunca pede.[/dim]\n"
+            )
         elif head in ("/relato", "/report"):
             config = orquestra.load_config()
             ui_cfg = config.setdefault("ui", dict(orquestra.DEFAULT_CONFIG["ui"]))
@@ -1460,7 +1579,7 @@ class OrquestraTUI(App):
         elif head in ("/ajuda", "/help"):
             log.write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
                       "/modo chat|tecnico · /detalhe minimal|normal|full · "
-                      "/risco on|off · /relato on|off · /seguir on|off · "
+                      "/risco on|off · /auto on|off · /relato on|off · /seguir on|off · "
                       "/quem <arquivo> · /uso · /saldo · botões do topo trocam os modelos\n"
                       "Atalhos: Ctrl+1..4 aba do palco · Ctrl+B Arquivos · "
                       "Ctrl+↑/↓ tamanho do chat · Ctrl+K limpa a Atividade · "
@@ -1501,6 +1620,13 @@ class OrquestraTUI(App):
 
     def _run_orchestrator_body(self, prompt: str, log: "RichLog") -> None:
         import orquestra
+
+        # A1: consome o "pré-aprovado" agora (one-shot) — vale só pra ESTE turno,
+        # o que vem logo depois de "▶ Executar plano". Se o turno não trouxer
+        # <DELEGATE> nenhum, o flag some do mesmo jeito e a próxima delegação
+        # avulsa volta a pedir confirmação.
+        preapproved = self._delegates_preapproved
+        self._delegates_preapproved = False
 
         def on_status(text: str):
             self.call_from_thread(self._set_status, text)
@@ -1594,20 +1720,58 @@ class OrquestraTUI(App):
             return
 
         if delegates or pipelines:
-            _OD = ("open-design", "opendesign", "open_design")
-            for m in delegates:
-                bt = m.group(1).lower()
-                if bt in _OD:
-                    self._run_open_design(m.group(2).strip())
-                else:
-                    self._run_worker(bt, m.group(2).strip())
-            for steps in pipelines:
-                steps = [(t, i) for t, i in steps if t.lower() not in _OD]
-                if steps:
-                    self._run_pipeline_tui(steps)
+            deleg_tuples = [(m.group(1).lower(), m.group(2).strip()) for m in delegates]
+            gate_on = config.get("ui", {}).get("confirm_delegates", True)
+            if gate_on and not preapproved:
+                # A1: delegação avulsa (o Orquestrador não passou por um <PLANO>
+                # que você aprovou). Mostra o que vai rodar e espera 1 clique —
+                # operário só dispara depois do "▶ Rodar agora".
+                self._pending_delegates = {"delegates": deleg_tuples, "pipelines": pipelines}
+                self.call_from_thread(self._show_delegate_bar, deleg_tuples, pipelines)
+                return
+            self._dispatch_delegates(deleg_tuples, pipelines)
             return
 
         self.call_from_thread(self._re_enable_input)
+
+    def _dispatch_delegates(self, deleg_tuples: list, pipelines: list) -> None:
+        """Dispara de fato os <DELEGATE>/<PIPELINE> já parseados — chamado ou
+        direto (gate desligado / plano aprovado) ou pelo botão "▶ Rodar agora"
+        da #delegate-bar (achado A1). Mesma lógica de roteamento de antes."""
+        _OD = ("open-design", "opendesign", "open_design")
+        for bt, instr in deleg_tuples:
+            if bt in _OD:
+                self._run_open_design(instr)
+            else:
+                self._run_worker(bt, instr)
+        for steps in pipelines:
+            steps = [(t, i) for t, i in steps if t.lower() not in _OD]
+            if steps:
+                self._run_pipeline_tui(steps)
+
+    def _show_delegate_bar(self, deleg_tuples: list, pipelines: list) -> None:
+        """Lista o que a delegação avulsa vai rodar e revela a #delegate-bar."""
+        log = self.query_one("#chat-log", RichLog)
+        linhas = [f"  → [bold]{bt}[/bold]: {instr[:180]}" for bt, instr in deleg_tuples]
+        for steps in pipelines:
+            cadeia = " → ".join(t for t, _ in steps)
+            linhas.append(f"  → [bold]pipeline[/bold] ({cadeia})")
+        log.write(
+            "\n[bold yellow]⚠ O Orquestrador quer delegar sem passar por um plano.[/bold yellow]\n"
+            + "\n".join(linhas)
+            + "\n[dim]Confira — o operário roda com permissão total quando você libera. "
+            "[bold]/auto on[/bold] para de pedir isso nesta sessão.[/dim]\n"
+        )
+        self.query_one("#delegate-bar").remove_class("hidden")
+        # a delegação parou o turno: reabilita o input pro caso de você preferir
+        # digitar outra coisa em vez de clicar "▶ Rodar agora".
+        self._re_enable_input()
+
+    def _hide_delegate_bar(self) -> None:
+        try:
+            self.query_one("#delegate-bar").add_class("hidden")
+        except Exception:
+            pass
 
     # ── Worker: Operário (Implementador) ─────────────────────────────────────
 
@@ -1650,14 +1814,20 @@ class OrquestraTUI(App):
         self._warn_pending_manual_edits(cwd, log)
 
         config = orquestra.load_config()
+        self._sync_model_headers_from_disk(config)
         worker_cfg, actual_binary, label, icon, color = orquestra._resolve_worker(config, binary_tag)
         worker_cfg = dict(worker_cfg)
 
-        # Modelo escolhido no header: Rev: para o revisor, Op: para o resto.
+        # Modelo escolhido no header (Rev: pro revisor, Op: pro operador). Só os
+        # papéis canônicos seguem o header — <DELEGATE binary="codex"> etc. são
+        # atalhos de motor explícito e respeitam a própria config.
         canon = orquestra._WORKER_ALIASES.get(binary_tag.lower().strip(), binary_tag.lower().strip())
-        chosen = self._rev_model if canon == "revisor" else self._op_model
+        chosen = self._rev_model if canon == "revisor" else (self._op_model if canon == "operador" else "")
         if chosen:
-            worker_cfg["model"] = chosen
+            # binary + env_file DERIVADOS do modelo, não herdados da config —
+            # senão sai motor de um provedor com id de modelo de outro (→ 400).
+            worker_cfg = orquestra.apply_model_to_worker(worker_cfg, chosen)
+            actual_binary = worker_cfg["binary"]
 
         cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction, read_only=read_only)
 
@@ -2103,6 +2273,7 @@ class OrquestraTUI(App):
         cwd = orquestra.get_project_dir()
         self._warn_pending_manual_edits(cwd, log)
         config = orquestra.load_config()
+        self._sync_model_headers_from_disk(config)
 
         # Painel "📋 Plano": na primeira chamada (não-retomada) monta a lista
         # cheia de passos; numa retomada pós-aprovação, self._plan_steps já
@@ -2118,9 +2289,12 @@ class OrquestraTUI(App):
             worker_cfg, actual_binary, label, icon, color = orquestra._resolve_worker(config, tag)
             worker_cfg = dict(worker_cfg)
             canon = orquestra._WORKER_ALIASES.get(tag.lower().strip(), tag.lower().strip())
-            chosen = self._rev_model if canon == "revisor" else self._op_model
+            chosen = self._rev_model if canon == "revisor" else (self._op_model if canon == "operador" else "")
             if chosen:
-                worker_cfg["model"] = chosen
+                # binary + env_file coerentes com o modelo escolhido (ver
+                # _run_worker_body) — nunca só troca o `model` por cima.
+                worker_cfg = orquestra.apply_model_to_worker(worker_cfg, chosen)
+                actual_binary = worker_cfg["binary"]
 
             full = instruction
             if previous:

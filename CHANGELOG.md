@@ -1,5 +1,25 @@
 # Changelog Orquestra
 
+## Não lançado — endurecimento pós-análise de segurança (set/2026)
+
+Análise ponta a ponta (relatório em `ANALISE_PONTA_A_PONTA_2026-09-08.md`).
+Dois achados corrigidos:
+
+- **A1 — delegação avulsa não tinha gate.** Um `<DELEGATE>`/`<PIPELINE>` que o
+  Orquestrador emitia **fora** de um `<PLANO>` aprovado disparava o operário na
+  hora, sem confirmação — e o operário roda com permissão total. Agora aparece
+  a barra **▶ Rodar agora / ✋ Cancelar** com a lista do que vai rodar.
+  Delegação **dentro** de um plano que você aprovou (botão ▶ Executar plano)
+  continua sem pedir nada. Toggle `/auto on|off` (`ui.confirm_delegates`,
+  nasce ligado = pede confirmação).
+- **A2 — "❌ Rejeitar" apagava a árvore inteira.** `revert_pending()` fazia
+  `git checkout`/`clean` de **tudo** que estava sujo — inclusive edição manual
+  sua no Editor e o trabalho de outra tarefa pendente no mesmo repo. Agora
+  reverte só os arquivos daquela tarefa (`revert_pending(only=...)`), usando a
+  lista que o worker reporta (`changed_files`, que já é "sujo depois − sujo
+  antes") e, como reforço, um baseline capturado no início da tarefa. Arquivos
+  que já estavam modificados aparecem como **🛡️ Preservado** no chat.
+
 ## V6 — Palco + Chat (set/2026)
 
 Layout novo (`PLANO_PALCO_CHAT.md`, plano revisado e implementado em 5 etapas):

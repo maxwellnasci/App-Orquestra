@@ -145,6 +145,13 @@ DEFAULT_CONFIG = {
         # sobrevivem entre sessões.
         "chat_dock_size": "normal",   # "compact" | "normal" | "tall"
         "stage_follow": True,         # False = não pula sozinho pra Atividade ao disparar um worker
+        # Achado A1: um <DELEGATE>/<PIPELINE> avulso (que NÃO veio de um <PLANO>
+        # que o usuário aprovou) pede 1 confirmação antes de o operário rodar —
+        # os operários têm permissão total, então delegação "por fora" do plano
+        # não deve disparar sozinha. Nasce LIGADO; `/auto on` desliga por sessão
+        # (projeto seu, de confiança). Delegação DENTRO de um plano aprovado não
+        # é afetada.
+        "confirm_delegates": True,
     },
     # Open Design (nexu-io/open-design) — prévia visual real de mudanças de UI.
     # repo_path = clone; node_bin_dir = Node oficial (o do Kali não roda TS);
@@ -778,9 +785,15 @@ def commit_pending(cwd: str, message: str) -> str:
     return ", ".join(sorted(dirty)) if r.returncode == 0 else ""
 
 
-def revert_pending(cwd: str) -> str:
+def revert_pending(cwd: str, only: "set[str] | None" = None) -> str:
     """Descarta as mudanças não commitadas: checkout dos rastreados + clean dos
-    novos (menos ruído). Retorna a lista revertida."""
+    novos (menos ruído). Retorna a lista revertida.
+
+    only: quando dado, reverte SÓ os caminhos desse conjunto (relativos à raiz
+    do repo, como o `git status --porcelain` emite). É o que a rejeição da TUI
+    usa pra nunca apagar edição manual sua nem o trabalho de outra tarefa que já
+    estava suja no mesmo repositório (achado A2). Sem `only`, comportamento
+    antigo — reverte tudo que estiver sujo."""
     try:
         res = subprocess.run(["git", "status", "--porcelain"], cwd=cwd,
                               capture_output=True, text=True, timeout=10)
@@ -794,6 +807,8 @@ def revert_pending(cwd: str) -> str:
         if " -> " in path:
             path = path.split(" -> ", 1)[1].strip()
         if _is_noise_path(path):
+            continue
+        if only is not None and path not in only:
             continue
         (untracked if code == "??" else tracked).append(path)
     if tracked:
@@ -3223,6 +3238,62 @@ _WORKER_ALIASES = {
 }
 
 
+def engine_for_model(model_id: str) -> dict:
+    """Fonte ÚNICA de verdade: dado um id de modelo, qual motor (CLI + endpoint)
+    o roda. Retorna {"binary", "model"[, "env_file"][, "provider"]} — ou {} se
+    model_id for vazio.
+
+    É isto que sustenta "escolher qualquer modelo no Operador e no Revisor": o
+    binário e o env_file são DERIVADOS do modelo, nunca herdados de uma config
+    antiga que apontava pra outro provedor. Sem isso, um `workers.revisor` que
+    ainda dizia binary=claude + env_file=deepseek recebia `--model gemini-…` e o
+    endpoint do DeepSeek devolvia HTTP 400 (era o bug do Palco+Chat).
+
+    Mantém a MESMA ordem de checagem do _binary_from_model da TUI (que agora
+    delega pra cá) — não reordene sem atualizar os dois."""
+    m = (model_id or "").lower().strip()
+    if not m:
+        return {}
+    if "openrouter" in m:
+        return {"binary": "opencode", "model": model_id}
+    if "claude" in m and "haiku" not in m and "deepseek" not in m:
+        return {"binary": "claude", "model": model_id}
+    if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
+        if "oss" in m:
+            return {"binary": "brain", "model": model_id, "provider": "ollama-cloud"}
+        return {"binary": "codex", "model": model_id}
+    if "copilot" in m or m.startswith("claude-haiku"):
+        return {"binary": "copilot", "model": model_id}
+    if "deepseek" in m:
+        # interface do claude apontada pro endpoint alternativo via env_file.
+        return {"binary": "claude", "model": model_id, "env_file": str(DEEPSEEK_ENV)}
+    if any(x in m for x in ("kimi", "nemotron", "mistral", "minimax", "glm", "gemma", "qwen")):
+        return {"binary": "brain", "model": model_id, "provider": "ollama-cloud"}
+    return {"binary": "agy", "model": model_id}  # Gemini / Antigravity
+
+
+def apply_model_to_worker(worker_cfg: dict, model_id: str) -> dict:
+    """Cópia de worker_cfg com binary/model/env_file/provider coerentes com
+    model_id, preservando label/ícone/cor/descrição (a IDENTIDADE do papel).
+    Use sempre que o modelo vier de fora da config em disco — ex.: o seletor
+    Op:/Rev: do header da TUI."""
+    out = dict(worker_cfg)
+    eng = engine_for_model(model_id)
+    if not eng:
+        return out
+    out["binary"] = eng["binary"]
+    out["model"] = eng["model"]
+    if eng.get("env_file"):
+        out["env_file"] = eng["env_file"]
+    else:
+        out.pop("env_file", None)
+    if eng.get("provider"):
+        out["provider"] = eng["provider"]
+    else:
+        out.pop("provider", None)
+    return out
+
+
 def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     """Resolve qual operário real usar a partir da tag do <DELEGATE>/<PIPELINE>.
     Retorna (worker_config, actual_binary, label, icon, color).
@@ -3236,7 +3307,13 @@ def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     tag = target_binary_tag.lower().strip()
     tag = _WORKER_ALIASES.get(tag, tag)
 
-    worker = workers.get(tag) or workers.get("operador", {})
+    worker = workers.get(tag)
+    if not worker:
+        # Esse papel não está salvo: herda só o MOTOR do operador (binary/model/
+        # env_file), NUNCA a identidade — senão a tela mostra "Operador" rodando
+        # como Revisor (o label vinha do dict do operador).
+        base = workers.get("operador", {})
+        worker = {k: v for k, v in base.items() if k in ("binary", "model", "env_file", "provider")}
     default_binary, default_label, default_icon, default_color = _WORKER_TAG_DEFAULTS.get(
         tag, ("claude", tag.capitalize(), "🤖", "white")
     )

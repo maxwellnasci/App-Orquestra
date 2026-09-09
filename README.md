@@ -68,7 +68,10 @@ clica na árvore ou o próprio Orquestrador mostra código durante a conversa
 
 1. Você pede algo. Dúvida conceitual → o Orquestrador responde na hora.
 2. Tarefa que mexe em código → ele escreve um `<PLANO>` e **para**. Você clica
-   **▶ Executar plano** (ou **✏️ Ajustar**).
+   **▶ Executar plano** (ou **✏️ Ajustar**). Se ele tentar delegar **sem** um
+   plano aprovado, aparece uma barra **▶ Rodar agora / ✋ Cancelar** com o que
+   vai rodar — o operário tem permissão total, então delegação "por fora" pede
+   1 confirmação (`/auto on` desliga isso num projeto seu de confiança).
 3. O Operador executa — acompanhe em **⚡ Atividade**. Os arquivos tocados
    abrem no Editor em tempo real (GPS).
 4. Ele termina → o Orquestrador comenta o resultado no chat (`/relato off`
@@ -76,7 +79,8 @@ clica na árvore ou o próprio Orquestrador mostra código durante a conversa
    arquivo → barra **✅ Aprovar / ❌ Rejeitar / 🔍 Revisar**, com o diff
    colorido em **± Mudanças**.
    - **Aprovar** → commit limpo no Git + o Cão de Guarda roda.
-   - **Rejeitar** → `git reset` só dos arquivos daquela tarefa.
+   - **Rejeitar** → reverte **só os arquivos daquela tarefa** — edição manual
+     sua e o trabalho de outra tarefa pendente ficam intactos.
    - **Revisar** → o Revisor analisa o diff.
 
 ## Instalação
@@ -121,6 +125,7 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 | `/relato on` \| `off` | O Orquestrador comenta o resultado do Operador/pipeline no chat (liga por padrão). |
 | `/seguir on` \| `off` | O palco pula sozinho pra ⚡ Atividade a cada tarefa nova (liga por padrão). |
 | `/risco on` \| `off` | Gate por risco — pula a pausa de Aprovar se nada bater em padrão sensível. |
+| `/auto on` \| `off` | `on` = delegação avulsa (fora de um `<PLANO>` aprovado) roda sem pedir confirmação. Nasce `off`. |
 | `/quem <arquivo>` | Quem foi o último agente a editar aquele arquivo (autoria por IA). |
 | `/uso` \| `/saldo` | Gasto/tokens da sessão · saldo real da DeepSeek. |
 | Botões do topo | Trocam o modelo do Orquestrador / Operador / Revisor, ou ligam o `🎓 Aprendizado`. |

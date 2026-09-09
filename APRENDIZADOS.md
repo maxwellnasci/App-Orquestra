@@ -552,3 +552,118 @@ igual ao `_friendly_tool_call` do Claude) fica como próximo passo — precisa
 rodar `codex exec --json` de verdade numa tarefa de leitura pra confirmar o
 schema; `codex exec resume --last` como forma de não reenviar o histórico
 inteiro a cada turno também não foi implementado, só anotado no `ROADMAP.md`.
+
+---
+
+## Fix — modelo do Operador/Revisor ≠ motor invocado (set/2026)
+
+**Sintoma (relato do usuário):** "botei o Gemini pra implementar, deu erro;
+troquei pro Revisor, deu erro também." O erro real:
+
+```
+API Error: 400 The supported API model names are deepseek-v4-pro,
+deepseek-v4-flash, deepseek-v4-flash-vision-exp, but you passed gemini-3.1-pro-high
+⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY ... is set
+{"model":"gemini-3.1-pro-high","query_source":"sdk"}
+```
+
+Textos `query_source`/`generate_session_title`/`claude.ai connectors` são do
+**`claude` (Claude Code)**, não do `agy`. Ou seja: a etapa do Revisor rodou o
+`claude` apontado pro endpoint do DeepSeek (`ANTHROPIC_BASE_URL` via
+`~/.claude-deepseek-env`) **passando `--model gemini-3.1-pro-high`** → o DeepSeek
+só aceita `deepseek-v4-*` → 400.
+
+**Causa raiz:** `_run_worker_body` / `_run_pipeline_tui_body` pegavam `binary` +
+`env_file` da config em disco (`_resolve_worker`) mas sobrescreviam **só o
+`model`** com o seletor do header (`self._op_model`/`self._rev_model`). Config e
+header discordando de provedor = comando Frankenstein (motor de um, id de modelo
+de outro). Agravantes: `_resolve_worker` caía no dict do `operador` inteiro
+quando faltava `workers.revisor` — inclusive o `label`, então a tela dizia
+"Operador" rodando como Revisor; e o processo da TUI fica de pé por horas com o
+header em memória velha.
+
+**Correção:**
+- `orquestra.engine_for_model(model_id)` — fonte ÚNICA: modelo → `{binary,
+  model, env_file?, provider?}`. `_binary_from_model` da TUI passou a delegar.
+- `orquestra.apply_model_to_worker(worker_cfg, model_id)` — deriva binary +
+  env_file do modelo, preserva label/ícone/cor. Usado nos 2 caminhos de worker
+  em vez de `worker_cfg["model"] = chosen`; `actual_binary` recalculado.
+- header só rege `operador`/`revisor` canônicos — `<DELEGATE binary="codex">`
+  etc. voltam a respeitar a própria config.
+- `_resolve_worker`: fallback do operador herda só o motor, nunca a identidade.
+- `_persist_agent`: env_file sempre derivado do modelo salvo (fim do
+  `binary=claude`+`env_file=deepseek` com modelo Gemini); `campo=None` = remoção.
+- `_sync_model_headers_from_disk`: re-alinha os seletores Op:/Rev: com o disco
+  no início de cada execução (mata o problema de processo velho).
+- testes novos em `test_orquestra.py` (engine_for_model, apply_model_to_worker,
+  cenário Frankenstein, fallback sem roubar identidade).
+
+**Colateral não corrigido:** `~/.claude-deepseek-env` tem `[1m]` colado em 3
+linhas (`ANTHROPIC_MODEL=deepseek-v4-pro[1m]`) — inválido pro endpoint DeepSeek,
+mas é setup do usuário, fora do escopo do código.
+
+## Fix — análise de segurança ponta a ponta: achados A1 e A2 (08/09/2026)
+
+Análise completa (compila, testes passam, base limpa de shell-injection / SQLi /
+eval / pickle). Relatório: `ANALISE_PONTA_A_PONTA_2026-09-08.md`. Dois achados
+corrigidos nesta sessão.
+
+### A1 — `<DELEGATE>` avulso executava operário sem gate
+
+**Sintoma:** só `<PLANO>` sozinho tinha gate de aprovação. Um
+`<DELEGATE>`/`<PIPELINE>` que o Orquestrador emitisse direto (sem plano, ou
+junto de um `<PLANO>` no mesmo texto) caía em `_run_orchestrator_body` e
+disparava `_run_worker`/`_run_pipeline_tui` na hora — e o operário roda com
+`--dangerously-skip-permissions` / `bypassPermissions` / `workspace-write`. Um
+delegate que só roda comando / lê segredo / exfiltra (sem tocar arquivo) nem
+batia na barra Aprovar depois, que só aparece com `changes_summary`.
+
+**Causa raiz:** o gate era conceitual (o system prompt manda usar `<PLANO>`),
+nunca estrutural. O README já vendia "você aprova cada mudança" — não era
+verdade pro delegate avulso.
+
+**Correção (`orquestra_tui.py`):**
+- `ui.confirm_delegates` (novo, `DEFAULT_CONFIG`, nasce `True`, auto-backfill).
+- `_run_orchestrator_body`: ao achar `delegates`/`pipelines`, se
+  `confirm_delegates` ligado **e** não veio de um plano aprovado → guarda em
+  `self._pending_delegates`, mostra `#delegate-bar` (▶ Rodar agora / ✋ Cancelar)
+  com a lista do que vai rodar, e `return`.
+- `self._delegates_preapproved`: setado no `btn-exec-plan`, lido+zerado no topo
+  de `_run_orchestrator_body` (one-shot) — libera a delegação DAQUELE plano sem
+  re-perguntar.
+- `_dispatch_delegates(deleg_tuples, pipelines)`: extraído (roteamento _OD /
+  worker / pipeline) — chamado direto (gate off / plano aprovado) ou pelo botão.
+- `/auto on|off` — `on` = `confirm_delegates=False` (projeto seu de confiança).
+- delegates viram `(tag, instr)` na hora do parse (antes eram `re.Match` só
+  consumidos no loop).
+
+### A2 — "❌ Rejeitar" na TUI revertia a árvore inteira
+
+**Sintoma:** `_handle_approval("reject")` chamava `revert_pending(cwd)` que fazia
+`git checkout HEAD -- <todos os tracked sujos>` + `git clean -fd -- <todos os
+untracked>`. Edição manual sua no Editor + outra tarefa pendente no mesmo repo
+eram apagadas junto, silenciosamente. O caminho REPL (`orquestra.py` linha ~3919)
+já tinha guarda `pre_snapshot`/`other_pending`; a TUI (interface oficial) não.
+
+**Correção:**
+- `orquestra.revert_pending(cwd, only=None)` — com `only` (set de caminhos
+  relativos à raiz), reverte só esses. Sem `only`, comportamento antigo.
+- `_handle_approval("reject")`: monta `task_files` a partir de
+  `_pending_attribution["files"]` (que já é `git_dirty depois − antes`,
+  calculado em `_capture_worker_result`) e, quando falta atribuição
+  (open-design etc.), `git_dirty_agora − self._task_baseline_dirty`.
+- `_task_baseline_dirty`: capturado em `_warn_pending_manual_edits` (chokepoint
+  único de início de tarefa). Arquivos dele nunca são revertidos → aparecem como
+  `🛡️ Preservado` no chat. (Delegações paralelas compartilham o campo — a lista
+  precisa do worker tem prioridade; documentado.)
+- `_rel_to_repo()` normaliza caminho absoluto que o worker às vezes reporta.
+- Se não dá pra identificar os arquivos da tarefa com segurança → NÃO reverte
+  nada, manda o usuário desfazer na mão (mesma filosofia da guarda do REPL).
+
+**Testes novos** (`test_orquestra.py`): `revert_pending(only=...)` com cenário
+manual+tarefa; `ui.confirm_delegates` default. Smoke tests da TUI via
+`app.run_test()` (barra, botões, `/auto`, reject preservando edição manual).
+
+**Não corrigido (baixo, no relatório):** A3 permissão 0664 do cofre, A4
+`/senha-mestra` sem validação, A5 prompt como argv, A6 egresso pro DeepSeek,
+A7 folgas no bridge HTTP, A8 `_load_vault_data` engole Exception.

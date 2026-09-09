@@ -46,6 +46,34 @@ check(b == "codex", "tag de motor 'codex' → codex")
 _w, b, *_ = orquestra._resolve_worker(cfg, "tag-desconhecida-xyz")
 check(b == "claude", "tag desconhecida → fallback operador/claude")
 
+# fallback do operador NÃO empresta a identidade (label continua do papel pedido)
+_broken = {"workers": {"operador": {"binary": "claude", "model": "x", "label": "Operador",
+                                     "env_file": "/tmp/x"}}}
+_w, b, label, *_ = orquestra._resolve_worker(_broken, "revisor")
+check(label == "Revisor", "revisor sem config → herda motor do operador mas label 'Revisor'")
+check("label" not in _w, "fallback do operador não carrega o label junto")
+
+
+# ── engine_for_model / apply_model_to_worker: motor derivado do modelo ──────
+print("engine_for_model")
+check(orquestra.engine_for_model("gemini-3.1-pro-high")["binary"] == "agy", "gemini → agy")
+check(orquestra.engine_for_model("claude-sonnet-5")["binary"] == "claude", "claude → claude")
+_ds = orquestra.engine_for_model("deepseek-v4-pro")
+check(_ds["binary"] == "claude" and _ds.get("env_file"), "deepseek → claude + env_file")
+check(orquestra.engine_for_model("gpt-5.6-terra")["binary"] == "codex", "gpt → codex")
+check(orquestra.engine_for_model("")  == {}, "modelo vazio → {}")
+
+# o cenário do bug: config diz claude+deepseek, pedido é um modelo Gemini
+_frank = {"binary": "claude", "env_file": str(orquestra.DEEPSEEK_ENV),
+          "model": "deepseek-v4-pro", "label": "Revisor", "icon": "🔍"}
+_fx = orquestra.apply_model_to_worker(_frank, "gemini-3.1-pro-high")
+check(_fx["binary"] == "agy", "apply_model_to_worker: binary vira agy")
+check("env_file" not in _fx, "apply_model_to_worker: env_file do deepseek some")
+check(_fx["label"] == "Revisor" and _fx["icon"] == "🔍", "apply_model_to_worker: identidade preservada")
+_cmd, _env, _ = orquestra._build_worker_cmd(_fx, _fx["binary"], "x")
+check(_cmd[0] == "agy" and "ANTHROPIC_BASE_URL" not in _env,
+      "comando final: agy puro, sem endpoint do deepseek")
+
 
 # ── _build_orchestrator_cmd: read-only, usa a conta logada ─────────────────
 print("_build_orchestrator_cmd")
@@ -390,6 +418,39 @@ with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
     orquestra._orchestrator_react(orquestra.DEFAULT_CONFIG, "Revisor", "revisei Y")
     check("Aprovar, Rejeitar ou pedir pra Revisar" not in _captured_prompt["text"],
           "has_pending_changes=False (default): sem o lembrete de aprovação")
+
+
+# ── Achado A2: revert_pending(only=...) reverte só os arquivos da tarefa ───
+print("revert_pending — escopo por arquivo (achado A2)")
+
+_r = tempfile.mkdtemp()
+_sp.run(["git", "init", "-q"], cwd=_r)
+_sp.run(["git", "config", "user.email", "t@t.com"], cwd=_r)
+_sp.run(["git", "config", "user.name", "t"], cwd=_r)
+Path(_r, "base.py").write_text("v1\n")
+_sp.run(["git", "add", "-A"], cwd=_r)
+_sp.run(["git", "commit", "-q", "-m", "base"], cwd=_r)
+
+# edição "manual" (pré-existente) + "tarefa" (rastreado alterado + arquivo novo)
+Path(_r, "base.py").write_text("EDICAO MANUAL\n")          # não pode ser revertido
+Path(_r, "tarefa_track.py").write_text("nova\n")           # ainda não commitado...
+_sp.run(["git", "add", "tarefa_track.py"], cwd=_r); _sp.run(["git", "commit", "-q", "-m", "t"], cwd=_r)
+Path(_r, "tarefa_track.py").write_text("nova\nMUDOU\n")    # alterado pela "tarefa"
+Path(_r, "tarefa_novo.py").write_text("print(1)\n")        # criado pela "tarefa"
+
+_revertidos = orquestra.revert_pending(_r, only={"tarefa_track.py", "tarefa_novo.py"})
+check("tarefa_track.py" in _revertidos and "tarefa_novo.py" in _revertidos,
+      "only=: reverte os dois arquivos da tarefa")
+check(Path(_r, "base.py").read_text() == "EDICAO MANUAL\n",
+      "only=: edição manual pré-existente NÃO é tocada")
+check(Path(_r, "tarefa_track.py").read_text() == "nova\n",
+      "only=: arquivo rastreado volta pro HEAD")
+check(not Path(_r, "tarefa_novo.py").exists(),
+      "only=: arquivo novo da tarefa é removido (git clean)")
+
+check("confirm_delegates" in orquestra.DEFAULT_CONFIG["ui"]
+      and orquestra.DEFAULT_CONFIG["ui"]["confirm_delegates"] is True,
+      "achado A1: ui.confirm_delegates nasce True no DEFAULT_CONFIG")
 
 
 print()
