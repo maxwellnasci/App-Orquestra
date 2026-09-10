@@ -667,3 +667,74 @@ manual+tarefa; `ui.confirm_delegates` default. Smoke tests da TUI via
 **Não corrigido (baixo, no relatório):** A3 permissão 0664 do cofre, A4
 `/senha-mestra` sem validação, A5 prompt como argv, A6 egresso pro DeepSeek,
 A7 folgas no bridge HTTP, A8 `_load_vault_data` engole Exception.
+
+
+## Gate de verificação + Cão de Guarda no DeepSeek (10/09/2026)
+
+Contexto e decisões em `ANALISE_GATE_E_COPILOT_2026-09-10.md`. Duas melhorias
+aditivas no fluxo, sem mudar o fluxo. Commit da implementação + este doc.
+
+### O que NÃO é óbvio
+
+- **A revisão de código do Copilot deixou de ser grátis (1º/jun/2026).** Virou
+  AI Credits (token-metered), e no plano estudante são 200 AIC/mês **compartilhados**
+  entre chat, agent mode, code review, CLI e Spaces. Só o autocomplete continua
+  ilimitado. Não existe "Copilot revisando sempre o mês todo". Por isso o Cão de
+  Guarda saiu do Copilot.
+- **`watchdog_verdict` NÃO usa `_run_worker_headless`.** Mantém `subprocess.run`
+  próprio com `timeout` (o `_run_worker_headless` faz `proc.wait()` sem timeout —
+  bom pra worker interativo, ruim pra um watchdog automático). Então o motor DeepSeek
+  entra como `claude -p <prompt> --permission-mode plan` **sem** `--output-format
+  stream-json` → stdout é texto puro, que o parser de hoje já trata. `plan` = pode
+  ler arquivos, nunca escreve. Combo `claude -p ... --permission-mode plan` já era
+  testado em `_build_orchestrator_cmd`.
+- **O env_file (`~/.claude-deepseek-env`) precisa ser passado no `env=` do
+  `subprocess.run`.** `watchdog_verdict` não fazia isso (só o Cão de Guarda-Copilot,
+  que não precisa). Sem isso o `claude` usaria o login real, não o DeepSeek.
+- **NÃO chamar `_orchestrator_react` da thread do Cão de Guarda.** `_run_copilot_watchdog`
+  dispara `_watchdog_report` numa thread daemon (`name="cao-guarda"`) enquanto
+  `_worker_lifecycle` já chama `_orchestrator_react` na própria thread. Duas reações
+  concorrentes = dois subprocessos de orquestrador + dois `_print_chat_bubble` +
+  corrida no `orquestrador.json`. Solução: `_watchdog_report` só faz `print` +
+  `save_chat_message` — o Orquestrador vê o achado na próxima vez que o usuário
+  falar com ele (`build_orchestrator_prompt` lê o histórico).
+- **`save_chat_message` não era thread-safe** (read-modify-write de JSON sem lock).
+  Já era disputado por `_worker_lifecycle` threads paralelas hoje; o Cão de Guarda
+  como mais um writer deixou óbvio. Envolvido em `_chat_lock` (RLock de módulo).
+- **`load_config` só faz backfill de workers faltando, nunca modifica os existentes.**
+  Pra virar `cao_guarda` de Copilot → DeepSeek precisou de um bloco de migração
+  dedicado (padrão do bloco "sanidade do Orquestrador"), com condição **engine-only**
+  (`binary == "copilot" and model in ("auto","",None)`) — quem escolheu um modelo
+  Copilot real é preservado.
+- **`~/.orquestra.json` é global, não por projeto.** Por isso o gate tem o
+  `.orquestra_gate` (arquivo na raiz do projeto, 1 comando por linha, `#` = comentário)
+  com prioridade sobre `gate.command`. O próprio repo tem um (`python3 test_orquestra.py`),
+  porque `test_orquestra.py` não é pytest e a auto-detecção não pegaria — pior,
+  `pytest` rodando nele daria erro de coleta (o módulo faz `sys.exit(1)`).
+- **Gate nunca pune o operário por problema de ambiente.** `_run_gate_check`
+  devolve `rc=None` (→ skip silencioso) em `FileNotFoundError`, `TimeoutExpired` e
+  `rc == 127`. Ecossistema ambíguo (ex.: `pyproject.toml` + `Cargo.toml`) também
+  → `None`.
+- **Gate só na última etapa do `<PIPELINE>`** (mesma regra do Cão de Guarda): as
+  etapas intermediárias são incompletas de propósito (etapa 1 escreve, etapa 2
+  testa) — gate no meio re-promptaria por "falhas" que o próximo passo conserta.
+
+### Arquivos
+
+`orquestra.py` — `gate` no `DEFAULT_CONFIG` + migração; `_chat_lock`;
+`_watchdog_report`; `watchdog_verdict` (env_file + `--permission-mode plan` +
+timeout 240 + prompt); `_gate_enabled` / `_detect_project_check` / `_run_gate_check`
+/ `_run_verification_gate` / `_GATE_REPROMPT` / `_open_live_section`; wiring em
+`_worker_lifecycle` e `_run_pipeline`. `orquestra_tui.py` — 2 sites do gate
+(`_run_worker_body`, `_run_pipeline_tui_body` só última etapa) + 3 de
+`save_chat_message` (2 auto-approve + `_run_watchdog` só pós-Aprovar).
+`test_orquestra.py` — +28 checks (158 no total): detecção do gate, fluxos de
+`_run_verification_gate` (skip / passa / falha→corrige / teto → entrega / operário
+erra), migração do `cao_guarda`, cmd do watchdog, `_watchdog_report`.
+
+### Testado ao vivo
+
+Gate: `_detect_project_check` pegou o `.orquestra_gate`, `_run_gate_check` rodou a
+suíte (rc 0), `_run_verification_gate` → `(True, "✅ verificação passou")`.
+Cão de Guarda: repo temporário com `a + b` → `a - b`; `watchdog_verdict` retornou
+`has_bug=True` + verdict do DeepSeek apontando arquivo/linha/impacto.

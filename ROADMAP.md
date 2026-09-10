@@ -23,7 +23,10 @@ TUI (Textual) como interface oficial. 3 agentes + Cão de Guarda, produtividade
   aceita OpenCode/OpenRouter (LLMs chinesas) como motor.
 - **🔍 Revisor** — revisão sob demanda (botão ou pipeline) ou, no **Modo
   Aprendizado**, revisão automática ao salvar + sugestões inline (aceitar/recusar).
-- **🐕 Cão de Guarda** — Copilot automático, audita cada `git diff` antes do commit.
+- **🐕 Cão de Guarda** — DeepSeek automático (read-only), lê o codebase ao redor de
+  cada `git diff` (bugs/lógica/segurança); o achado vai pro chat do Orquestrador.
+- **🔎 Gate de verificação** — antes do Revisor, roda o teste/build do projeto; se
+  quebrar, o Operador conserta sozinho (até 2x).
 - **📝 Editor** — multi-abas de verdade, sintaxe por extensão, `Ctrl+S`/`Ctrl+W`.
 
 Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
@@ -34,6 +37,13 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 - [x] Orquestrador estrategista sem ferramentas (cérebro via chat completions: DeepSeek/Ollama)
 - [x] Operador / Revisor / Cão de Guarda como agentes de verdade na config
 - [x] Cão de Guarda funcionando (era código morto) — roda 1x/turno com o `git diff` no prompt
+- [x] **Gate de verificação determinística (set/2026)** — teste/build do projeto após
+  cada edição, re-prompta o mesmo operário com o log de erro (teto 2x) antes do Revisor.
+  `gate` no config, `enabled` nasce `true`. Detecção: `.orquestra_gate` > `gate.command` >
+  auto (pytest/npm/tsc/cargo/go)
+- [x] **Cão de Guarda: Copilot → Claude-DeepSeek `--permission-mode plan` (set/2026)** —
+  lê o codebase ao redor do diff, custa centavos (Copilot code review deixou de ser
+  grátis jun/2026); achado salvo no histórico do Orquestrador
 - [x] Gate de plano restaurado (`<PLANO>` → "▶ Executar / ✏️ Ajustar")
 - [x] `<PIPELINE>` na TUI retoma sozinho após o Aprovar
 - [x] "Aprovar" commita de verdade; "Rejeitar" reverte só os arquivos da tarefa

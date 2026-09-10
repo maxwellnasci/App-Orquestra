@@ -1,5 +1,45 @@
 # Changelog Orquestra
 
+## Não lançado — Gate de verificação + Cão de Guarda no DeepSeek (set/2026)
+
+Análise em `ANALISE_GATE_E_COPILOT_2026-09-10.md`. Duas melhorias no fluxo, sem
+mudar o fluxo (Codex discute → Gemini implementa → Claude revisa → Gemini ajusta).
+
+- **Gate de verificação determinística** (`gate` no config, `enabled` nasce `true`).
+  Depois que um operário edita arquivos, o Orquestra roda o teste/build do projeto
+  (`subprocess`, zero LLM). Se falhar, devolve o log de erro pro **mesmo operário**
+  consertar (`_GATE_REPROMPT`, teto `gate.max_retries`, default 2) antes de entregar
+  ao Revisor; se não passar depois do teto, entrega assim mesmo com status
+  "⚠️ Aguardando Aprovação (verificação falhou)". Detecção conservadora
+  (`_detect_project_check`): `.orquestra_gate` (arquivo per-projeto, 1 comando por
+  linha) > `gate.command` > auto (`pytest` / `npm test` / `tsc --noEmit` /
+  `cargo check` / `go build`). Ambíguo, nada detectável, ferramenta ausente,
+  timeout ou rc 127 → no-op silencioso, **nunca pune o operário**. Vale no REPL e
+  na TUI (`_worker_lifecycle`, `_run_pipeline` só na última etapa, e os 2 handlers
+  de worker da TUI). O próprio repo tem um `.orquestra_gate` = `python3 test_orquestra.py`
+  (a suíte não é pytest, a auto-detecção não pegaria).
+- **Cão de Guarda: Copilot → Claude-DeepSeek em `--permission-mode plan`.** A
+  revisão de código do Copilot deixou de ser incluída em jun/2026 (vira AI Credits,
+  200/mês compartilhados no plano estudante). O `cao_guarda` passa a rodar DeepSeek
+  v4 Pro dentro do harness do Claude Code em modo read-only — **lê o codebase ao
+  redor do diff** (quem chama a função alterada, arquivos vizinhos), custa ~centavos.
+  `watchdog_verdict` ganhou `--permission-mode plan` + carga do `env_file` + timeout
+  90→240s + prompt que autoriza leitura de arquivos e inclui riscos de segurança.
+  Migração de `load_config` vira **só** o default antigo intocado (`copilot` +
+  `auto`) — quem escolheu um modelo Copilot de propósito é preservado.
+- **O achado do Cão de Guarda agora vai pro Orquestrador.** Antes só era impresso
+  no terminal e ninguém consumia. `_watchdog_report(cfg)` faz print **e**
+  `save_chat_message("orquestrador", ...)` — o Orquestrador vê o achado na próxima
+  vez que você falar com ele. NÃO chama `_orchestrator_react` daqui (rodaria
+  concorrente com o de `_worker_lifecycle`). Mesma rota nos 2 pontos automáticos +
+  na revisão pós-Aprovar da TUI.
+- **`save_chat_message` virou thread-safe** (`_chat_lock`) — a corrida entre
+  operários paralelos já existia; o Cão de Guarda como mais um writer deixou óbvio.
+
+Testado ao vivo: gate detectou o `.orquestra_gate` e rodou a suíte; Cão de Guarda
+pegou um bug injetado (`a + b` → `a - b`) com verdict preciso do DeepSeek.
+`test_orquestra.py`: 158 checks.
+
 ## Não lançado — endurecimento pós-análise de segurança (set/2026)
 
 Análise ponta a ponta (relatório em `ANALISE_PONTA_A_PONTA_2026-09-08.md`).

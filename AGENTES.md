@@ -24,7 +24,7 @@ qualidade, múltiplas perspectivas de IA) sem conhecer os detalhes de cada CLI.
 | `roles.orquestrador` | Estrategista: conversa, `<PLANO>`, delega | `brain` / DeepSeek v4 Flash | **NÃO** (chat puro) |
 | `workers.operador` | Executor: lê/escreve/roda/cria | `claude` / claude-sonnet-5 | sim (headless) |
 | `workers.revisor` | Revisão sob demanda | `claude` / claude-opus-5 | sim (headless) |
-| `workers.cao_guarda` | Auditoria automática do diff | `copilot` / auto | sim (read-only) |
+| `workers.cao_guarda` | Auditoria automática do diff (bugs + lógica + segurança) | `claude` / DeepSeek v4 Pro em `--permission-mode plan` | sim (read-only — lê o codebase, nunca escreve) |
 
 Atalhos de motor (uso avançado): `workers.claude`, `.agy`, `.deepseek`, `.codex`.
 Tags legadas (`implementador`, `arquiteto`, `pesquisador`, `analista`, `designer`,
@@ -50,11 +50,18 @@ Operador (headless, --output-format stream-json)
    │   • GPS: arquivos tocados abrem no Editor em tempo real
    │   • git snapshot antes/depois isola a tarefa
    │
+   ▼  mexeu em arquivos → GATE de verificação (se `gate.enabled`)
+Orquestra roda o teste/build do projeto (subprocess, sem LLM).
+   │   • passou → segue
+   │   • falhou → devolve o log pro MESMO operário consertar (teto max_retries),
+   │             depois entrega assim mesmo com status "(verificação falhou)"
+   │
    ▼  mexeu em arquivos → status "⚠️ Aguardando Aprovação"
 Usuário: ✅ Aprovar (commit) │ ❌ Rejeitar (git reset dos arquivos da tarefa) │ 🔍 Revisar
    │
    ▼  ao aprovar
-Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + alerta
+Cão de Guarda (DeepSeek, read-only) audita o diff → rodapé verde, ou vermelho +
+alerta; o achado também é salvo no histórico do Orquestrador
 ```
 
 ### Tags que o Orquestrador emite
@@ -104,8 +111,23 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
 3. **Comandos `/senha*`** são interceptados por `vault.handle_command` antes de
    qualquer agente.
 4. **O Cão de Guarda roda de verdade:** `_run_copilot_watchdog(config)` dispara uma
-   thread (cooldown de 15s) que chama `watchdog_verdict(config)`. Silencioso se o
-   veredito for "tudo certo".
+   thread (cooldown de 15s) → `_watchdog_report(cfg)` → `watchdog_verdict(config)`.
+   Silencioso se o veredito for "tudo certo". Motor padrão = DeepSeek via `claude
+   --permission-mode plan` (lê o codebase ao redor do diff, nunca escreve). O achado
+   é impresso **e** salvo no histórico do Orquestrador (`save_chat_message`) — NÃO
+   chama `_orchestrator_react` daqui (corrida com o de `_worker_lifecycle`). Migração
+   de `load_config` vira só o default antigo intocado (`copilot` + `auto`).
+9. **Gate de verificação (`gate` no config, `enabled` default true):** depois que um
+   operário edita arquivos, `_run_verification_gate(...)` roda o teste/build do
+   projeto (`subprocess`, zero LLM). Detecção conservadora em `_detect_project_check`:
+   `.orquestra_gate` (arquivo per-projeto, 1 comando por linha) > `gate.command` >
+   auto (`pytest`/`npm test`/`tsc --noEmit`/`cargo check`/`go build`). Ambíguo ou
+   nada detectável → no-op silencioso. Ferramenta ausente / timeout / rc 127 →
+   inconclusivo, **nunca pune o operário**. Se `rc != 0`: re-prompta o MESMO operário
+   com o log (`_GATE_REPROMPT`, teto `gate.max_retries`), depois entrega assim mesmo
+   com status "(verificação falhou)". Wired em `_worker_lifecycle`, `_run_pipeline`
+   (só última etapa) e nos 2 handlers de worker da TUI. `test_orquestra.py` não é
+   pytest → o repo tem um `.orquestra_gate` com `python3 test_orquestra.py`.
 5. **`vault.py`** não tem dependência além de `cryptography` + stdlib.
 6. **Assinaturas compartilhadas:** `_run_worker_headless`, `_resolve_worker`,
    `_build_worker_cmd`, `_build_orchestrator_cmd`, `build_orchestrator_prompt` são
@@ -141,14 +163,16 @@ Cão de Guarda (Copilot) audita o git diff → rodapé verde, ou vermelho + aler
   "workers": {
     "operador":   { "binary": "claude", "model": "claude-sonnet-5" },
     "revisor":    { "binary": "claude", "model": "claude-opus-5" },
-    "cao_guarda": { "binary": "copilot", "model": "auto" }
+    "cao_guarda": { "binary": "claude", "model": "deepseek-v4-pro", "env_file": "~/.claude-deepseek-env" }
   },
-  "ui": { "mode": "chat", "detail": "normal", "learning_mode": false }
+  "ui": { "mode": "chat", "detail": "normal", "learning_mode": false },
+  "gate": { "enabled": true, "command": "", "timeout_s": 180, "max_retries": 2 }
 }
 ```
 
 `load_config()` migra automaticamente configs v1 (orquestrador em `agy`/`claude`,
-operários com nomes soltos, `ollama_api_key` em texto puro).
+operários com nomes soltos, `ollama_api_key` em texto puro), o `cao_guarda` de
+Copilot → DeepSeek, e semeia a seção `gate`.
 
 ### Como o Orquestrador roda
 
