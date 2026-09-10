@@ -12,7 +12,7 @@ o que quer e a equipe executa, com você aprovando cada mudança.
 | 🎼 **Orquestrador** | Estrategista | Conversa, pensa a solução, faz o `<PLANO>` e delega. **Não tem ferramentas** — nunca lê/escreve/roda nada sozinho. | DeepSeek v4 Flash (chat direto) |
 | 🔨 **Operador** | Executor | Lê o código, escreve, altera, roda comandos, cria arquivos. | Claude Code (`claude-sonnet-5`) |
 | 🔍 **Revisor** | Revisão sob demanda | Caça bugs, avalia arquitetura e segurança de um trecho ou de um diff. Você aciona pelo botão "🔍 Revisar". | Claude Code (`claude-opus-5`) |
-| 🐕 **Cão de Guarda** | Automático e silencioso | Depois de cada edição, audita o `git diff` no rodapé. Fica verde se está tudo certo, vermelho só se achar bug. | GitHub Copilot |
+| 🐕 **Cão de Guarda** | Automático e silencioso | Depois de cada edição, lê o codebase ao redor do diff (bugs, lógica, segurança), reporta no rodapé e no chat do Orquestrador. Verde se está tudo certo, vermelho só se achar algo. | DeepSeek v4 Pro (read-only) |
 
 Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Rev:`) —
 inclusive por modelos chineses via OpenRouter (DeepSeek, Qwen, GLM, Kimi, MiniMax),
@@ -74,11 +74,17 @@ clica na árvore ou o próprio Orquestrador mostra código durante a conversa
    1 confirmação (`/auto on` desliga isso num projeto seu de confiança).
 3. O Operador executa — acompanhe em **⚡ Atividade**. Os arquivos tocados
    abrem no Editor em tempo real (GPS).
+   - **Gate de verificação:** quando ele termina, o Orquestra roda o teste/build
+     do projeto sozinho (`pytest`/`npm test`/`tsc`/`cargo`/`go`, ou o comando do
+     arquivo `.orquestra_gate`). Se quebrar, o log volta pro **mesmo Operador**
+     consertar (até 2 tentativas) antes de você ver. Projeto sem teste detectável
+     = não faz nada. Desliga com `"gate": {"enabled": false}` no config.
 4. Ele termina → o Orquestrador comenta o resultado no chat (`/relato off`
    desliga isso e volta a mostrar a resposta crua do Operador). Se mexeu em
    arquivo → barra **✅ Aprovar / ❌ Rejeitar / 🔍 Revisar**, com o diff
    colorido em **± Mudanças**.
-   - **Aprovar** → commit limpo no Git + o Cão de Guarda roda.
+   - **Aprovar** → commit limpo no Git + o Cão de Guarda roda (DeepSeek lê o
+     codebase ao redor do diff; o achado vai pro rodapé e pro chat do Orquestrador).
    - **Rejeitar** → reverte **só os arquivos daquela tarefa** — edição manual
      sua e o trabalho de outra tarefa pendente ficam intactos.
    - **Revisar** → o Revisor analisa o diff.
@@ -94,9 +100,10 @@ ln -sf "$PWD/orquestra" ~/.local/bin/orquestra
 Ferramentas externas (no PATH): `claude`, `agy`, `codex`, `gh` (com `gh copilot`),
 `opencode` (opcional — motor OpenRouter/LLMs chinesas, já logado na conta),
 e `chromium`/`google-chrome` (renderiza a prévia do Open Design dentro da TUI).
-Cérebro do Orquestrador: `~/.claude-deepseek-env` (chave DeepSeek) ou o `kimi` CLI
-(Ollama Cloud). Open Design: seção `open_design` no `~/.orquestra.json` (auto-semeada
-se o clone existir).
+Cérebro do Orquestrador **e o Cão de Guarda**: `~/.claude-deepseek-env` (chave
+DeepSeek, com saldo). O Orquestrador aceita também o `kimi` CLI (Ollama Cloud).
+Open Design: seção `open_design` no `~/.orquestra.json` (auto-semeada se o clone
+existir).
 
 **Prévia do Open Design dentro da TUI:** a imagem é renderizada na aba 🎨 Idea Studio.
 A nitidez depende do terminal — num terminal com protocolo de imagem (Kitty, WezTerm,
