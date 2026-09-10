@@ -1,18 +1,24 @@
-# Análise: Gate de verificação determinística + Copilot como revisor
+# Análise: Gate determinístico + trocar o revisor automático (Copilot → DeepSeek)
 
 **Data:** 2026-09-10
 **Contexto:** o fluxo atual (Codex discute → Gemini implementa → Claude revisa →
 Gemini ajusta) já está bom. Isto **não é mudança de fluxo** — são duas melhorias
 pontuais pra ganhar qualidade de código, menos erros e mais confiança:
-1. um **gate determinístico** que roda teste/build antes de entregar ao revisor;
-2. ligar o **Copilot no modo agêntico** (o mesmo do VS Code) no Cão de Guarda.
+
+1. um **gate determinístico** que roda teste/build e realimenta o erro no operário
+   antes de entregar ao revisor;
+2. **trocar o revisor automático**: o Cão de Guarda sai do Copilot e passa a rodar
+   com **DeepSeek** (via `Claude-DeepSeek` em modo plan), com a saída indo pro
+   Orquestrador em vez de morrer no terminal.
+
+**O Claude continua revisor sênior em tudo, inalterado.**
 
 Ponto de partida foi um texto de terceiro sobre "por que o Claude Code se destaca"
 (engenharia do harness). Diagnóstico dele: correto no geral, com dois deslizes —
 nega o papel dos pesos do modelo (boa parte da vantagem é RL em uso agêntico) e
 chama o loop de auto-correção do Claude Code de "determinístico" (na verdade é
 dirigido pelo modelo). Das 3 recomendações do texto, só uma se aplica aqui: a
-camada de feedback determinístico.
+camada de feedback determinístico (o gate).
 
 ---
 
@@ -40,7 +46,7 @@ crua + motor de patch próprio seria regressão. **Não fazer.**
 
 ---
 
-## 2. O gap real: falta o gate de verificação determinística
+## 2. Melhoria 1 — o gate de verificação determinística
 
 ### Situação atual
 
@@ -50,13 +56,13 @@ Depois que um operário mexe na árvore:
   `pytest` / `ruff` / `tsc --noEmit` / `npm build` nem realimenta o erro no worker.
 - Único retry existente: **stdout vazio** (instabilidade do modelo, ~linha 4196).
 - Único failover: **erro de quota/429** (~linha 3603).
-- A verificação que existe é **humana no loop**: Cão de Guarda comenta, Revisor
-  comenta, usuário aprova/rejeita. Nada mecânico confirma que o código roda.
+- A verificação que existe é **humana no loop**. Nada mecânico confirma que o
+  código roda.
 
 Resultado: o Claude (recurso escasso — 1 conta paga) gasta quota revisando código
 que às vezes nem compila.
 
-### O que muda com o gate
+### O que muda
 
 **Hoje:** operário edita → entrega pro Revisor/usuário (mesmo com build quebrado).
 
@@ -90,150 +96,182 @@ Encaixa na máquina que já existe (snapshot de git diff, task tracking, failove
 
 ---
 
-## 3. O Cão de Guarda / Copilot hoje
+## 3. O Cão de Guarda / Copilot hoje — e por que não serve
 
 Confirmado no código (`watchdog_verdict` em `orquestra.py:3465`,
 `_run_copilot_watchdog` em 3529, chamadas em 3638 e 4422):
 
 - **Dispara sozinho** depois de todo `<DELEGATE>` ou da última etapa de
   `<PIPELINE>`, **só se** o operário terminou sem erro **e** mexeu em arquivo.
-- Pega o `git diff` (só 3 linhas de contexto, `--unified=3`) e manda pro Copilot:
-  *"analise só o diff em busca de BUGS ou lógica errada, ignore estilo; se achar,
-  seja curto: arquivo, problema, impacto; senão responda 'Tudo certo'."*
+- Pega o `git diff` (só 3 linhas de contexto, `--unified=3`) e manda pro Copilot
+  via `gh copilot -p "<diff>"`.
 - Roda em **thread daemon, não bloqueia**. Cooldown de 15s.
-- **A saída só é impressa no terminal** (vermelho se detectar "bug/erro/falha",
-  amarelo se não).
+- **A saída só é impressa no terminal.**
 
 ### Dois problemas
 
 1. **O veredito morre no terminal.** `has_bug=True` não faz nada: não volta pro
-   operário, não entra no contexto do orquestrador, não muda o status da task.
-2. **Ele lê o diff — não executa nada.** Não roda teste/build/lint. Pega o que um
-   LLM enxerga lendo: lógica torta, erro óbvio. Não pega "não compila", "import
-   quebrado", "teste vermelho", "quebrou quem chama isso 3 arquivos adiante".
+   operário, não entra no contexto do Orquestrador, não muda o status da task.
+   Você paga por uma opinião que ninguém lê.
+2. **Ele lê 3 linhas de diff — não executa nada.** Pega só o que um LLM enxerga
+   lendo um trecho minúsculo. Não pega "não compila", "import quebrado", "teste
+   vermelho", "quebrou quem chama isso 3 arquivos adiante".
 
-O papel está **certo** (revisor barato, automático, sempre ligado). Falta:
-- tornar o veredito acionável (voltar pro Gemini, ou segurar a task);
-- dar mais contexto (arquivos inteiros, não 3 linhas de diff).
+O **papel** está certo (revisor barato, automático, sempre ligado). O **motor e a
+fiação** estão errados.
 
 ---
 
-## 4. Ligar o Copilot no modo agêntico (o mesmo do VS Code)
+## 4. Por que NÃO usar o Copilot pra esse papel
 
-### Descoberta
+### A revisão de código do Copilot deixou de ser grátis (jun/2026)
 
-O **GitHub Copilot CLI agêntico já está instalado e logado** na máquina:
+Pesquisa de 10/set/2026:
 
-- `/home/max/.local/bin/copilot` — **GitHub Copilot CLI v1.0.83**
-- É o **mesmo motor do VS Code (modo agente)**: edita arquivos, roda shell,
-  **busca no codebase**, tem `/review`, `/security-review`, `/plan`, `/delegate`,
-  MCP, subagentes (`/tasks`), skills, seleção de modelo.
-- Suporta `--output-format json` (JSONL), `-s` (só a resposta), `--add-dir`,
-  `--allow-tool` / `--deny-tool`, `--model auto`.
-- **O `gh copilot` desta máquina já redireciona pra esse binário**
-  ("gh will execute the Copilot CLI found in your PATH").
+- Em **1º de junho de 2026** o GitHub trocou "premium requests" por **AI Credits** e
+  **a revisão de código deixou de ser incluída** — antes era. Agora **tanto a
+  revisão no PR quanto no VS Code** consomem AI Credits (token-metered, custo
+  imprevisível). Em repo **privado**, a revisão no PR ainda queima minutos de
+  GitHub Actions.
+- **Conta estudante = 200 AI Credits/mês**, e esse orçamento é **compartilhado**
+  entre chat, agent mode, code review, Copilot CLI e Spaces. (Bate com o rodapé do
+  usuário: 16/200, reseta em 20 dias, `gpt-5.6-luna` no Auto, ~0,54 AIC/sessão.)
+- **Só o autocomplete é ilimitado** (sugestões inline enquanto digita). Isso não
+  gasta nada — mas não é revisão.
+- `--model auto` **não zera o custo** (billing novo é por token; não há tier 0×).
 
-**⇒ O comentário em `orquestra.py:3392`** ("gh copilot não suporta `--output-format
-json`, flag só existe no agent CLI nativo") **está desatualizado.** Já estamos
-chamando o CLI novo — só não estamos usando as capacidades dele.
+**Conta:** ~0,5 AIC por revisão → teto de ~400/mês, dividido com todo o resto que
+se faz no Copilot. Como watchdog automático a cada edição, estoura em 1–2 semanas
+de uso intenso. **Não existe "Copilot revisando sempre, o mês todo".**
 
-### Por que hoje ele responde raso
+### O CLI agêntico do Copilot existe e funciona (mas não muda a conta acima)
 
-`gh copilot -p "<diff>" --no-ask-user` **sem conceder ferramentas**. Sem
-`--allow-tool`, o agente não lê arquivo nenhum — responde só com o texto colado no
-prompt. Não é o CLI que é raso; é que ninguém deu permissão pra ele explorar.
+- `/home/max/.local/bin/copilot` — **GitHub Copilot CLI v1.0.83**, instalado e
+  logado (`maxwellnasci`). É o mesmo motor do VS Code (modo agente): edita, roda
+  shell, busca no codebase, tem `/review`, `/security-review`, MCP, subagentes.
+- **O `gh copilot` desta máquina já redireciona pra esse binário.** Logo o
+  comentário em `orquestra.py:3392` ("gh copilot não suporta `--output-format
+  json`") **está desatualizado**.
+- Hoje o Cão de Guarda chama `gh copilot -p` **sem `--allow-tool`** → o agente não
+  lê arquivo nenhum, responde só com o texto colado. Dá pra ligar as tools de
+  leitura (`--allow-tool read`, `shell(git:*)`, `--deny-tool write`), mas **isso
+  não resolve o custo** — continua saindo dos 200 AIC.
 
-### Como ligar (mesma função, motor de verdade)
+### Copilot é bom em quê
 
-Trocar a invocação do Cão de Guarda por algo como:
+- **Autocomplete** (o motivo real de usarem no VS Code): muito bom e rápido —
+  modelo pequeno afinado pra latência + integração no editor.
+- **Revisão**: nada de especial — modelo classe GPT com um prompt de review. Um
+  modelo bom de código (DeepSeek) faz a mesma função.
 
-```
-copilot -p "/review" \
-  --add-dir <projeto> \
-  --allow-tool 'read' --allow-tool 'shell(git:*)' \
-  --deny-tool 'write' \
-  --output-format json -s
-```
+**Conclusão:** Copilot pra revisão automática = a única opção onde o custo te
+limita, sem ganho de qualidade que justifique. Sai do papel.
 
-Mesmo papel (watchdog automático após cada edição), mas agora ele:
+---
 
-- lê os arquivos alterados inteiros **e quem chama eles** (não 3 linhas de diff);
-- roda `git diff` / `git log` sozinho;
-- `--deny-tool write` garante que **revisa sem editar**.
+## 5. Melhoria 2 — DeepSeek como revisor de código automático
 
-### O custo — ponto a vigiar
+### A ideia (do usuário)
 
-O CLI nativo cobra **AI Credits** por execução (um teste trivial custou 0,43; uma
-revisão lendo arquivos pode custar 1–5+). A conta é **Copilot Pro (Student)**
-(logada como `maxwellnasci`), que tem cota mensal — ~300 premium requests/mês ou o
-equivalente em AI credits no billing novo — mais o modelo base "ilimitado".
-Conferir em github.com/settings/billing, ou no CLI interativo: rodapé, `/usage`,
-`/statusline quota`.
+Um **membro do time focado só em código — lógica e segurança** — que:
 
-Como watchdog **automático a cada edição**, isso soma. Mitigação:
+- roda **automático** depois que o Operador (Gemini) termina;
+- **analisa sem executar e sem editar** (read-only);
+- **reporta os achados pro Orquestrador** (não pro terminal);
+- o Orquestrador decide: trivial → manda o Operador ajustar; relevante → passa como
+  contexto pro Claude; nada → segue.
 
-- rodar o watchdog automático com `--model` num modelo leve e cooldown maior que
-  os 15s de hoje;
-- reservar revisão agêntica pesada só sob demanda;
-- como o Claude já é o revisor sênior de tudo, o Copilot pode continuar sendo só a
-  camada rápida e barata.
+É **um agente do time**, não um chat separado pra vigiar. A interface dele com o
+usuário é via Orquestrador (encaixa no "Orquestrador presta contas", Etapa 4 do
+Palco+Chat / achado A5).
 
-### "Copilot code review é ilimitado" — o que isso significa de verdade
+### Por que DeepSeek, e qual atalho
 
-O que se ouve falar (review ilimitado) é uma **feature do editor / do GitHub**, não
-do CLI:
+O DeepSeek **já está ligado** no Orquestra — credencial em `~/.claude-deepseek-env`
+(chave da conta **DeepSeek** pré-paga em platform.deepseek.com; **não** é Anthropic,
+**não** é conta nova). Dois atalhos existentes:
 
-| Superfície | Custo | Orquestra usa? |
+| Atalho (`orquestra.py`) | O que é | Ferramentas | Modelo padrão |
+|---|---|---|---|
+| **`Claude-DeepSeek`** (`deepseek`, ~linha 111) | CLI do `claude` com `env_file` apontando `ANTHROPIC_BASE_URL` pro DeepSeek → **harness do Claude Code + modelo DeepSeek** | sim | `deepseek-v4-pro` |
+| **`brain-deepseek`** (`orchestrator_brain.py`) | API de chat do DeepSeek direto | **não** — prompt→texto | `deepseek-v4-flash` |
+
+**Usar `Claude-DeepSeek` em `--permission-mode plan` (read-only):**
+
+- o revisor precisa **ler o codebase** (o diff + os arquivos de quem chama a função
+  alterada) — o `brain-deepseek` não consegue (teria que colar tudo no prompt, o
+  mesmo problema das "3 linhas" de hoje);
+- o `Claude-DeepSeek` usa **o harness bom** (grep/glob/ler trechos, gestão de
+  contexto — exatamente as vantagens do texto original), só que com modelo barato;
+- `_build_worker_cmd` **já suporta** `read_only=True` → `--permission-mode plan`
+  garante que ele analisa sem executar nem editar.
+
+### Custo
+
+DeepSeek V4 ≈ US$0,30/1M tokens de entrada. Uma revisão de diff + alguns arquivos
+≈ 30–80k tokens ≈ **US$0,01–0,03 por revisão**. 100 revisões/mês ≈ US$1–3.
+Praticamente ilimitado — o oposto dos 200 AIC do Copilot.
+
+### Antes / depois
+
+| | Cão de Guarda hoje (Copilot) | Revisor DeepSeek |
 |---|---|---|
-| Code review no VS Code (pedir review inline) | incluído em plano pago, **não consome premium requests / AI credits** | ❌ |
-| Copilot reviewer no PR (github.com) | idem — incluído | ❌ |
-| `copilot` CLI (`-p`, `/review`) | **medido em AI credits**, cada turno gasta | ✅ é o que o Cão de Guarda faz |
+| Contexto | 3 linhas de diff | lê o codebase de verdade (harness) |
+| Saída | printada no terminal, ignorada | vai pro Orquestrador, entra no relatório dele |
+| Ação | nenhuma | Orquestrador roteia (Operador / Claude / segue) |
+| Modo | — | read-only (`--permission-mode plan`) |
+| Custo | 200 AIC/mês compartilhado, ~0,5/run | ~US$0,01–0,03/run, pré-pago DeepSeek |
+| Escopo | "bug ou lógica errada" | lógica + segurança no diff |
 
-O CLI é superfície de billing separada — tem `--max-ai-credits` e autopilot pause
-justamente porque é metered. **`--model auto` não zera o custo** (billing novo é
-por token; o multiplicador 0x do billing legado vale pro modelo base, não é
-"review grátis").
+### O que fazer com o Copilot
 
-**Como aproveitar o review incluído (grátis) pelo Orquestra:**
+- **Recomendado:** tirar do papel de revisor automático. Deixar como **opção
+  manual** — já está instalado e logado; o usuário chama quando quiser um segundo
+  par de olhos e aceitar gastar AIC. Não dispara sozinho.
+- Alternativa: remover de vez (`cao_guarda` aponta pro `deepseek`).
 
-- **Opção A (grátis, assíncrona):** o fluxo empurra branch/PR e o Orquestra pede o
-  **Copilot PR review** via API GitHub (`request_copilot_review`). Essa revisão é
-  a incluída, não gasta cota. Precisa de PR.
-- **Opção B (barata, metered):** Cão de Guarda no CLI com modelo leve + cooldown
-  maior.
+### Riscos (todos pequenos)
 
-Não existe "CLI + ilimitado" ao mesmo tempo.
+- Manter o **escopo apertado**: lógica + segurança no diff, não redesenhar
+  arquitetura.
+- **Não somar latência** no caminho crítico — rodar em paralelo / passada rápida,
+  não bloqueando.
+- **Não virar mais um painel/chat pra babá** — a saída entra no relatório que o
+  Orquestrador já presta, só isso.
+- Garantir o **read-only por flag** (`--permission-mode plan`), não só no prompt.
+- Garantir **saldo** na conta DeepSeek.
 
 ---
 
-## 5. Estratégia consolidada
+## 6. Estratégia consolidada
 
 Divisão de trabalho, do mais barato ao mais caro:
 
 | Camada | Quem | Pega | Custo |
 |---|---|---|---|
 | **Gate** | script do `orquestra.py` | "não roda / teste quebrou / import errado" | 0 |
-| **Cão de Guarda** | Copilot agêntico (read-only) | "lógica obviamente errada", quebra de quem chama | AI Credits |
-| **Revisor** | Claude (Opus-5) | arquitetura, segurança, bug sutil, design | quota Anthropic |
+| **Revisor de código** | `Claude-DeepSeek` (plan / read-only) | lógica + segurança, quebra de quem chama; reporta ao Orquestrador | ~US$0,01–0,03/run |
+| **Revisor sênior** | Claude (Opus-5) | arquitetura, segurança profunda, bug sutil, design | quota Anthropic |
+| **2º par de olhos (manual)** | Copilot CLI, sob demanda | quando o usuário pedir | AI Credits |
 
 Decisões:
 
-- **Claude fica em tudo** — é o revisor sênior, inalterado. Não vira filtro nem
+- **Claude fica em tudo** — revisor sênior, inalterado. Não vira filtro nem
   opcional.
-- **Gate primeiro** — é o ganho principal e o de menor risco (~40 linhas, nenhum
-  agente novo).
-- **Copilot agêntico** — melhoria do Cão de Guarda existente: mesmo papel, motor
-  já instalado, custa só granular as permissões na invocação + vigiar AI Credits.
-  O "review ilimitado" é a feature do VS Code / PR, não o CLI; pra usar a versão
-  grátis pelo Orquestra, pedir Copilot PR review via API num branch/PR.
-- Opcional, depois: tornar o veredito do Cão de Guarda acionável (devolver pro
-  Gemini em vez de só imprimir).
+- **Gate primeiro** — ganho principal, menor risco (~40 linhas, nenhum agente
+  novo).
+- **Cão de Guarda: Copilot → DeepSeek** — mesmo papel no fluxo, motor barato, e a
+  saída passa a servir pra algo (vai pro Orquestrador). Troca contida, não feature
+  nova.
+- **Copilot** — fora do automático; fica como opção manual.
 
 ---
 
 ## Referências no código
 
-- `orquestra.py:3330` — `_build_worker_cmd` (montagem do comando de cada operário)
+- `orquestra.py:49` — `DEEPSEEK_ENV = ~/.claude-deepseek-env`
+- `orquestra.py:111` — atalho worker `deepseek` (`Claude-DeepSeek`)
+- `orquestra.py:3330` — `_build_worker_cmd` (monta o comando; suporta `read_only`)
 - `orquestra.py:3392` — comentário desatualizado sobre `gh copilot`
 - `orquestra.py:3465` — `watchdog_verdict` (Cão de Guarda síncrono)
 - `orquestra.py:3529` — `_run_copilot_watchdog` (thread daemon)
@@ -241,4 +279,15 @@ Decisões:
 - `orquestra.py:3603` — failover por quota/429
 - `orquestra.py:4196` — retry por stdout vazio
 - `orquestra.py:3638`, `4422` — pontos onde o Cão de Guarda é disparado
-- `orchestrator_brain.py` — cérebro do Orquestrador (zero ferramentas, não edita)
+- `orchestrator_brain.py:72` — `_creds_deepseek()` (lê `~/.claude-deepseek-env`)
+
+---
+
+## Fontes (billing Copilot)
+
+- GitHub Changelog — Copilot code review vai consumir Actions minutes em 1º/jun/2026:
+  https://github.blog/changelog/2026-04-27-github-copilot-code-review-will-start-consuming-github-actions-minutes-on-june-1-2026/
+- Codacy — "Copilot Code Review used to be included, from June 1st you pay twice":
+  https://blog.codacy.com/github-copilot-code-review-used-to-be-included-from-june-1st-you-pay-twice
+- push-based.io — GitHub Copilot AI Credits, a mudança de billing
+- StudyAI Hub — Copilot grátis pra estudante 2026 (200 AI Credits/mês)
