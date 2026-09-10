@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import shutil
+import shlex
 import json
 import re
 import fnmatch
@@ -55,7 +56,8 @@ CHAT_HISTORY_DIR = Path.home() / ".orquestra_chats"
 #                       Só conversa, planeja e delega — nunca executa nada.
 # workers.operador     → EXECUTA: lê, escreve, altera código, roda comandos.
 # workers.revisor      → REVISA sob demanda (bugs, arquitetura, segurança).
-# workers.cao_guarda   → Copilot AUTOMÁTICO e silencioso: audita cada git diff.
+# workers.cao_guarda   → DeepSeek read-only AUTOMÁTICO: audita cada git diff e
+#                       reporta o achado ao Orquestrador (não só ao terminal).
 # workers.claude/agy/deepseek/codex → atalhos de motor específico (uso avançado).
 DEFAULT_CONFIG = {
     "active_role": "orquestrador",
@@ -87,12 +89,15 @@ DEFAULT_CONFIG = {
             "description": "Revisa código sob demanda: bugs, arquitetura, segurança."
         },
         "cao_guarda": {
-            "binary": "copilot",
-            "model": "auto",
+            "binary": "claude",
+            "model": "deepseek-v4-pro",
+            "env_file": str(DEEPSEEK_ENV),
             "icon": "🐕",
             "color": "yellow",
             "label": "Cão de Guarda",
-            "description": "Copilot automático — audita cada git diff em silêncio."
+            "description": "Revisor automático (DeepSeek, read-only) — lê o codebase ao redor "
+                           "do diff em busca de bugs, lógica errada e riscos de segurança; "
+                           "reporta ao Orquestrador."
         },
         "claude": {
             "binary": "claude",
@@ -169,6 +174,17 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "always_confirm_patterns": ["*.env*", "*secret*", "*credential*", "*/auth*", "*.pem", "*.key"],
     },
+    # Gate de verificação determinística: depois de um operário editar arquivos, o
+    # Orquestra roda o teste/build do projeto (subprocess, sem LLM). Se falhar,
+    # devolve o log de erro pro MESMO operário consertar (teto max_retries) antes
+    # de entregar ao Revisor. "command" vazio = auto-detecção; um arquivo
+    # .orquestra_gate na raiz do projeto tem prioridade (é per-projeto).
+    "gate": {
+        "enabled": True,
+        "command": "",
+        "timeout_s": 180,
+        "max_retries": 2,
+    },
 }
 
 
@@ -179,6 +195,11 @@ console = Console()
 # no meio — sem isso, deltas de texto de dois operários podem se entrelaçar
 # caractere a caractere na tela.
 _console_lock = threading.RLock()
+
+# save_chat_message faz read-modify-write de um JSON — várias threads de operário
+# paralelas (e o Cão de Guarda) escrevem no mesmo arquivo. Serializa pra não
+# perder mensagem.
+_chat_lock = threading.RLock()
 
 # Arquivo de log para o "Modo Cursor" (Terminal Limpo)
 LOG_FILE_NAME = ".orquestra_logs.md"
@@ -365,6 +386,19 @@ def load_config() -> dict:
                 cfg["workers"][w_name] = w_data
                 needs_save = True
 
+    # Cão de Guarda: migra o default ANTIGO (Copilot) para o novo (DeepSeek
+    # read-only). A revisão de código do Copilot deixou de ser grátis em jun/2026
+    # (200 AI Credits/mês compartilhados). Só vira se ainda for a combinação
+    # intocada copilot+auto — se o usuário escolheu um modelo/binário de propósito,
+    # preserva.
+    cg = cfg.get("workers", {}).get("cao_guarda")
+    if cg and cg.get("binary") == "copilot" and cg.get("model") in ("auto", "", None):
+        cfg["workers"]["cao_guarda"] = dict(DEFAULT_CONFIG["workers"]["cao_guarda"])
+        console.print("[dim]⚙  Cão de Guarda migrado de Copilot para DeepSeek — a revisão "
+                      "automática do Copilot deixou de ser grátis (jun/2026). Use /agentes "
+                      "trocar pra ajustar.[/dim]")
+        needs_save = True
+
     # Garante que a seção ui existe e tem 'detail'
     if "ui" not in cfg:
         cfg["ui"] = dict(DEFAULT_CONFIG["ui"])
@@ -384,6 +418,17 @@ def load_config() -> dict:
         for k, v in DEFAULT_CONFIG["risk_gates"].items():
             if k not in cfg["risk_gates"]:
                 cfg["risk_gates"][k] = v
+                needs_save = True
+
+    # Gate de verificação: seção nova. Backfill de chaves faltando; um user que já
+    # tem gate:{enabled:false} é preservado.
+    if "gate" not in cfg:
+        cfg["gate"] = dict(DEFAULT_CONFIG["gate"])
+        needs_save = True
+    else:
+        for k, v in DEFAULT_CONFIG["gate"].items():
+            if k not in cfg["gate"]:
+                cfg["gate"][k] = v
                 needs_save = True
 
     if needs_save:
@@ -420,12 +465,13 @@ def load_chat_history(role_name: str) -> list:
         return json.load(f)
 
 def save_chat_message(role_name: str, role: str, content: str):
-    history = load_chat_history(role_name)
-    history.append({"role": role, "content": content})
-    # Mantém apenas as últimas 50 mensagens
-    history = history[-50:]
-    with open(get_chat_file(role_name), "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
+    with _chat_lock:
+        history = load_chat_history(role_name)
+        history.append({"role": role, "content": content})
+        # Mantém apenas as últimas 50 mensagens
+        history = history[-50:]
+        with open(get_chat_file(role_name), "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
 
 def get_session_id(role_name: str) -> str | None:
     """Retorna o ID da última sessão do agy para este papel no projeto atual."""
@@ -3221,7 +3267,7 @@ SUGESTAO_RE = re.compile(
 _WORKER_TAG_DEFAULTS = {
     "operador":   ("claude",  "Operador",       "🔨", "cyan"),
     "revisor":    ("claude",  "Revisor",        "🔍", "blue"),
-    "cao_guarda": ("copilot", "Cão de Guarda",  "🐕", "yellow"),
+    "cao_guarda": ("claude",  "Cão de Guarda",  "🐕", "yellow"),
     "claude":     ("claude",  "Motor Claude",   "💞", "cyan"),
     "agy":        ("agy",     "Motor Antigravity", "💚", "green"),
     "deepseek":   ("claude",  "Motor DeepSeek", "💙", "blue"),
@@ -3463,8 +3509,9 @@ def _git_diff_snapshot(cwd: str, max_chars: int = 6000) -> str:
 
 
 def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tuple:
-    """Roda o Cão de Guarda (SÍNCRONO) sobre o diff atual. Passa o diff pronto no
-    prompt em vez de pedir pro agente rodar git — mais rápido e determinístico.
+    """Roda o Cão de Guarda (SÍNCRONO) sobre o diff atual. O diff vai pronto no
+    prompt como ponto de partida, mas o motor (Claude-DeepSeek em --permission-mode
+    plan) PODE ler outros arquivos do repo pra avaliar o impacto real.
     Retorna (texto, achou_bug). ('', False) quando não há mudança, o binário
     falha, ou o veredito é 'tudo certo'.
 
@@ -3489,11 +3536,20 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
 
     worker, binary, *_ = _resolve_worker(config, "cao_guarda")
     model = worker.get("model", "auto")
-    alvo = "o diff" if modo == "diff" else "o arquivo (sem git disponível pra comparar com a versão anterior)"
+    wenv = os.environ.copy()
+    ef = worker.get("env_file", "")
+    if ef and Path(os.path.expanduser(ef)).exists():
+        wenv.update(load_env_file(ef))
+    alvo = ("As mudanças não-commitadas do projeto estão abaixo."
+            if modo == "diff" else
+            "O conteúdo abaixo é um arquivo (não há git pra comparar com a versão anterior).")
     prompt = (
-        f"Você é o Cão de Guarda. Analise APENAS {alvo} abaixo em busca de BUGS ou lógica "
-        "errada (ignore estilo e formatação). Se achar algo, seja curto e direto: arquivo, "
-        "o problema e o impacto. Se estiver tudo certo, responda somente 'Tudo certo'.\n\n"
+        f"Você é o Cão de Guarda, revisor de código. {alvo} Você PODE ler outros arquivos "
+        "do repositório (quem chama as funções alteradas, arquivos vizinhos, testes) pra "
+        "avaliar o impacto real. Analise em busca de BUGS, lógica errada ou riscos de "
+        "segurança (ignore estilo e formatação). Se achar algo, seja curto e direto: "
+        "arquivo, o problema, o impacto. Se estiver tudo certo, responda somente "
+        "'Tudo certo'.\n\n"
         f"{diff}"
     )
 
@@ -3508,13 +3564,15 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
     elif binary == "codex":
         cmd = ["codex", "exec", prompt, "--sandbox", "read-only", "--skip-git-repo-check"]
     else:
-        cmd = ["claude", "-p", prompt]
-        if model:
+        # claude (inclui deepseek via env_file) — plan = read-only, pode ler mas
+        # nunca escrever. Sem --output-format → stdout é texto puro.
+        cmd = ["claude", "-p", prompt, "--permission-mode", "plan"]
+        if model and model != "auto":
             cmd += ["--model", model]
 
     try:
         res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
-                             timeout=90, stdin=subprocess.DEVNULL)
+                             timeout=240, stdin=subprocess.DEVNULL, env=wenv)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return "", False
 
@@ -3526,25 +3584,179 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
     return out, has_bug
 
 
+def _watchdog_report(cfg: dict):
+    """Roda o veredito do Cão de Guarda e, se houver algo a dizer: imprime no
+    terminal E salva no histórico do Orquestrador (pra ele ver o achado na
+    próxima vez que o usuário falar com ele). SÍNCRONO — chamado pela thread
+    daemon de _run_copilot_watchdog e pelos testes.
+
+    NÃO chama _orchestrator_react aqui: essa função roda numa thread separada
+    enquanto _worker_lifecycle já dispara o _orchestrator_react dele — duas
+    reações concorrentes brigariam por stdout e pelo orquestrador.json."""
+    text, has_bug = watchdog_verdict(cfg)
+    if not text:
+        return
+    marker = "⚠ [bold red]" if has_bug else "[bold yellow]"
+    with _console_lock:
+        console.print(f"\n{marker}🐕 Cão de Guarda[/]\n{text}\n")
+    save_chat_message("orquestrador", "assistant",
+                      f"[Cão de Guarda — revisão automática]:\n{text}")
+
+
 def _run_copilot_watchdog(config: dict = None):
-    """Dispara o Cão de Guarda numa thread daemon (não bloqueia o operário) e
-    imprime no terminal SÓ se houver algo a dizer. Cooldown de 15s pra não rodar
-    N vezes quando vários operários paralelos terminam quase juntos."""
+    """Dispara o Cão de Guarda numa thread daemon (não bloqueia o operário).
+    Cooldown de 15s pra não rodar N vezes quando vários operários paralelos
+    terminam quase juntos."""
     with _watchdog_lock:
         if time.time() - _watchdog_last[0] < 15:
             return
         _watchdog_last[0] = time.time()
     cfg = config or load_config()
+    threading.Thread(target=_watchdog_report, args=(cfg,), daemon=True, name="cao-guarda").start()
 
-    def _run():
-        text, has_bug = watchdog_verdict(cfg)
-        if not text:
-            return
-        marker = "⚠ [bold red]" if has_bug else "[bold yellow]"
-        with _console_lock:
-            console.print(f"\n{marker}🐕 Cão de Guarda[/]\n{text}\n")
 
-    threading.Thread(target=_run, daemon=True, name="cao-guarda").start()
+# ─────────────────────────────────────────────────────────
+# Gate de verificação determinística
+# ─────────────────────────────────────────────────────────
+
+_GATE_REPROMPT = (
+    "A verificação automática do projeto falhou depois da sua última alteração.\n"
+    "Comando: {cmd}\n\nSaída (fim):\n{log}\n\n"
+    "Corrija APENAS o necessário para o comando passar (exit 0). Não refatore além "
+    "disso, não altere testes para escondê-lo. Ao terminar, resuma em uma linha o "
+    "que ajustou."
+)
+
+
+def _gate_enabled(config: dict) -> bool:
+    return bool((config or {}).get("gate", {}).get("enabled"))
+
+
+def _open_live_section(label: str, icon: str, color: str):
+    s = LiveSection(label, icon, color)
+    s.open()
+    return s
+
+
+def _detect_project_check(project_dir: str, config: dict) -> tuple:
+    """(cmd: list|None, label: str). Conservador: na dúvida retorna (None, motivo)
+    e o gate vira no-op silencioso. Ordem: .orquestra_gate (per-projeto) >
+    config['gate']['command'] > auto-detecção por ecossistema."""
+    p = Path(project_dir)
+
+    gate_file = p / ".orquestra_gate"
+    try:
+        if gate_file.is_file():
+            for ln in gate_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith("#"):
+                    return shlex.split(ln), ".orquestra_gate"
+    except OSError:
+        pass
+
+    cfg_cmd = ((config or {}).get("gate", {}).get("command", "") or "").strip()
+    if cfg_cmd:
+        return shlex.split(cfg_cmd), "gate.command"
+
+    def _has(name):
+        return (p / name).exists()
+
+    def _text(name):
+        try:
+            return (p / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    is_pytest = _has("pytest.ini") or _has("tox.ini") or ("[tool.pytest" in _text("pyproject.toml"))
+    pkg_test = False
+    if _has("package.json"):
+        try:
+            t = ((json.loads(_text("package.json")).get("scripts") or {}).get("test") or "").strip()
+            pkg_test = bool(t) and "no test specified" not in t
+        except (ValueError, AttributeError):
+            pkg_test = False
+    is_ts = _has("tsconfig.json")
+    is_rust = _has("Cargo.toml")
+    is_go = _has("go.mod")
+
+    if sum(1 for f in (is_pytest, pkg_test, is_rust, is_go) if f) > 1:
+        return None, "ambíguo — pulado"
+    if is_pytest:
+        return ["python3", "-m", "pytest", "-q", "-x"], "pytest"
+    if pkg_test:
+        return ["npm", "test", "--silent"], "npm test"
+    if is_ts:
+        return ["npx", "--no-install", "tsc", "--noEmit"], "tsc --noEmit"
+    if is_rust:
+        return ["cargo", "check", "--quiet"], "cargo check"
+    if is_go:
+        return ["go", "build", "./..."], "go build"
+    return None, "sem verificação"
+
+
+def _run_gate_check(cmd: list, cwd: str, timeout_s: int) -> tuple:
+    """(rc: int|None, output: str). rc is None = inconclusivo (ferramenta ausente,
+    timeout, command-not-found) → o gate pula em silêncio, nunca pune o operário."""
+    try:
+        pr = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                            timeout=timeout_s, stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None, ""
+    except (subprocess.TimeoutExpired, OSError):
+        return None, "timeout"
+    out = (pr.stdout or "") + (pr.stderr or "")
+    if pr.returncode == 127:
+        return None, ""
+    return pr.returncode, out
+
+
+def _run_verification_gate(config: dict, worker: dict, actual_binary: str, tag: str,
+                           instruction: str, project_dir: str, detail: str,
+                           make_section=None) -> tuple:
+    """Roda o teste/build do projeto; se falhar, devolve o log de erro pro MESMO
+    operário consertar (teto config['gate']['max_retries']). Retorna
+    (passou: bool, resumo: str). resumo == "" ⇒ nada a dizer (gate foi no-op)."""
+    cmd, label = _detect_project_check(project_dir, config)
+    if cmd is None:
+        return True, ""
+
+    gcfg = (config or {}).get("gate", {})
+    timeout_s = int(gcfg.get("timeout_s", 180) or 180)
+    max_retries = int(gcfg.get("max_retries", 2) or 0)
+
+    rc, out = _run_gate_check(cmd, project_dir, timeout_s)
+    if rc is None:
+        return True, ""
+    if rc == 0:
+        return True, f"✅ verificação passou ({label})"
+
+    mk = make_section or _open_live_section
+    _, _, wlabel, wicon, wcolor = _resolve_worker(config, tag)
+    attempts = 0
+    while rc != 0 and attempts < max_retries:
+        attempts += 1
+        reprompt = _GATE_REPROMPT.format(cmd=" ".join(cmd), log=out[-4000:])
+        w_cmd, w_env, ofile = _build_worker_cmd(worker, actual_binary, reprompt)
+        sec = mk(f"{wlabel} — corrigindo ({attempts}/{max_retries})", wicon, wcolor)
+        res = _run_worker_headless(
+            w_cmd, w_env, project_dir, sec, actual_binary == "agy", detail=detail,
+            is_codex=actual_binary == "codex", is_copilot=actual_binary == "copilot",
+            is_opencode=actual_binary == "opencode", output_file=ofile,
+        )
+        if ofile:
+            try:
+                os.unlink(ofile)
+            except OSError:
+                pass
+        if getattr(res, "is_error", False):
+            return False, f"⚠️ verificação falhou ({label}); operário não conseguiu corrigir"
+        rc, out = _run_gate_check(cmd, project_dir, timeout_s)
+
+    if rc == 0:
+        return True, f"✅ verificação passou ({label}) após {attempts} correção(ões)"
+    return False, (f"❌ verificação ainda falha ({label}) após {attempts} tentativa(s) — "
+                   f"entregando assim mesmo:\n{out[-1500:]}")
+
 
 def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
     """Executa uma cadeia de operários em sequência (um <PIPELINE> emitido pelo
@@ -3633,8 +3845,19 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
 
         if not is_error and changes_summary:
             new_status = "⚠️ Aguardando Aprovação"
-            # Dispara o cão de guarda na última etapa se houver mudanças
+            # Gate + cão de guarda só na última etapa (as intermediárias são
+            # incompletas de propósito — o próximo passo completa).
             if idx == total:
+                if _gate_enabled(config):
+                    passed, gsummary = _run_verification_gate(
+                        config, worker, actual_binary, target_binary_tag, instruction,
+                        get_project_dir(), detail)
+                    if gsummary:
+                        console.print(f"[dim]🔎 {gsummary}[/dim]")
+                        if not passed:
+                            new_status = "⚠️ Aguardando Aprovação (verificação falhou)"
+                            save_chat_message("orquestrador", "assistant",
+                                              f"[Verificação automática]:\n{gsummary}")
                 _run_copilot_watchdog(config)
         else:
             new_status = "✅ Concluído"
@@ -4417,8 +4640,19 @@ def main():
                             _auto_open_in_cursor_at(mf_abs, first_line)
 
 
+                    gate_passed, gate_summary = True, ""
                     if not is_error and changes_summary:
-                        new_status = "⚠️ Aguardando Aprovação"
+                        if _gate_enabled(config):
+                            gw, gab, *_ = _resolve_worker(config, tag)
+                            gate_passed, gate_summary = _run_verification_gate(
+                                config, gw, gab, tag, delegate_instruction, get_project_dir(), detail)
+                            if gate_summary:
+                                with _console_lock:
+                                    console.print(f"[dim]🔎 {gate_summary}[/dim]")
+                                if not gate_passed:
+                                    save_chat_message("orquestrador", "assistant",
+                                                      f"[Verificação automática]:\n{gate_summary}")
+                        new_status = "⚠️ Aguardando Aprovação" + ("" if gate_passed else " (verificação falhou)")
                         _run_copilot_watchdog(config)
                     else:
                         new_status = "❌ Erro" if is_error else "✅ Concluído"
@@ -4435,6 +4669,8 @@ def main():
                         return
 
                     captured = final_text.strip()
+                    if not gate_passed and gate_summary:
+                        captured = (captured + f"\n\n[Verificação automática ainda falha: {gate_summary}]").strip()
                     if captured:
                         summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
                         save_chat_message("orquestrador", "assistant", summary)

@@ -2017,6 +2017,21 @@ class OrquestraTUI(App):
                     "instruction": instruction, "files": result.changed_files,
                 }
 
+            if orquestra._gate_enabled(config) and not read_only and result.changed_files:
+                self._activity("🔎", "Verificação", "rodando teste/build...")
+                passed, gsummary = orquestra._run_verification_gate(
+                    config, worker_cfg, actual_binary, binary_tag, instruction, cwd,
+                    orquestra._detail_level(config),
+                    make_section=lambda lbl, ic, col: _TUILiveSection(
+                        lbl, lambda t: self._activity(ic, lbl, t), lambda *a: None,
+                        lambda s: self._activity(ic, lbl, s)))
+                if gsummary:
+                    self.call_from_thread(log.write, f"\n[dim]🔎 {gsummary}[/dim]\n")
+                    self._activity("🔎", "Verificação", gsummary)
+                    if not passed:
+                        orquestra.save_chat_message("orquestrador", "assistant",
+                                                    f"[Verificação automática]:\n{gsummary}")
+
             auto_ok = (not read_only) and self._should_auto_approve(config, result.changed_files)
             has_bug = False
             if auto_ok:
@@ -2032,6 +2047,9 @@ class OrquestraTUI(App):
                     self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
                     self.call_from_thread(footer.remove_class, "alert")
                     self._activity("🐕", "Cão de Guarda", wtext or "nada a apontar. ✅")
+                if wtext:
+                    orquestra.save_chat_message("orquestrador", "assistant",
+                                                f"[Cão de Guarda — revisão automática]:\n{wtext}")
 
             if auto_ok and not has_bug:
                 self.call_from_thread(log.write, "\n[dim](gate por risco: seguindo sem pausar)[/dim]\n")
@@ -2084,6 +2102,12 @@ class OrquestraTUI(App):
         else:
             self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {text[:220]}")
             self.call_from_thread(footer.remove_class, "alert")
+
+        # Rota pro Orquestrador só na revisão pós-Aprovar (não na auditoria de
+        # save manual do editor, que seria ruído a cada Ctrl+S).
+        if text and commit_after and file_path is None:
+            orquestra.save_chat_message("orquestrador", "assistant",
+                                        f"[Cão de Guarda — revisão automática]:\n{text}")
 
         if commit_after:
             commited = orquestra.commit_pending(orquestra.get_project_dir(), "Orquestra: mudança aprovada")
@@ -2407,6 +2431,22 @@ class OrquestraTUI(App):
                         "instruction": instruction, "files": result.changed_files,
                     }
 
+                # Gate só na última etapa (as intermediárias são incompletas).
+                if idx == len(steps) and orquestra._gate_enabled(config) and result.changed_files:
+                    self._activity("🔎", "Verificação", "rodando teste/build...")
+                    passed, gsummary = orquestra._run_verification_gate(
+                        config, worker_cfg, actual_binary, tag, instruction, cwd,
+                        orquestra._detail_level(config),
+                        make_section=lambda lbl, ic, col: _TUILiveSection(
+                            lbl, lambda t: self._activity(ic, lbl, t), lambda *a: None,
+                            lambda s: self._activity(ic, lbl, s)))
+                    if gsummary:
+                        self.call_from_thread(log.write, f"\n[dim]🔎 {gsummary}[/dim]\n")
+                        self._activity("🔎", "Verificação", gsummary)
+                        if not passed:
+                            orquestra.save_chat_message("orquestrador", "assistant",
+                                                        f"[Verificação automática]:\n{gsummary}")
+
                 auto_ok = self._should_auto_approve(config, result.changed_files)
                 has_bug = False
                 if auto_ok:
@@ -2422,6 +2462,9 @@ class OrquestraTUI(App):
                         self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
                         self.call_from_thread(footer.remove_class, "alert")
                         self._activity("🐕", "Cão de Guarda", wtext or "nada a apontar. ✅")
+                    if wtext:
+                        orquestra.save_chat_message("orquestrador", "assistant",
+                                                    f"[Cão de Guarda — revisão automática]:\n{wtext}")
 
                 if auto_ok and not has_bug:
                     # Gate por risco: nenhum caminho sensível e o Cão de Guarda não

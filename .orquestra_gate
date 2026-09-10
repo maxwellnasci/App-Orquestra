@@ -1,0 +1,3 @@
+# Comando de verificação do gate pro próprio Orquestra.
+# test_orquestra.py não é pytest (roda direto), então a auto-detecção não pega.
+python3 test_orquestra.py

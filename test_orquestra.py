@@ -32,7 +32,11 @@ _w, b, label, *_ = orquestra._resolve_worker(cfg, "revisor")
 check(b == "claude" and label == "Revisor", "revisor → claude / Revisor")
 
 _w, b, *_ = orquestra._resolve_worker(cfg, "cao_guarda")
-check(b == "copilot", "cao_guarda → copilot")
+check(b == "claude", "cao_guarda → claude (DeepSeek via env_file)")
+check(_w.get("model") == "deepseek-v4-pro" and _w.get("env_file"),
+      "cao_guarda usa deepseek-v4-pro + env_file")
+check(orquestra._WORKER_TAG_DEFAULTS["cao_guarda"][0] == "claude",
+      "_WORKER_TAG_DEFAULTS cao_guarda → claude")
 
 for legado, canon in [("implementador", "Operador"), ("designer", "Operador"),
                       ("pesquisador", "Operador"), ("arquiteto", "Revisor"),
@@ -310,6 +314,41 @@ try:
         check(od and od.get("agent") == "claude", "open_design semeado com agent=claude")
     else:
         check(od is None, "open_design NÃO semeado (clone ausente)")
+
+    # gate: seção nova é semeada (enabled=True, decisão do usuário)
+    check(c1.get("gate", {}).get("enabled") is True, "gate semeado com enabled=True")
+    check(c1["gate"]["max_retries"] == 2, "gate.max_retries default 2")
+
+    # Cão de Guarda: default antigo (copilot/auto) vira DeepSeek na migração
+    orquestra.CONFIG_FILE.write_text(json.dumps({
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "workers": {"cao_guarda": {"binary": "copilot", "model": "auto", "icon": "🐕",
+                                   "color": "yellow", "label": "Cão de Guarda"}},
+        "ui": {},
+    }), encoding="utf-8")
+    cg1 = orquestra.load_config()
+    check(cg1["workers"]["cao_guarda"]["binary"] == "claude", "cao_guarda copilot/auto → claude (migração)")
+    check(cg1["workers"]["cao_guarda"].get("env_file"), "cao_guarda migrado ganha env_file DeepSeek")
+    cg2 = orquestra.load_config()
+    check(cg2["workers"]["cao_guarda"]["binary"] == "claude", "migração do cao_guarda idempotente")
+
+    # Cão de Guarda: usuário escolheu um modelo Copilot de propósito → preservado
+    orquestra.CONFIG_FILE.write_text(json.dumps({
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "workers": {"cao_guarda": {"binary": "copilot", "model": "gpt-5.6"}},
+        "ui": {},
+    }), encoding="utf-8")
+    cg3 = orquestra.load_config()
+    check(cg3["workers"]["cao_guarda"]["binary"] == "copilot", "cao_guarda copilot com modelo real → preservado")
+
+    # gate: usuário que já desligou é preservado
+    orquestra.CONFIG_FILE.write_text(json.dumps({
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "workers": {}, "ui": {}, "gate": {"enabled": False},
+    }), encoding="utf-8")
+    cgt = orquestra.load_config()
+    check(cgt["gate"]["enabled"] is False, "gate.enabled=False do usuário preservado")
+    check(cgt["gate"]["timeout_s"] == 180, "gate.timeout_s backfilled")
 finally:
     orquestra.CONFIG_FILE = orig_cfg
 
@@ -451,6 +490,127 @@ check(not Path(_r, "tarefa_novo.py").exists(),
 check("confirm_delegates" in orquestra.DEFAULT_CONFIG["ui"]
       and orquestra.DEFAULT_CONFIG["ui"]["confirm_delegates"] is True,
       "achado A1: ui.confirm_delegates nasce True no DEFAULT_CONFIG")
+
+
+# ── Gate de verificação determinística ─────────────────────────────────────
+print("gate — detecção e execução")
+
+check(orquestra._gate_enabled({"gate": {"enabled": True}}) is True, "_gate_enabled True")
+check(orquestra._gate_enabled({"gate": {"enabled": False}}) is False, "_gate_enabled False")
+check(orquestra._gate_enabled({}) is False, "_gate_enabled sem seção → False")
+
+_gt = Path(tempfile.mkdtemp())
+check(orquestra._detect_project_check(str(_gt), {})[0] is None, "pasta vazia → sem verificação")
+
+(_gt / "pytest.ini").write_text("[pytest]\n")
+_cmd, _lbl = orquestra._detect_project_check(str(_gt), {})
+check(_cmd and _cmd[:3] == ["python3", "-m", "pytest"], "pytest.ini → pytest")
+
+(_gt / "Cargo.toml").write_text("[package]\n")
+check(orquestra._detect_project_check(str(_gt), {})[0] is None, "pytest + Cargo → ambíguo (None)")
+
+_gt2 = Path(tempfile.mkdtemp())
+(_gt2 / "package.json").write_text(json.dumps({"scripts": {"test": "echo \"Error: no test specified\" && exit 1"}}))
+check(orquestra._detect_project_check(str(_gt2), {})[0] is None, "package.json placeholder → None")
+(_gt2 / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}))
+check(orquestra._detect_project_check(str(_gt2), {})[0][:2] == ["npm", "test"], "package.json test real → npm test")
+
+_gt3 = Path(tempfile.mkdtemp())
+check(orquestra._detect_project_check(str(_gt3), {"gate": {"command": "make check"}})[0] == ["make", "check"],
+      "gate.command → shlex.split")
+(_gt3 / ".orquestra_gate").write_text("# comentário\npython3 run_tests.py --fast\n")
+check(orquestra._detect_project_check(str(_gt3), {"gate": {"command": "make check"}})[0]
+      == ["python3", "run_tests.py", "--fast"], ".orquestra_gate vence gate.command")
+
+# _run_verification_gate: fluxos, com _run_gate_check mockado
+_GCFG = {"gate": {"enabled": True, "command": "true", "timeout_s": 5, "max_retries": 2}}
+_wk = {"binary": "claude", "model": ""}
+
+class _QuietSection:
+    def open(self): pass
+    def close(self, **k): pass
+    def write(self, *a): pass
+    def tool_call(self, *a): pass
+    def end_line(self): pass
+_quiet = lambda *a: _QuietSection()
+
+_gt_none = Path(tempfile.mkdtemp())  # nada detectável
+with patch("orquestra._run_gate_check", side_effect=AssertionError("não deveria rodar")):
+    _p, _s = orquestra._run_verification_gate({"gate": {}}, _wk, "claude", "operador",
+                                              "faz X", str(_gt_none), "normal")
+    check(_p is True and _s == "", "nada detectável → no-op, sem rodar check")
+
+_gt4 = Path(tempfile.mkdtemp()); (_gt4 / "pytest.ini").write_text("[pytest]\n")
+with patch("orquestra._run_gate_check", return_value=(None, "")):
+    _p, _s = orquestra._run_verification_gate(_GCFG, _wk, "claude", "operador", "x", str(_gt4), "normal", make_section=_quiet)
+    check(_p is True and _s == "", "ferramenta ausente (rc None) → passa em silêncio")
+
+with patch("orquestra._run_gate_check", return_value=(0, "")):
+    _p, _s = orquestra._run_verification_gate(_GCFG, _wk, "claude", "operador", "x", str(_gt4), "normal", make_section=_quiet)
+    check(_p is True and "passou" in _s, "check passou de primeira")
+
+_calls = {"n": 0}
+def _fake_headless(*a, **k):
+    _calls["n"] += 1
+    return orquestra.WorkerResult(final_text="consertei", is_error=False, error_detail="",
+                                  changes_summary="", cost_usd=0.0)
+with patch("orquestra._run_gate_check", side_effect=[(1, "FAILED test_x"), (0, "")]), \
+     patch("orquestra._build_worker_cmd", return_value=(["true"], {}, None)), \
+     patch("orquestra._run_worker_headless", side_effect=_fake_headless):
+    _p, _s = orquestra._run_verification_gate(_GCFG, _wk, "claude", "operador", "x", str(_gt4), "normal", make_section=_quiet)
+    check(_p is True and _calls["n"] == 1 and "após 1" in _s, "falha → 1 correção → passa")
+
+_calls["n"] = 0
+with patch("orquestra._run_gate_check", return_value=(1, "boom")), \
+     patch("orquestra._build_worker_cmd", return_value=(["true"], {}, None)), \
+     patch("orquestra._run_worker_headless", side_effect=_fake_headless):
+    _p, _s = orquestra._run_verification_gate(_GCFG, _wk, "claude", "operador", "x", str(_gt4), "normal", make_section=_quiet)
+    check(_p is False and _calls["n"] == 2 and "boom" in _s, "falha persistente → teto de retries → entrega mesmo assim")
+
+def _err_headless(*a, **k):
+    return orquestra.WorkerResult(final_text="", is_error=True, error_detail="crash",
+                                  changes_summary="", cost_usd=0.0)
+with patch("orquestra._run_gate_check", return_value=(1, "x")), \
+     patch("orquestra._build_worker_cmd", return_value=(["true"], {}, None)), \
+     patch("orquestra._run_worker_headless", side_effect=_err_headless):
+    _p, _s = orquestra._run_verification_gate(_GCFG, _wk, "claude", "operador", "x", str(_gt4), "normal", make_section=_quiet)
+    check(_p is False and "não conseguiu corrigir" in _s, "operário erra no meio → gate para")
+
+
+# ── watchdog_verdict: comando DeepSeek + rota pro Orquestrador ─────────────
+print("watchdog_verdict — DeepSeek + rota")
+
+import subprocess as _sp2
+_env_tmp = Path(tempfile.mkdtemp()) / ".ds-env"
+_env_tmp.write_text("ANTHROPIC_API_KEY=xyz\nANTHROPIC_BASE_URL=https://api.deepseek.com\n")
+_cap = {}
+def _fake_run(cmd, **kw):
+    _cap["cmd"] = cmd
+    _cap["env"] = kw.get("env")
+    return _sp2.CompletedProcess(cmd, 0, stdout="Bug: off-by-one em foo.py (loop passa do fim)", stderr="")
+_wdcfg = {"workers": {"cao_guarda": {"binary": "claude", "model": "deepseek-v4-pro",
+                                     "env_file": str(_env_tmp)}}}
+with patch("orquestra._git_diff_snapshot", return_value="--- diff falso ---"), \
+     patch("orquestra.subprocess.run", side_effect=_fake_run):
+    _txt, _bug = orquestra.watchdog_verdict(_wdcfg)
+check("--permission-mode" in _cap["cmd"] and "plan" in _cap["cmd"], "watchdog: claude --permission-mode plan")
+check("--model" in _cap["cmd"] and "deepseek-v4-pro" in _cap["cmd"], "watchdog: --model deepseek-v4-pro")
+check(_cap["env"] and _cap["env"].get("ANTHROPIC_API_KEY") == "xyz", "watchdog: env_file carregado no subprocess")
+check(_bug is True and "off-by-one" in _txt, "watchdog: acha bug e reporta o texto")
+
+with patch("orquestra._git_diff_snapshot", return_value="--- diff ---"), \
+     patch("orquestra.subprocess.run", side_effect=lambda c, **k: _sp2.CompletedProcess(c, 0, stdout="Tudo certo", stderr="")):
+    _txt2, _bug2 = orquestra.watchdog_verdict(_wdcfg)
+check(_txt2 == "" and _bug2 is False, "watchdog: 'Tudo certo' → silêncio")
+
+_saved = []
+with patch("orquestra.watchdog_verdict", return_value=("achado importante", True)), \
+     patch("orquestra.save_chat_message", side_effect=lambda *a: _saved.append(a)), \
+     patch("orquestra._orchestrator_react") as _react:
+    orquestra._watchdog_report({})
+check(_saved and _saved[0][0] == "orquestrador" and "achado importante" in _saved[0][2],
+      "_watchdog_report salva o achado no histórico do Orquestrador")
+check(not _react.called, "_watchdog_report NÃO chama _orchestrator_react (evita corrida)")
 
 
 print()
