@@ -216,6 +216,26 @@ deep_i = _otui._deep_review_instruction("/tmp/x.py")
 check("<SUGESTAO" in auto_i, "instrução automática ensina o formato <SUGESTAO>")
 check("<SUGESTAO" in deep_i, "instrução profunda ensina o formato <SUGESTAO>")
 
+# ── Bug achado em uso (10/09/2026): "✏️ Ajustar" não reabilitava o chat ────
+print("TUI — '✏️ Ajustar' reabilita o #chat-input")
+import asyncio as _asyncio
+
+async def _check_adjust_plan_reenables_input():
+    app = _otui.OrquestraTUI()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Reproduz o estado real: <PLANO> chegou, chat-input foi desabilitado
+        # (on_chat_input_submitted) e a barra do plano apareceu (_show_plan_bar).
+        app.query_one("#chat-input").disabled = True
+        app._show_plan_bar()
+        await pilot.pause()
+        await pilot.click("#btn-adjust-plan")
+        await pilot.pause()
+        return app.query_one("#chat-input").disabled
+
+_still_disabled = _asyncio.run(_check_adjust_plan_reenables_input())
+check(_still_disabled is False, "clicar Ajustar reabilita o campo de texto (antes travava)")
+
 
 # ── Regex de tags ──────────────────────────────────────────────────────────
 print("regex DELEGATE / PIPELINE / PLANO")

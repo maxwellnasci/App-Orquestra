@@ -1034,9 +1034,13 @@ class OrquestraTUI(App):
         elif event.button.id == "btn-adjust-plan":
             self.query_one("#plan-bar").add_class("hidden")
             self._plan_pending = ""
-            self.query_one("#chat-input").focus()
             self.query_one("#chat-log", RichLog).write(
                 "\n[dim]✏️ Diga o que quer mudar no plano.[/dim]\n")
+            # Bug real (achado em uso, 10/09/2026): ao mostrar o <PLANO>, o
+            # chat-input fica desabilitado esperando Executar/Ajustar — mas
+            # "Ajustar" só dava focus() sem reabilitar, então o usuário clicava
+            # e não conseguia digitar nada. _re_enable_input() faz os dois.
+            self._re_enable_input()
 
     def _handle_approval(self, decision: str) -> None:
         """Processa a decisão do usuário após o Operador terminar."""

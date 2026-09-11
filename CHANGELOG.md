@@ -43,7 +43,14 @@ mudança de prompt + contexto.
   — emita o `<DELEGATE>` sem perguntar de novo (a TUI já tem o gate). Ler/analisar
   o projeto a fundo é esperado, não pede permissão.
 
-Testado: `python3 test_orquestra.py` — 168 checks verdes (12 novos).
+- **Bug achado em uso (fora do escopo do pacote, corrigido de passagem):**
+  "✏️ Ajustar" no `<PLANO>` desabilitava o campo de texto e nunca reabilitava —
+  o usuário clicava e não conseguia mais digitar nada. `btn-adjust-plan` só
+  dava `focus()`; faltava `disabled = False`. Agora chama `_re_enable_input()`
+  (faz os dois).
+
+Testado: `python3 test_orquestra.py` — 170 checks verdes (14 novos, incluindo
+regressão via Textual pilot pro bug do "Ajustar").
 
 ## Não lançado — Gate de verificação + Cão de Guarda no DeepSeek (set/2026)
 
