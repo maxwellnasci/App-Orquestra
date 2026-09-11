@@ -9,7 +9,7 @@ o que quer e a equipe executa, com você aprovando cada mudança.
 
 | Agente | Papel | O que faz | Motor padrão |
 |---|---|---|---|
-| 🎼 **Orquestrador** | Estrategista | Conversa, pensa a solução, faz o `<PLANO>` e delega. **Não tem ferramentas** — nunca lê/escreve/roda nada sozinho. | DeepSeek v4 Flash (chat direto) |
+| 🎼 **Orquestrador** | Estrategista | Conversa, pensa a solução como um pair, faz o `<PLANO>` e delega. **Nunca escreve nem roda comando que altere nada** — implementar é sempre do Operador. | Codex / Claude / Antigravity em **modo plano** (lê o projeto pra raciocinar) — ou um cérebro de chat puro (DeepSeek/Kimi, zero ferramentas) |
 | 🔨 **Operador** | Executor | Lê o código, escreve, altera, roda comandos, cria arquivos. | Claude Code (`claude-sonnet-5`) |
 | 🔍 **Revisor** | Revisão sob demanda | Caça bugs, avalia arquitetura e segurança de um trecho ou de um diff. Você aciona pelo botão "🔍 Revisar". | Claude Code (`claude-opus-5`) |
 | 🐕 **Cão de Guarda** | Automático e silencioso | Depois de cada edição, lê o codebase ao redor do diff (bugs, lógica, segurança), reporta no rodapé e no chat do Orquestrador. Verde se está tudo certo, vermelho só se achar algo. | DeepSeek v4 Pro (read-only) |
@@ -66,7 +66,10 @@ clica na árvore ou o próprio Orquestrador mostra código durante a conversa
 
 ## Como funciona um turno
 
-1. Você pede algo. Dúvida conceitual → o Orquestrador responde na hora.
+1. Você pede algo. Dúvida conceitual ou conversa de análise ("o que tá rolando
+   no meu servidor?", "vale a pena isso aqui?") → o Orquestrador **lê o código
+   relevante** (ele roda em modo plano/read-only) e responde como um pair: a
+   leitura dele, as opções, os trade-offs, a recomendação. Sem `<PLANO>`.
 2. Tarefa que mexe em código → ele escreve um `<PLANO>` e **para**. Você clica
    **▶ Executar plano** (ou **✏️ Ajustar**). Se ele tentar delegar **sem** um
    plano aprovado, aparece uma barra **▶ Rodar agora / ✋ Cancelar** com o que
@@ -146,6 +149,7 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 | `Ctrl+↑` / `Ctrl+↓` | Tamanho do chat: compact ↔ normal ↔ tall (fica salvo). |
 | `Ctrl+K` | Limpa a aba Atividade (não mexe no chat nem no histórico). |
 | `Ctrl+L` | Foco direto no campo de texto do chat. |
+| `Ctrl+N` | Cria um arquivo novo no Editor (nasce no disco no primeiro `Ctrl+S`). |
 | `Ctrl+S` / `Ctrl+W` | Salva / fecha a aba ativa do Editor. |
 
 ## Arquivos

@@ -21,7 +21,7 @@ qualidade, múltiplas perspectivas de IA) sem conhecer os detalhes de cada CLI.
 
 | Agente (config) | Papel | Motor padrão | Ferramentas? |
 |---|---|---|---|
-| `roles.orquestrador` | Estrategista: conversa, `<PLANO>`, delega | `brain` / DeepSeek v4 Flash | **NÃO** (chat puro) |
+| `roles.orquestrador` | Estrategista: conversa como pair, `<PLANO>`, delega | `codex`/`claude`/`agy` em modo plano (recomendado — lê o projeto) ou `brain`/DeepSeek (chat puro) | **só leitura** (nunca escreve) |
 | `workers.operador` | Executor: lê/escreve/roda/cria | `claude` / claude-sonnet-5 | sim (headless) |
 | `workers.revisor` | Revisão sob demanda | `claude` / claude-opus-5 | sim (headless) |
 | `workers.cao_guarda` | Auditoria automática do diff (bugs + lógica + segurança) | `claude` / DeepSeek v4 Pro em `--permission-mode plan` | sim (read-only — lê o codebase, nunca escreve) |
@@ -38,9 +38,10 @@ Tags legadas (`implementador`, `arquiteto`, `pesquisador`, `analista`, `designer
 Usuário (TUI: chat)
    │
    ▼
-Orquestrador  ─ orchestrator_brain.py (chat completions, ZERO ferramentas)
-   │   • dúvida conceitual → responde e acabou
+Orquestrador  ─ codex/claude/agy em modo plano (lê o projeto) OU brain (chat puro)
+   │   • dúvida / análise / decisão → LÊ o código e conversa como pair (sem <PLANO>)
    │   • tarefa de código → escreve <PLANO> e PARA (gate)
+   │   • resultado da equipe volta → engaja, opinião própria, próximo passo
    │
    ▼  usuário clica "▶ Executar plano"
 Orquestrador emite <DELEGATE binary="operador"> / <PIPELINE>
@@ -100,14 +101,28 @@ alerta; o achado também é salvo no histórico do Orquestrador
 
 ## Regras que não podem quebrar
 
-1. **O Orquestrador nunca ganha ferramentas.** `_build_orchestrator_cmd` só usa
-   `binary="brain"` (ou `agy`/`claude` como fallback **sem** `--add-dir` /
-   `--dangerously-skip-permissions` / `--permission-mode bypassPermissions`). O spike
-   provou que `agy`/`claude` executam comandos mesmo em `--mode plan` — por isso o
-   caminho padrão é `orchestrator_brain.py` (chat REST puro).
+1. **O Orquestrador nunca ganha ferramenta de ESCRITA.** `_build_orchestrator_cmd`
+   tem dois caminhos, os dois sem permissão de alterar nada:
+   - `binary="brain"`/`ollama-cloud` → `orchestrator_brain.py`, chat REST puro,
+     zero ferramentas — fisicamente incapaz de tocar em arquivo.
+   - `binary="agy"/"claude"/"codex"` → a CLI logada em **modo plano/read-only**
+     (`--mode plan` / `--permission-mode plan` / `--sandbox read-only`): LÊ
+     arquivo e roda comando de leitura pra dar contexto real, mas **nunca**
+     `--add-dir` / `--dangerously-skip-permissions` / `bypassPermissions` /
+     `--sandbox workspace-write`. Testado: os 3 respondem, emitem `<PLANO>`/
+     `<DELEGATE>` e não escrevem (APRENDIZADOS §2). Implementar é **sempre**
+     delegado ao Operador, em qualquer um dos caminhos.
+   O menu (TUI `_orch_route`, REPL `_ORQ_CHOICES`) só oferece esses — nunca um
+   motor de escrita cru.
 2. **O texto do prompt do Orquestrador tem fonte única:** `build_orchestrator_prompt()`
-   em `orquestra.py`. TUI e REPL chamam essa função. O marcador literal
+   em `orquestra.py` (system + memória + árvore de arquivos + `working_context` +
+   histórico). TUI e REPL chamam essa função. O marcador literal
    `"Histórico da Conversa:\n"` é onde `orchestrator_brain.py` corta system/user — não mude.
+   `_ORCH_SYSTEM` tem o modo "pensa junto" (item 1 do "COMO VOCÊ TRABALHA": ler o
+   código e conversar como pair, sem `<PLANO>`) e o modo delegação (item 2+).
+   `_orchestrator_react` continua a conversa como parceiro — recebe `changed_files`
+   e, com um motor "com olhos", manda abrir os arquivos tocados; **não** dá
+   relatório de status nem a pergunta "quer ajustar algo ou seguir?".
 3. **Comandos `/senha*`** são interceptados por `vault.handle_command` antes de
    qualquer agente.
 4. **O Cão de Guarda roda de verdade:** `_run_copilot_watchdog(config)` dispara uma
@@ -263,6 +278,15 @@ duas vezes vinda de fontes diferentes — clique na árvore, GPS, `<MOSTRAR>`).
   com `NoMatches` (bug real, corrigido — ver `APRENDIZADOS.md`).
 - **`action_save_file(editor=None)`** — `Ctrl+S`. Aceita o `TextArea` já resolvido
   opcionalmente, pelo mesmo motivo acima. Também dispara `_refresh_changes_panel()`.
+  Grava `info["path"]` exista ou não no disco — é o que faz o `Ctrl+N` funcionar.
+- **`action_new_file()`** — `Ctrl+N`. `FileNameModal` pede o caminho (relativo ao
+  projeto; recusa `..`/absoluto que escape da pasta). Abre aba vazia, registra em
+  `_open_files`/`_path_to_pane` com `original_text=""` e `dirty=True`; o arquivo só
+  nasce no disco no `Ctrl+S`. Se o caminho já existir, abre em vez de recriar.
+- **`_snapshot_open_buffers()`** — chamado na thread da UI por `_run_orchestrator_body`
+  (via `call_from_thread`); devolve `[{path, disk_text, buffer_text}]` que
+  `orquestra.format_working_context` transforma no bloco `working_context` do prompt
+  do Orquestrador (arquivos abertos + edições não salvas + diff pendente do repo).
 - **Dirty-tracking** — `on_text_area_changed` compara `editor.text` com
   `info["original_text"]` (string inteira, não um bool ingênuo — cobre desfazer até
   o texto original). `TextArea.replace()` (usado por `_accept_suggestion`) dispara

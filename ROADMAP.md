@@ -33,6 +33,17 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 
 ## ✅ Feito
 
+- [x] **Orquestrador parceiro de raciocínio (set/2026)** — motivado por uso real
+  (análise de servidor devolveu resumo raso + pergunta enlatada). O Orquestrador
+  já era `codex` read-only; o problema eram os prompts. `_ORCH_SYSTEM` ganhou o
+  modo "pensa junto" (lê o código, traz opções/trade-offs/recomendação, sem
+  `<PLANO>`); `_orchestrator_react` reescrito (input 4k→8k, recebe `changed_files`,
+  manda abrir os arquivos tocados, sem a pergunta genérica); `working_context`
+  novo no `build_orchestrator_prompt` (arquivos abertos + edições não salvas +
+  diff pendente, via `_snapshot_open_buffers`/`format_working_context`); `Ctrl+N`
+  cria arquivo no Editor; menu do REPL destravado (`_ORQ_CHOICES`: codex/claude/agy
+  em plano + cérebros); cláusula do `<PLANO>` no `~/.codex/AGENTS.md`. 168 checks.
+
 - [x] TUI vira a interface oficial (`orquestra` abre a TUI; `--repl` = REPL legado)
 - [x] Orquestrador estrategista sem ferramentas (cérebro via chat completions: DeepSeek/Ollama)
 - [x] Operador / Revisor / Cão de Guarda como agentes de verdade na config
@@ -120,6 +131,12 @@ Posicionamento: o Orquestra **não compete com Cursor/VS Code como editor** (LSP
 extensões, debugger — corrida perdida). Ele rege; o editor que o usuário quiser
 toca (já existe a ponte com o Cursor). A aposta é no que as IDEs gringas não
 conseguem ou não querem fazer por conflito de modelo de negócio.
+
+Confirmado na prática (set/2026): quando o Orquestrador ficou raso, a resposta
+**não** foi virar editor nem forkar VS Code — foi consertar prompt + contexto pra
+ele enxergar o código e conversar como pair. O editor continua sendo um bloco de
+notas de propósito (`Ctrl+N` foi o único investimento: fechar o buraco de "criar
+arquivo"). Edição séria = ponte com o Cursor.
 
 ### Onde o Orquestra já é diferente (manter e aprofundar)
 

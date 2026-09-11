@@ -458,6 +458,46 @@ with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
     check("Aprovar, Rejeitar ou pedir pra Revisar" not in _captured_prompt["text"],
           "has_pending_changes=False (default): sem o lembrete de aprovação")
 
+# ── _orchestrator_react — modo parceiro (não relatório enlatado) ──────────
+print("_orchestrator_react — modo parceiro de raciocínio")
+with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
+     patch("orquestra._run_orchestrator_stream", return_value=("ok", True)):
+    orquestra._orchestrator_react(orquestra.DEFAULT_CONFIG, "Operador", "editei X")
+    _t = _captured_prompt["text"]
+    check("parceiro de raciocínio" in _t, "pede postura de parceiro, não relatório")
+    check("proponha o próximo passo você mesmo" in _t, "manda propor o próximo passo (sem pergunta enlatada)")
+
+    _cfg_codex_react = {"roles": {"orquestrador": {"binary": "codex"}}}
+    orquestra._orchestrator_react(_cfg_codex_react, "Operador", "editei X",
+                                  changed_files=["src/foo.py", "src/bar.py"])
+    _t = _captured_prompt["text"]
+    check("src/foo.py" in _t and "ABRA e leia" in _t,
+          "codex + changed_files: manda abrir os arquivos tocados")
+
+# ── format_working_context / working_context no prompt ───────────────────
+print("format_working_context")
+_wc_buffers = [{"path": str(Path(__file__).parent / "orquestra.py"),
+                "disk_text": "linha 1\nlinha 2\n", "buffer_text": "linha 1\nlinha 2 MUDADA\n"}]
+_wc = orquestra.format_working_context(_wc_buffers, str(Path(__file__).parent))
+check("orquestra.py" in _wc, "lista o arquivo aberto")
+check("Edições NÃO salvas" in _wc and "MUDADA" in _wc, "mostra o diff do buffer não salvo")
+_wc_clean = orquestra.format_working_context(
+    [{"path": "/x/a.py", "disk_text": "igual", "buffer_text": "igual"}], "/x")
+check("Edições NÃO salvas" not in _wc_clean, "buffer == disco → sem seção de não salvo")
+
+_p_wc = orquestra.build_orchestrator_prompt(cfg, [], "", "CONTEXTO_DE_TRABALHO_XYZ")
+check("CONTEXTO_DE_TRABALHO_XYZ" in _p_wc and "está mexendo agora" in _p_wc,
+      "working_context entra no prompt")
+check("CONTEXTO_DE_TRABALHO_XYZ" not in orquestra.build_orchestrator_prompt(cfg, [], ""),
+      "sem working_context → bloco ausente")
+
+# ── menu do REPL: Orquestrador aceita motores com olhos ──────────────────
+print("_ORQ_CHOICES — motores com olhos + cérebros")
+_orq_keys = [k for k, _ in orquestra._ORQ_CHOICES]
+check(all(x in _orq_keys for x in ("codex", "claude", "gemini")),
+      "menu do Orquestrador oferece codex/claude/agy (plano)")
+check(any(k.startswith("brain-") for k in _orq_keys), "e ainda os cérebros de chat puro")
+
 
 # ── Achado A2: revert_pending(only=...) reverte só os arquivos da tarefa ───
 print("revert_pending — escopo por arquivo (achado A2)")

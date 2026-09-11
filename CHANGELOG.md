@@ -1,5 +1,50 @@
 # Changelog Orquestra
 
+## Não lançado — Orquestrador que enxerga o que a gente mexe (set/2026)
+
+Motivado por sessão real: o usuário pediu uma análise do servidor, a equipe
+executou, e o Orquestrador devolveu um resumo raso + a pergunta enlatada "quer
+ajustar algo ou seguir para outra coisa?". Diagnóstico: o Orquestrador **já**
+rodava como `codex` read-only (podia ler o projeto), mas os prompts o tratavam
+como um gerador de `<PLANO>`, não como parceiro de raciocínio. Nada de rebuild —
+mudança de prompt + contexto.
+
+- **`_ORCH_SYSTEM` ganhou o modo "pensa junto".** "COMO VOCÊ TRABALHA" tinha só
+  dois caminhos (dúvida conceitual → resposta curta; mexer em código → `<PLANO>`
+  e para). Agora o item 1 é conversa de análise/decisão: **leia o código
+  relevante** (está em read-only, use isso), traga sua leitura, opções,
+  trade-offs e recomendação com o porquê; `<PLANO>` só quando há mudança concreta
+  E o usuário quer partir pra ação. Item 4 novo: ao receber resultado da equipe,
+  engajar (o que faria a seguir, o que priorizaria, o que preocupa), não dar
+  relatório de status.
+- **`_orchestrator_react` deixou de ser enlatado.** Recebe `raw_result[:8000]`
+  (era 4000), a lista de `changed_files` do worker, e — quando o Orquestrador tem
+  olhos (`agy`/`claude`/`codex`) — a instrução de **abrir e ler os arquivos
+  tocados** antes de comentar. Prompt reescrito: continue a conversa como
+  parceiro, proponha o próximo passo você mesmo, **sem** a pergunta genérica.
+  Cap de exibição da fala do Orquestrador na TUI 2000 → 6000 chars.
+- **Estado de trabalho ao vivo no prompt** (`format_working_context` +
+  `build_orchestrator_prompt(..., working_context=)`). A cada turno a TUI faz um
+  snapshot dos arquivos abertos no Editor, o diff das **edições ainda não
+  salvas** (buffer vs. disco, via `difflib`) e o diff pendente do repositório, e
+  injeta como um bloco antes do histórico. O Orquestrador enxerga o que você está
+  mexendo agora, não só o que está commitado. Bounded em ~6 KB. REPL passa vazio.
+- **`Ctrl+N` cria arquivo novo no Editor.** Modal `FileNameModal` pede o caminho
+  (relativo ao projeto, recusa escape pra fora da pasta), abre aba vazia; o
+  arquivo nasce no disco no primeiro `Ctrl+S`. Fecha o buraco "eu crio, ele
+  mostra, eu edito" — antes o Editor só abria arquivo já existente.
+- **Menu do REPL destravado pro Orquestrador.** `interactive_agent_selection`
+  oferecia só cérebros de chat puro (`_BRAIN_CHOICES`); agora oferece primeiro os
+  motores "com olhos" em modo plano/read-only (`_ORQ_AGENT_CHOICES`: codex /
+  claude / agy) e depois os cérebros. A TUI já roteava GPT→codex/Claude→claude
+  há tempos (`_orch_route`); é só o REPL alcançando a TUI.
+- **`~/.codex/AGENTS.md`:** nova exceção "quando você É o Orquestrador dentro da
+  TUI". Aprovar um `<PLANO>` na TUI conta como a confirmação explícita da Regra 3
+  — emita o `<DELEGATE>` sem perguntar de novo (a TUI já tem o gate). Ler/analisar
+  o projeto a fundo é esperado, não pede permissão.
+
+Testado: `python3 test_orquestra.py` — 168 checks verdes (12 novos).
+
 ## Não lançado — Gate de verificação + Cão de Guarda no DeepSeek (set/2026)
 
 Análise em `ANALISE_GATE_E_COPILOT_2026-09-10.md`. Duas melhorias no fluxo, sem

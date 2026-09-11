@@ -738,3 +738,62 @@ Gate: `_detect_project_check` pegou o `.orquestra_gate`, `_run_gate_check` rodou
 suíte (rc 0), `_run_verification_gate` → `(True, "✅ verificação passou")`.
 Cão de Guarda: repo temporário com `a + b` → `a - b`; `watchdog_verdict` retornou
 `has_bug=True` + verdict do DeepSeek apontando arquivo/linha/impacto.
+
+
+## Orquestrador parceiro de raciocínio (10/09/2026)
+
+### O gatilho
+
+Sessão real: usuário pediu "vê meu servidor", a equipe fez o levantamento (SSH,
+`docker inspect`, `psql` — 237 linhas), e o Orquestrador devolveu um resumo de 3
+frases + "Quer ajustar algo ou seguir para outra coisa?". Reclamação: *"ele
+analisou mas não falou mais nada — eu gosto que o Claude Code analisa e traz as
+ideias, a gente planeja junto"*.
+
+### O que a investigação mostrou (≠ do que eu ia assumir)
+
+Ia recomendar "destravar o motor do Orquestrador pra ele poder ler". **Ele já
+lia** — `~/.orquestra.json` tinha `orquestrador: {binary: "codex"}`, ou seja
+`codex exec --sandbox read-only` rodando na pasta do projeto. A TUI já roteava
+GPT→codex há tempo (`_orch_route`). Verificar o código/config **antes** de propor
+mudou o diagnóstico inteiro.
+
+O raso vinha de dois prompts:
+- **`_orchestrator_react`** dava `raw_result[:4000]` + "comente, diga o que mudou
+  e o que falta, **termine perguntando se quer ajustar algo ou seguir**". A
+  resposta enlatada estava escrita no prompt, palavra por palavra.
+- **`_ORCH_SYSTEM`** só tinha "dúvida conceitual → responde curto" e "código →
+  `<PLANO>` e PARA". Não existia "analisa e conversa comigo sobre o que achou".
+
+### O conserto (sem rebuild, sem virar editor)
+
+1. `_ORCH_QUEM_VOCE_E_READONLY` + `_ORCH_SYSTEM` item 1: modo pair — leia o código
+   de verdade, traga leitura/opções/trade-offs/recomendação, `<PLANO>` só quando
+   há mudança concreta e o usuário quer agir. Item 4: ao receber resultado da
+   equipe, engajar, não relatar.
+2. `_orchestrator_react`: input 8k, recebe `changed_files`, com motor "com olhos"
+   manda **abrir e ler** os arquivos tocados; corta a pergunta genérica.
+3. `format_working_context` + `working_context` no `build_orchestrator_prompt`:
+   `_snapshot_open_buffers` (thread da UI) → arquivos abertos + `difflib` das
+   edições não salvas + `git_diff_for_display` do que está pendente. O Orquestrador
+   passa a ver o que o usuário mexe agora, não só o HEAD.
+4. `Ctrl+N`/`FileNameModal`: `action_save_file` já gravava `info["path"]` exista
+   ou não — só faltava uma aba vazia com um path. Buraco de "criar arquivo"
+   fechado; o resto do Editor continua bloco de notas de propósito.
+5. `_ORQ_CHOICES` no menu do REPL (a TUI já fazia). `~/.codex/AGENTS.md`: exceção
+   nova — aprovar `<PLANO>` na TUI = confirmação da Regra 3, emite `<DELEGATE>`
+   sem perguntar de novo.
+
+### Gotcha
+
+`AGENTES.md` regra 1 dizia "o Orquestrador **nunca** ganha ferramentas / caminho
+padrão é `orchestrator_brain.py`". Estava desatualizada — o código e o menu já
+aceitavam `codex`/`claude`/`agy` em modo plano (só-leitura) fazia tempo. Corrigida
+pra "nunca ganha ferramenta de **escrita**". Doc atrás do código, de novo.
+
+### Testado
+
+`python3 test_orquestra.py` — 168 checks (12 novos: modo parceiro, `changed_files`
+→ "abra os arquivos", `format_working_context` com/sem edição não salva,
+`working_context` no prompt, `_ORQ_CHOICES`). Falta o teste ao vivo na TUI com o
+Codex (rodar `orquestra` e pedir uma análise).
