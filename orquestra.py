@@ -2956,7 +2956,10 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
     _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
     silêncio total + spinner genérico de antes da reforma — e com um timeout
     de verdade (mata o processo se passar de timeout_s), a mesma garantia que
-    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok).
+    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok, error_detail)
+    — error_detail vem preenchido quando ok=False (timeout/erro de processo/erro
+    do modelo), pro chamador poder mostrar o motivo de verdade em vez de um
+    "tente de novo" genérico.
 
     detail: narra tool calls/texto ao vivo (PLANO_PALCO_CHAT.md, Etapa 0a) —
     reaproveita o mesmo parser do motor que os operários já usam
@@ -2982,8 +2985,9 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
             text=True, bufsize=1,
         )
     except FileNotFoundError:
-        section.close(ok=False, error_detail=f"binário '{binary}' não encontrado")
-        return "", False
+        err_msg = f"binário '{binary}' não encontrado"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     stop_heartbeat = threading.Event()
 
@@ -3041,25 +3045,26 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
                 pass
 
     if timed_out["flag"]:
-        section.close(ok=False, error_detail=f"não respondeu em {timeout_s}s (timeout)")
-        return "", False
+        err_msg = f"não respondeu em {timeout_s}s (timeout)"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     if not state["final_text"] and proc.returncode != 0:
-        detail = "".join(stderr_lines[-20:]).strip() or "processo terminou sem resposta"
-        section.close(ok=False, error_detail=detail)
-        return "", False
+        err_msg = "".join(stderr_lines[-20:]).strip() or "processo terminou sem resposta"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     if state["is_error"]:
         # O processo pode sair com código 0 mesmo reportando erro no envelope
         # JSON (is_error/status) — sem checar isso, um erro "educado" do
         # modelo seria tratado como resposta válida e tentaria ser escaneado
         # por <DELEGATE>/<PIPELINE> como se fosse texto normal.
-        detail = state["final_text"] or "".join(stderr_lines[-20:]).strip() or "o modelo reportou erro"
-        section.close(ok=False, error_detail=detail)
-        return "", False
+        err_msg = state["final_text"] or "".join(stderr_lines[-20:]).strip() or "o modelo reportou erro"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     section.close(ok=True)
-    return state["final_text"].strip(), True
+    return state["final_text"].strip(), True, ""
 
 
 def _orchestrator_react(config: dict, event_label: str, raw_result: str,
@@ -3117,8 +3122,8 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     if section is None:
         section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
         section.open()
-    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile,
-                                        detail=_detail_level(config))
+    text, ok, _err = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile,
+                                              detail=_detail_level(config))
     if not ok:
         return ""
 
@@ -4400,15 +4405,17 @@ def main():
             # aborta direto — a LiveSection já mostrou o motivo ao fechar).
             clean_output = ""
             hard_fail = False
+            hard_fail_detail = ""
             for attempt in range(2):
                 cmd, cmd_binary, cmd_ofile = _build_orchestrator_cmd(role, prompt)
                 section = LiveSection(role_name.capitalize(), icon, color)
                 section.open()
-                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150,
-                                                    output_file=cmd_ofile, detail=_detail_level(config))
+                text, ok, err_detail = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150,
+                                                                 output_file=cmd_ofile, detail=_detail_level(config))
 
                 if not ok:
                     hard_fail = True
+                    hard_fail_detail = err_detail
                     break
 
                 clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text or '').strip()
@@ -4419,6 +4426,8 @@ def main():
                     console.print(f"[dim]⚠ {icon} {role_name.capitalize()} voltou vazio na 1ª tentativa — tentando de novo...[/dim]")
 
             if hard_fail:
+                if hard_fail_detail:
+                    console.print(f"[dim]{hard_fail_detail[:500]}[/dim]")
                 console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
                 continue
 

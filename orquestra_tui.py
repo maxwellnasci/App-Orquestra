@@ -1663,14 +1663,27 @@ class OrquestraTUI(App):
         # ferramenta nenhuma) — timeout curto pra ele virava "sem resposta"
         # sem causa clara.
         timeout_s = 300 if binary == "codex" else 150
-        final_text, ok = orquestra._run_orchestrator_stream(
+        final_text, ok, error_detail = orquestra._run_orchestrator_stream(
             cmd, env, binary, section, timeout_s=timeout_s, output_file=ofile,
             detail=orquestra._detail_level(config),
         )
         on_status("")
 
         if not ok or not final_text:
-            self.call_from_thread(log.write, "[bold red]⚠ Sem resposta do Orquestrador. Tente de novo.[/bold red]\n")
+            # Mesmo tratamento que erro de worker (Operador/Revisor): salva no
+            # histórico (senão o próximo turno nem sabe que essa falha aconteceu
+            # e o usuário fica reenviando a mesma mensagem pra um buraco negro)
+            # e mostra o motivo de verdade (timeout/erro de API/etc.), não um
+            # "tente de novo" genérico que esconde a causa na aba Atividade.
+            detail_msg = error_detail or "resposta vazia do modelo"
+            orquestra.save_chat_message("orquestrador", "assistant",
+                                        f"[Erro do Orquestrador]: {detail_msg[:1500]}")
+            self._activity("🎼", "Orquestrador", f"❌ erro: {detail_msg}")
+            self.call_from_thread(
+                log.write,
+                f"\n[bold red]⚠ Erro no Orquestrador:[/bold red] {detail_msg[:500]}\n"
+                f"[dim]Tente perguntar de novo.[/dim]\n"
+            )
             self.call_from_thread(self._re_enable_input)
             return
 

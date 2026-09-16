@@ -446,7 +446,7 @@ def _fake_build_cmd(role, prompt):
     return (["echo", "x"], "brain", None)
 
 with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
-     patch("orquestra._run_orchestrator_stream", return_value=("comentário do orquestrador", True)):
+     patch("orquestra._run_orchestrator_stream", return_value=("comentário do orquestrador", True, "")):
     comment = orquestra._orchestrator_react(
         orquestra.DEFAULT_CONFIG, "Operador", "editei X", has_pending_changes=True,
     )
