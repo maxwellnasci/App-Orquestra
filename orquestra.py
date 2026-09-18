@@ -2731,7 +2731,15 @@ def _narrate_muse_line(line: str, section: "LiveSection", state: dict, detail: s
     payload_type == "run.terminal.completed", que traz o texto final
     completo (não é incremental — testado, repete o texto inteiro) e o
     status real da execução em payload["terminal"] ("completed" = sucesso;
-    qualquer outro valor = erro, com o motivo em payload["reason"])."""
+    qualquer outro valor = erro, com o motivo em payload["reason"]).
+
+    LACUNA CONHECIDA: ao contrário do _narrate_codex_line (que lê tokens_in/
+    tokens_out de "turn.completed".usage), este parser não preenche
+    state["cost_usd"]/tokens_in/tokens_out — não confirmei ainda qual
+    payload_type do MSP carrega uso de token (os testes feitos só tinham
+    bytes_read/wire_events_seen, não contagem de token). A feature de
+    gasto/uso vai reportar 0 pro Muse até isso ser confirmado e implementado
+    — melhor deixar zerado do que arriscar ler o campo errado."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
@@ -2865,6 +2873,13 @@ projeto de verdade antes de responder — mas NÃO escreve arquivo nem roda nada
 altere o estado do projeto. Implementar é sempre delegado pra sua equipe, nunca feito
 por você mesmo."""
 
+# A regra "revisor só sob pedido explícito" abaixo é enforcement só de prompt —
+# igual toda a outra política deste sistema (o próprio gate de "espera aprovação
+# antes de executar" também é só instrução, sem checagem de código). Se o LLM do
+# Orquestrador ignorar/interpretar mal num turno e emitir <DELEGATE
+# binary="revisor"> sem o usuário ter pedido, nada em _run_pipeline/_resolve_worker
+# bloqueia — aceito como o mesmo tipo de risco que já existe pro resto do sistema,
+# não um gate técnico novo.
 _ORCH_SYSTEM = """Você é o Orquestra — o ESTRATEGISTA que coordena o projeto '{projeto}'.
 Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso total a ela).
 
@@ -3289,8 +3304,9 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
             text=True, bufsize=1,
         )
     except FileNotFoundError as e:
-        section.close(ok=False, error_detail=f"binário não encontrado: {e}")
-        return "", True, f"binário não encontrado: {e}"
+        msg = f"binário não encontrado: {e}"
+        section.close(ok=False, error_detail=msg)
+        return WorkerResult(final_text="", is_error=True, error_detail=msg, changes_summary="")
 
     def _drain_stderr():
         for l in proc.stderr:
