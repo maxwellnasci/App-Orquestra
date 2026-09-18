@@ -6,6 +6,7 @@ Arquitetura baseada em Papéis (Roles) e configuração via JSON.
 
 import os
 import sys
+import signal
 import subprocess
 import shutil
 import shlex
@@ -55,6 +56,13 @@ CHAT_HISTORY_DIR = Path.home() / ".orquestra_chats"
 # cortava raciocínio/código de respostas longas antes do Orquestrador ver —
 # pedido explícito do usuário pra não perder informação entre os agentes.
 _ORCH_CONTEXT_CHARS = 20000
+
+# ACHADO (2026-09-18): _run_worker_headless (Operador/Revisor/Cão de Guarda)
+# não tinha NENHUM timeout — se o motor (agy/claude/muse/codex) travasse, a
+# chamada ficava presa pra sempre, sem o recurso que o Orquestrador já tinha.
+# Maior que o timeout do Orquestrador (150s) de propósito: tarefa de código
+# real demora mais que uma decisão de roteamento.
+_WORKER_TIMEOUT_S = 900
 
 # ── Arquitetura de 3 agentes + Cão de Guarda ────────────────────────────────
 # roles.orquestrador  → o ESTRATEGISTA. binary="brain" = chat completions puro
@@ -3129,6 +3137,27 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
             state["is_error"] = bool(d.get("is_error"))
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Mata o processo E todo mundo que ele gerou (grupo inteiro), não só ele.
+
+    ACHADO (2026-09-18): `proc.kill()` sozinho não bastava — agy/claude/muse/
+    codex às vezes são wrappers que sobem um processo filho de verdade pra
+    fazer o trabalho. Matar só o wrapper deixa o filho vivo segurando a ponta
+    de escrita do pipe de stdout aberta, e o `for line in proc.stdout:` nunca
+    recebe EOF — trava pra sempre mesmo com o timer disparando (foi
+    exatamente o que aconteceu: Orquestrador passou dos 150s configurados e
+    ficou preso). Só funciona se o Popen que criou `proc` tiver sido aberto
+    com `start_new_session=True` (novo grupo de processo, herdado pelos
+    filhos) — sem isso, `os.killpg` mata só o grupo do processo pai (o
+    próprio Orquestra) e derruba a ferramenta inteira."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # já morreu sozinho entre o timer disparar e chegar aqui
+    except OSError:
+        proc.kill()  # start_new_session não foi usado nesse Popen — fallback
+
+
 def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection",
                              timeout_s: int, output_file: str | None = None,
                              detail: str = "normal") -> tuple:
@@ -3167,6 +3196,7 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
+            start_new_session=True,  # necessário pro _kill_process_group funcionar de verdade
         )
     except FileNotFoundError:
         err_msg = f"binário '{binary}' não encontrado"
@@ -3187,7 +3217,7 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
 
     def _kill_on_timeout():
         timed_out["flag"] = True
-        proc.kill()
+        _kill_process_group(proc)
 
     timer = threading.Timer(timeout_s, _kill_on_timeout)
     timer.start()
@@ -3362,6 +3392,7 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
+            start_new_session=True,  # necessário pro _kill_process_group funcionar de verdade
         )
     except FileNotFoundError as e:
         msg = f"binário não encontrado: {e}"
@@ -3387,10 +3418,21 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
     else:
         parser = _narrate_claude_line
 
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            parser(line, section, state, detail=detail)
+    timed_out = {"flag": False}
+
+    def _kill_on_timeout():
+        timed_out["flag"] = True
+        _kill_process_group(proc)
+
+    timer = threading.Timer(_WORKER_TIMEOUT_S, _kill_on_timeout)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                parser(line, section, state, detail=detail)
+    finally:
+        timer.cancel()
 
     proc.wait()
     section.end_line()
@@ -3403,6 +3445,11 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
                 state["final_text"] = file_text
         except OSError:
             pass
+
+    if timed_out["flag"]:
+        state["is_error"] = True
+        state["final_text"] = ""  # o que veio até travar não é confiável — não faz sentido entregar parcial
+        stderr_lines.append(f"não respondeu em {_WORKER_TIMEOUT_S}s (timeout)\n")
 
     if not state["final_text"] and proc.returncode != 0:
         state["is_error"] = True
