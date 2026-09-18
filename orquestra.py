@@ -1642,10 +1642,13 @@ _CLAUDE_FALLBACK = [
 ]
 
 
+# Confirmado direto na API real em 2026-09-18 (GET /models com token válido):
+# só existem estes 2 ids hoje. "deepseek-v4-flash" e
+# "deepseek-v4-flash-vision-exp" saíram da listagem — a Deepseek aposentou o
+# nome antigo em 14/09/2026 (virou "deepseek-flash").
 _DEEPSEEK_FALLBACK = [
-    ("deepseek-v4-pro",              "deepseek-v4-pro               (V4 Pro — Mais capaz)"),
-    ("deepseek-v4-flash",            "deepseek-v4-flash             (V4 Flash — Rápido e barato)"),
-    ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp  (V4 Flash Vision — Experimental)"),
+    ("deepseek-flash",  "deepseek-flash       (V4.1 Flash — nome canônico atual)"),
+    ("deepseek-v4-pro", "deepseek-v4-pro      (alias legado — hoje serve o mesmo V4.1 Flash)"),
 ]
 
 # Codex CLI não tem um endpoint de listagem de modelos confiável hoje (ver
@@ -1714,10 +1717,26 @@ def _fetch_claude_models() -> list[tuple[str, str]]:
             pass
     return _CLAUDE_FALLBACK
 
+# Descrição amigável por id — a API real de /models só devolve o id puro (sem
+# display_name), então isto só decora o rótulo mostrado no seletor.
+_DEEPSEEK_MODEL_HINTS = {
+    "deepseek-flash":  "V4.1 Flash — nome canônico atual",
+    "deepseek-v4-pro": "alias legado — hoje serve o mesmo V4.1 Flash, mesmo preço do Flash",
+}
+
+
 def _fetch_deepseek_models() -> list[tuple[str, str]]:
-    """Busca os modelos DeepSeek via API. Fallback para lista fixa."""
+    """Busca os modelos DeepSeek via API. Fallback para lista fixa.
+
+    ACHADO (2026-09-18): a chave lida daqui era "ANTHROPIC_AUTH_TOKEN", mas o
+    .claude-deepseek-env de verdade guarda a chave em "ANTHROPIC_API_KEY" — a
+    busca ao vivo NUNCA rodava (token sempre vazio), sempre caindo no fallback
+    fixo, que estava desatualizado (deepseek-v4-flash não existe mais na API
+    real desde 14/09/2026 — virou deepseek-flash). Corrigido e confirmado
+    rodando a chamada de verdade: hoje a API só lista deepseek-flash e
+    deepseek-v4-pro (esse último é alias legado, mesmo modelo por baixo)."""
     env = load_env_file(str(DEEPSEEK_ENV))
-    token = env.get("ANTHROPIC_AUTH_TOKEN", "")
+    token = env.get("ANTHROPIC_API_KEY", "")
     if token:
         try:
             req = urllib.request.Request(
@@ -1727,8 +1746,9 @@ def _fetch_deepseek_models() -> list[tuple[str, str]]:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
                 models = [
-                    (m["id"], f"{m.get('id', m['id']):<45}")
+                    (m["id"], f"{m['id']:<20} ({_DEEPSEEK_MODEL_HINTS.get(m['id'], 'DeepSeek')})")
                     for m in data.get("data", [])
+                    if m.get("id")
                 ]
                 if models:
                     return models
@@ -1774,6 +1794,46 @@ def _fetch_opencode_models() -> list[tuple[str, str]]:
         return models if models else _OPENCODE_FALLBACK
     except Exception:
         return _OPENCODE_FALLBACK
+
+# Muse Code só tem 1 modelo de verdade (muse-spark) — o que varia é o
+# reasoning_effort. Sem endpoint de listagem (nem faria sentido, não é um
+# catálogo de modelos). "ultra" fica de fora de propósito: testado rodando
+# `muse exec --reasoning-effort ultra`, o plano básico bloqueia e cai sozinho
+# pra xhigh — melhor não oferecer uma opção que degrada silenciosamente.
+_MUSE_FALLBACK = [
+    ("muse-spark-max",     "Muse Spark (Max)            — teto liberado no plano básico"),
+    ("muse-spark-xhigh",   "Muse Spark (XHigh)"),
+    ("muse-spark-high",    "Muse Spark (High)"),
+    ("muse-spark-medium",  "Muse Spark (Medium)         — padrão do binário"),
+    ("muse-spark-low",     "Muse Spark (Low)"),
+    ("muse-spark-minimal", "Muse Spark (Minimal)        — mais rápido/barato"),
+]
+
+
+def _fetch_muse_models() -> list[tuple[str, str]]:
+    """Sem endpoint de listagem no Muse CLI (só existe 1 modelo) — lista fixa
+    de variações de reasoning_effort, apresentadas como "modelo" pra encaixar
+    no mesmo seletor dos outros motores."""
+    return _MUSE_FALLBACK
+
+
+def _muse_reasoning_effort(model: str) -> str:
+    """Aceita tanto o id 'muse-spark-<effort>' (escolhido no seletor de modelo
+    real da TUI/engine_for_model) quanto o valor bruto '<effort>' (formato
+    antigo, gravado pelo /agentes trocar antes deste seletor existir) — os
+    dois representam o mesmo --reasoning-effort do binário, que só tem 1
+    modelo de verdade. Desconhecido/vazio cai em "medium" (mesmo default do
+    settings.json do binário)."""
+    m = (model or "").strip().lower()
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+    if m in valid:
+        return m
+    if m.startswith("muse-spark-"):
+        suffix = m[len("muse-spark-"):]
+        if suffix in valid:
+            return suffix
+    return "medium"
+
 
 _OLLAMA_FALLBACK = [
     ("gpt-oss:120b", "GPT-OSS 120b (Ollama Cloud)"),
@@ -2844,7 +2904,7 @@ def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
         # --approval-mode never evita travar esperando aprovação interativa.
         cmd = ["muse", "exec", prompt, "--json", "--approval-mode", "never",
                "--disable-write", "--disable-shell",
-               "--reasoning-effort", model or "medium"]
+               "--reasoning-effort", _muse_reasoning_effort(model)]
         return cmd, "muse", None
 
     # claude — modo plano = read-only, usa o login do claude
@@ -3435,6 +3495,8 @@ def engine_for_model(model_id: str) -> dict:
         return {}
     if "openrouter" in m:
         return {"binary": "opencode", "model": model_id}
+    if "muse" in m:
+        return {"binary": "muse", "model": model_id}
     if "claude" in m and "haiku" not in m and "deepseek" not in m:
         return {"binary": "claude", "model": model_id}
     if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
@@ -3577,9 +3639,8 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
         # skills do projeto, essa lacuna reabre e precisa do mesmo tratamento.
         # --approval-mode never evita ele travar esperando aprovação que
         # nunca chega (não tem terminal interativo do outro lado do pipe).
-        reasoning_effort = worker_model or "medium"
         cmd = ["muse", "exec", instruction, "--json",
-               "--approval-mode", "never", "--reasoning-effort", reasoning_effort]
+               "--approval-mode", "never", "--reasoning-effort", _muse_reasoning_effort(worker_model)]
         if read_only:
             cmd += ["--disable-write", "--disable-shell"]
     elif actual_binary == "copilot":
@@ -3717,7 +3778,7 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
         # vai pro stderr sozinho — testado, não precisa de filtro extra aqui.
         cmd = ["muse", "exec", prompt, "--approval-mode", "never",
                "--disable-write", "--disable-shell",
-               "--reasoning-effort", model if model and model != "auto" else "medium"]
+               "--reasoning-effort", _muse_reasoning_effort(model)]
     else:
         # claude (inclui deepseek via env_file) — plan = read-only, pode ler mas
         # nunca escrever. Sem --output-format → stdout é texto puro.
