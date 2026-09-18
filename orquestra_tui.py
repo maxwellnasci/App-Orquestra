@@ -696,7 +696,7 @@ class OrquestraTUI(App):
         ]
 
         loop = asyncio.get_running_loop()
-        (orq_raw, claude_raw, copilot_raw, deepseek_raw, codex_raw, ollama_raw, opencode_raw) = await asyncio.gather(
+        (orq_raw, claude_raw, copilot_raw, deepseek_raw, codex_raw, ollama_raw, opencode_raw, muse_raw) = await asyncio.gather(
             loop.run_in_executor(None, orquestra._fetch_agy_models),
             loop.run_in_executor(None, orquestra._fetch_claude_models),
             loop.run_in_executor(None, orquestra._fetch_copilot_models),
@@ -704,6 +704,7 @@ class OrquestraTUI(App):
             loop.run_in_executor(None, orquestra._fetch_codex_models),
             loop.run_in_executor(None, orquestra._fetch_ollama_models),
             loop.run_in_executor(None, orquestra._fetch_opencode_models),
+            loop.run_in_executor(None, orquestra._fetch_muse_models),
         )
 
         if not orq_raw:
@@ -718,6 +719,7 @@ class OrquestraTUI(App):
             "🐋 DeepSeek":             [(label, val) for val, label in deepseek_raw],
             "🤖 OpenAI Codex":         [(label, val) for val, label in codex_raw],
             "🌐 OpenCode (OpenRouter)": [(label, val) for val, label in opencode_raw],
+            "🎭 Muse Code (Meta)":     [(label, val) for val, label in muse_raw],
         }
 
         # value do modelo → provedor (pra saber como falar com ele).
@@ -729,6 +731,7 @@ class OrquestraTUI(App):
             "🐋 DeepSeek": "deepseek",
             "🤖 OpenAI Codex": "openai",
             "🌐 OpenCode (OpenRouter)": "opencode",
+            "🎭 Muse Code (Meta)": "muse",
         }
         self._model_provider = {}
         for company, models in self.grouped_models.items():
@@ -814,6 +817,8 @@ class OrquestraTUI(App):
             return "brain", "ollama-cloud"
         if m.startswith(("gpt-", "o1", "o3", "o4")) or grp == "openai":
             return "codex", ""   # usa o login do codex CLI
+        if m.startswith("muse") or grp == "muse":
+            return "muse", ""    # usa o login do muse CLI
         return "brain", "ollama-cloud"
 
     def _check_brain_key(self, provider: str) -> None:
@@ -930,7 +935,7 @@ class OrquestraTUI(App):
                 self._persist_agent("orquestrador", **{k: v for k, v in fields.items() if v is not None})
                 if b == "brain":
                     self._check_brain_key(prov)
-                elif b in ("agy", "claude", "codex"):
+                elif b in ("agy", "claude", "codex", "muse"):
                     self.query_one("#chat-log", RichLog).write(
                         f"\n[dim]🎼 Orquestrador via [bold]{b}[/bold] (conta logada no terminal), modo plano.[/dim]\n")
 
