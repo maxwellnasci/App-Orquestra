@@ -27,21 +27,27 @@ O framework `Textual` tem um comportamento rigoroso de layout e overflow. Os bot
    - A string de exibição **nunca pode ultrapassar 18 caracteres**. (Para que `Orq: {18_chars}` = 23 caracteres, cabendo no botão de 25 com padding).
 3. **BACKEND NÃO É AFETADO:** Essa limitação é **estritamente visual**. O `value` real que circula nas variáveis (ex: `gemini-3.7-flash-high`) permanece intacto para ser passado à API de backend.
 
-## Terminal real (set/2026) — botão 💻 Shell + aba 🖥 Terminal
+## Terminal real (set/2026) — painel lateral 🖥 Shell + shell externo (Ctrl+O)
 
 Duas formas de ter um shell de verdade dentro do Orquestra:
 
 1. **`💻 Shell` (header)** — `action_open_shell` usa `self.suspend()` e roda
    `$SHELL`; a TUI congela até `exit`/Ctrl+D. Terminal 100% real (vim, claude,
-   codex, login interativo funcionam sem ressalva). *Bug corrigido:* o handler
-   chamava a action `async` sem `await`, então o botão não fazia nada — agora
-   é `self.call_later(self.action_open_shell)`.
-2. **`🖥 Terminal` (aba do palco, `Ctrl+E`)** — `orquestra_term.PtyTerminal`:
-   shell num pty (`ptyprocess`) desenhado por `pyte` dentro de um widget
-   Textual, ao lado do chat/diff. Sobe no primeiro acesso, no cwd do projeto,
-   com o `os.environ` já preenchido pelo vault. **Todas as teclas vão pro
-   shell** (inclusive os atalhos do app); `Ctrl+]` devolve o foco ao chat e
-   `Ctrl+E` volta à aba. Shell continua vivo em segundo plano; morre com o app.
+   codex, login interativo funcionam sem ressalva). Agora é `Ctrl+O` (o botão
+   `💻 Shell` abre o painel lateral). *Bug antigo corrigido:* o handler chamava
+   a action `async` sem `await`, então nada acontecia.
+2. **Painel lateral `📊 Logs | 🖥 Shell` (Ctrl+E, ou o botão `💻 Shell`)** —
+   `orquestra_term.PtyTerminal`: shell num pty (`ptyprocess`) desenhado por
+   `pyte` dentro de um widget Textual. Vive no `#terminal-panel` (a coluna da
+   direita, 45% da tela, que já mostrava os logs), então o shell fica **ao lado
+   da Atividade e acima do chat** — dá pra rodar `claude login`, `export KEY=...`
+   ou abrir um agente na pasta vendo o Orquestra trabalhar. Sobe no primeiro
+   acesso, no cwd do projeto, com o `os.environ` já preenchido pelo vault.
+   **Todas as teclas vão pro shell** (inclusive os atalhos do app); `Ctrl+]`
+   devolve o foco ao chat, `Ctrl+T` fecha/abre o painel (o shell segue vivo) e
+   `Ctrl+E` volta pro shell. O shell morre com o app.
+   `Ctrl+O` continua abrindo o shell **externo** (suspende a TUI) — o mais fiel
+   (copiar/colar, scrollback, apps de tela cheia exigentes).
 
 Decisões/armadilhas (o que não é óbvio no código):
 - **`event.character` não é confiável** (None pra Enter/Ctrl+letra no Pilot,
@@ -52,7 +58,15 @@ Decisões/armadilhas (o que não é óbvio no código):
 - **Ctrl+5 = Ctrl+] em terminais sem protocolo kitty** (byte 0x1d) → o atalho
   de abrir é Ctrl+E, não Ctrl+5.
 - `_re_enable_input` (fim de tarefa) não rouba o foco de quem digita no terminal.
+- **Ctrl+E é binding `priority`**: o `TextArea` do chat liga Ctrl+E a "fim da
+  linha" e engolia o atalho justo quando o foco estava no chat. Com o shell em
+  foco a action repassa `\x05` ao shell (readline: fim da linha).
+- `RichLog` adia a escrita enquanto está oculto: com a aba Shell ativa os logs
+  novos só aparecem ao voltar pra aba `📊 Logs` (nada se perde).
+- Ao testar a TUI, **nunca digite sem garantir o foco no terminal**: Enter no
+  chat dispara chamada real ao Orquestrador (foi assim que um teste quebrado
+  falou com o LLM sem querer).
 - Chave exportada no shell embutido vale só pra ele; pro Orquestra usar `/senha`.
 - **Limites**: sem scrollback, sem mouse, sem seleção/cópia (copie pelo
   `💻 Shell` ou tmux); pyte não cobre 100% do xterm.
-- Testes: `python3 test_orquestra_term.py` (Pilot + shell real, 45 checks).
+- Testes: `python3 test_orquestra_term.py` (Pilot + shell real, 56 checks).

@@ -243,7 +243,9 @@ class OrquestraTUI(App):
         Binding("ctrl+4", "stage_tab('stage-idea')", "Idea Studio", show=False),
         # Ctrl+E e não Ctrl+5: em terminais sem protocolo kitty (xterm, qterminal)
         # Ctrl+5 chega como 0x1d, o mesmo byte do Ctrl+] (sair do terminal).
-        Binding("ctrl+e", "stage_tab('stage-terminal')", "Terminal embutido", show=False),
+        # priority: o TextArea do chat liga Ctrl+E a "fim da linha" e engoliria o atalho.
+        Binding("ctrl+e", "focus_shell", "Shell no painel lateral", show=False, priority=True),
+        Binding("ctrl+o", "open_shell", "Shell externo (suspende a TUI)", show=False),
         Binding(EXIT_KEY, "leave_terminal", "Sair do terminal", show=False),
         Binding("ctrl+t", "toggle_terminal", "Terminal", show=False),
         Binding("ctrl+b", "toggle_files", "Arquivos", show=False),
@@ -545,6 +547,14 @@ class OrquestraTUI(App):
         border-bottom: solid $primary-background;
     }
 
+    #side-tabs {
+        height: 1fr;
+    }
+
+    #side-tabs TabPane {
+        padding: 0;
+    }
+
     #terminal-log {
         height: 1fr;
         background: #020409;
@@ -586,13 +596,6 @@ class OrquestraTUI(App):
                         yield Button("🔍 Revisão profunda", id="btn-deep-review", classes="action-btn")
                     yield Vertical(id="suggestions-panel", classes="hidden")
                     yield TabbedContent(id="editor-tabs")
-                with TabPane("🖥 Terminal", id="stage-terminal"):
-                    yield Label(
-                        f"Shell real na pasta do projeto · todas as teclas vão pro shell · "
-                        f"{EXIT_KEY_LABEL} volta pro chat · Ctrl+E volta pra cá",
-                        id="term-hint",
-                    )
-                    yield PtyTerminal(cwd=self._project_dir(), id="embedded-term")
                 with TabPane("🎨 Idea Studio", id="stage-idea"):
                     yield Container(id="idea-image")
                     yield Markdown(
@@ -601,10 +604,21 @@ class OrquestraTUI(App):
                         id="idea-md",
                     )
 
-            # ── Painel Terminal (lateral direita, toggle com Ctrl+T) ──
+            # ── Painel lateral direito (Ctrl+T): 📊 Logs dos agentes | 🖥 Shell ──
+            # O shell fica ao lado da Atividade e acima do chat — dá pra
+            # rodar `claude login`, `export KEY=...` ou abrir um agente na
+            # pasta vendo o Orquestra trabalhar, sem sair da tela.
             with Vertical(id="terminal-panel"):
-                yield Label("📊 MONITOR DOS AGENTES (Logs)", id="terminal-header")
-                yield RichLog(id="terminal-log", markup=True, wrap=True, max_lines=8000)
+                with TabbedContent(id="side-tabs", initial="side-logs"):
+                    with TabPane("📊 Logs", id="side-logs"):
+                        yield RichLog(id="terminal-log", markup=True, wrap=True, max_lines=8000)
+                    with TabPane("🖥 Shell", id="side-shell"):
+                        yield Label(
+                            f"Shell real · todas as teclas vão pro shell · "
+                            f"{EXIT_KEY_LABEL} volta pro chat · Ctrl+E volta pra cá",
+                            id="term-hint",
+                        )
+                        yield PtyTerminal(cwd=self._project_dir(), id="embedded-term")
 
 
         # ── Dock de Prompt estilo Antigravity ──
@@ -916,11 +930,9 @@ class OrquestraTUI(App):
             self.action_toggle_terminal()
             return
 
-        # Botão Shell: abre o shell interativo
+        # Botão Shell: shell no painel lateral (Ctrl+O = shell externo, suspende a TUI)
         if event.button.id == "btn-shell":
-            # action_open_shell é async: chamar sem await só criava a coroutine
-            # e o botão não fazia nada. call_later agenda e aguarda de verdade.
-            self.call_later(self.action_open_shell)
+            self.action_focus_shell()
             return
 
         # Toggles de painéis
@@ -1423,8 +1435,21 @@ class OrquestraTUI(App):
     # ── Atalhos do palco/chat-dock (PLANO_PALCO_CHAT.md, Etapa 1) ────────────
 
     def action_stage_tab(self, pane_id: str) -> None:
-        """Ctrl+1..4 / Ctrl+E: troca a aba ativa do palco direto pelo teclado."""
+        """Ctrl+1..4: troca a aba ativa do palco direto pelo teclado."""
         self._stage_show(pane_id)
+
+    def action_focus_shell(self) -> None:
+        """Ctrl+E / botão 💻 Shell: abre o painel lateral na aba Shell e põe o
+        foco nele (o palco e o chat continuam visíveis)."""
+        if isinstance(self.focused, PtyTerminal):
+            # binding prioritário: com o shell em foco o Ctrl+E é do shell
+            # (readline: fim da linha), então repassa em vez de "reabrir".
+            self.focused._write(b"\x05")
+            return
+        self._show_terminal_panel()
+        self.query_one("#side-tabs", TabbedContent).active = "side-shell"
+        # depois do refresh: o widget só tem tamanho real com o painel visível
+        self.call_after_refresh(self._focus_embedded_term)
 
     def action_leave_terminal(self) -> None:
         """Ctrl+]: devolve o foco ao chat (o terminal embutido consome as
@@ -2685,8 +2710,8 @@ class OrquestraTUI(App):
         usuário lendo o Editor levaria um "puxão" de volta a cada chamada)."""
         if event.tabbed_content.id == "stage-tabs" and self._active_workers > 0:
             self._stage_pinned = True
-        if event.tabbed_content.id == "stage-tabs" and event.pane.id == "stage-terminal":
-            # depois do refresh: o widget só tem tamanho real quando a aba aparece
+        if event.tabbed_content.id == "side-tabs" and event.pane.id == "side-shell":
+            # clique direto na aba 🖥 Shell: sobe o shell e leva o foco
             self.call_after_refresh(self._focus_embedded_term)
 
     # ── Helpers de UI (devem ser chamados na thread da UI) ────────────────────

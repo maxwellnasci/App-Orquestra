@@ -185,18 +185,58 @@ async def tui_tests():
             term = app.query_one("#embedded-term", PtyTerminal)
             check(not term.alive, "shell embutido não sobe no boot")
 
+            panel = app.query_one("#terminal-panel")
+            check(not panel.has_class("visible"), "painel lateral começa fechado")
+
             await pilot.click("#btn-shell")
+            check(await wait_for(lambda: term.alive), "botão 💻 Shell sobe o shell no painel lateral")
             await pilot.pause()
-            check(calls == ["open_shell"], "botão 💻 Shell agora AGUARDA action_open_shell")
-
-            await pilot.press("ctrl+e")
-            check(await wait_for(lambda: term.alive), "Ctrl+E abre a aba e sobe o shell")
-            check(app.query_one("#stage-tabs").active == "stage-terminal", "aba Terminal ativa")
-            await pilot.pause()
+            check(panel.has_class("visible"), "botão abre o painel lateral")
+            check(app.query_one("#side-tabs").active == "side-shell", "aba 🖥 Shell ativa no painel")
             check(app.focused is term, "foco vai pro terminal")
+            check(calls == [], "botão NÃO suspende a TUI (nada de terminal externo)")
 
+            # shell e o resto da tela visíveis AO MESMO TEMPO
+            _t, _a, _c = term.region, app.query_one("#activity-log").region, app.query_one("#chat-input").region
+            check(_t.width >= 40 and _t.height >= 10, f"terminal com tamanho útil ({_t.width}x{_t.height})")
+            check(_a.width > 0 and _a.right <= _t.x, "Atividade visível à esquerda do terminal")
+            check(_c.height > 0 and _c.y >= _t.bottom, "chat visível abaixo do terminal")
+            check(app.query_one("#stage-tabs").active == "stage-activity",
+                  "palco continua na Atividade (não foi trocado)")
+
+            # RichLog adia escrita enquanto oculto: os logs aparecem ao voltar pra aba 📊 Logs
+            app._terminal_log("linha-de-log")
+            app.query_one("#side-tabs").active = "side-logs"
+            await pilot.pause()
+            check(any("linha-de-log" in str(l.text) for l in app.query_one("#terminal-log").lines),
+                  "aba Logs recebe o texto escrito enquanto o Shell estava em foco")
+            await pilot.press("ctrl+e")                     # de volta ao Shell (foco em nenhum campo de texto)
+            await wait_for(lambda: app.focused is term)
+
+            await pilot.press("ctrl+right_square_bracket")
+            await pilot.pause()
+            check(app.focused is app.query_one("#chat-input"), "Ctrl+] devolve o foco ao chat")
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+            check(not panel.has_class("visible") and term.alive, "Ctrl+T fecha o painel e o shell segue vivo")
+            # foco no TextArea do chat: ele liga Ctrl+E a "fim da linha" — o atalho precisa vencer
+            await pilot.press("ctrl+e")
+            check(await wait_for(lambda: panel.has_class("visible") and app.focused is term),
+                  "Ctrl+E (com o foco no chat) reabre o painel direto no shell")
+            await pilot.press("ctrl+right_square_bracket")
+            await pilot.pause()
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            check(calls == ["open_shell"], "Ctrl+O continua abrindo o shell externo (suspende)")
+            await pilot.press("ctrl+e")
+            await wait_for(lambda: app.focused is term)
+
+            # Guarda: nunca digitar no chat por engano (isso dispararia chamada real ao Orquestrador)
+            if app.focused is not term:
+                check(False, "foco no terminal antes de digitar (abortando o resto pra não falar com o Orquestrador)")
+                return
             await pilot.press(*"echo integrado-$((6*7))", "enter")
-            check(await wait_for(lambda: "integrado-42" in term.screen_text()), "digitar na aba executa no shell")
+            check(await wait_for(lambda: "integrado-42" in term.screen_text()), "digitar no painel executa no shell")
 
             files_before = app.query_one("#file-panel").has_class("hidden")
             await pilot.press("ctrl+b")
