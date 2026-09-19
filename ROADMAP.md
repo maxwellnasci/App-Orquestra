@@ -3,7 +3,16 @@
 Documento vivo. Conforme for usando a TUI no dia a dia, anote aqui o que incomoda e
 o que dá pra melhorar.
 
-## Arquitetura atual (V6 — Palco + Chat)
+## Arquitetura atual (V7 — Palco + Painel lateral + Chat)
+
+Desde 18–19/09/2026 a tela tem uma **terceira coluna à direita** (`#terminal-panel`,
+45%): abas `📊 Logs` (monitor dos agentes) e `🖥 Shell` (terminal de verdade dentro da
+TUI, `orquestra_term.py`). Dá pra rodar `claude login`, `export KEY=...` ou abrir um
+agente na pasta vendo a Atividade e o chat ao mesmo tempo. `Ctrl+E` abre, `Ctrl+]`
+volta pro chat, `Ctrl+T` / ✕ fecha (o shell segue vivo), `Ctrl+O` = shell externo.
+Ver `AGENTES.md` (regras) e `APRENDIZADOS.md` §12 (erros e acertos do dia).
+
+## Arquitetura anterior (V6 — Palco + Chat)
 
 TUI reorganizada em **palco** (abas ⚡ Atividade / ± Mudanças / 📝 Editor /
 🎨 Idea Studio, em cima, grande) + **chat** (faixa pequena embaixo, largura
@@ -32,6 +41,12 @@ TUI (Textual) como interface oficial. 3 agentes + Cão de Guarda, produtividade
 Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
 
 ## ✅ Feito
+
+- [x] **Terminal real dentro do Orquestra (18–19/09/2026, PRs #4/#5/#6)** — shell num pty
+  (`ptyprocess`) desenhado por `pyte` num painel lateral ao lado da Atividade e do chat;
+  tela alternativa (vim/less), cores, resize, paste, reinício; ✕ pra fechar com o mouse;
+  botão `💻 Shell` corrigido (era no-op: action `async` chamada sem `await`);
+  `Ctrl+O` mantém o shell externo. 62 checks em `test_orquestra_term.py`.
 
 - [x] TUI vira a interface oficial (`orquestra` abre a TUI; `--repl` = REPL legado)
 - [x] Orquestrador estrategista sem ferramentas (cérebro via chat completions: DeepSeek/Ollama)
@@ -93,6 +108,11 @@ Ver `AGENTES.md` para a arquitetura completa e as regras que não podem quebrar.
   agentes mockados).
 
 ## 💡 Próximas ideias
+
+- **Terminal embutido — o que falta (medido no uso real, não adivinhado):** scrollback
+  (`pyte.HistoryScreen` + PageUp/roda do mouse), seleção/cópia (hoje só via `Ctrl+O`),
+  mouse (apps que pedem `?1000h`), largura do painel ajustável (hoje 45% fixo), e testar
+  `claude`/`codex` de tela cheia lá dentro — **ainda não foi validado**.
 
 - [ ] `codex exec resume --last` (existe no Codex CLI 0.152) em vez de
   reenviar o histórico inteiro a cada turno do Orquestrador — anotado na

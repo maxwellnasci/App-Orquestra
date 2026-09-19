@@ -18,28 +18,47 @@ Troque o motor de qualquer um pelos botões do topo da TUI (`Orq:` / `Op:` / `Re
 inclusive por modelos chineses via OpenRouter (DeepSeek, Qwen, GLM, Kimi, MiniMax),
 usando a CLI `opencode` já logada na máquina.
 
-## A tela: Palco + Chat
+## A tela: Palco + Painel lateral + Chat
 
 ```
-┌ 🎼 ORQUESTRA   [📁 Arquivos] [🎓 Aprendizado]         Orq: | Op: | Rev: ┐
-├──────────┬───────────────────────────────────────────────────────────────┤
-│ 📁       │ ⚡ Atividade │ ± Mudanças │ 📝 Editor │ 🎨 Idea Studio         │  ← palco
-│ Arquivos │───────────────────────────────────────────────────────────────│
-│ (toggle) │ narração ao vivo de cada agente, com timestamp e cor          │
-├──────────┴───────────────────────────────────────────────────────────────┤
-│ 💬 Orquestrador                    ⠹ 🔨 Operador editando... 12s        │  ← chat, embaixo
-│ conversa limpa — sem narração crua de worker                            │
-│ [✅ Aprovar] [❌ Rejeitar] [🔍 Revisar]                                   │
-└───────────────────────────────────────────────────────────────────────────┘
+┌ 🎼 ORQUESTRA  [📁 Arquivos] [📊 Logs] [💻 Shell] [🎓 Aprendizado]  Orq:|Op:|Rev: ┐
+├──────────┬───────────────────────────────────────┬──────────────────────────┤
+│ 📁       │ ⚡ Atividade │ ± Mudanças │ 📝 Editor …  │ 📊 Logs │ 🖥 Shell     [✕] │
+│ Arquivos │───────────────────────────────────────│──────────────────────────│
+│ (toggle) │ narração ao vivo de cada agente,      │ ┌──(max㉿kali)-[projeto]  │
+│          │ com timestamp e cor                   │ └─$ claude login          │
+├──────────┴───────────────────────────────────────┴──────────────────────────┤
+│ 💬 Orquestrador                    ⠹ 🔨 Operador editando... 12s            │  ← chat
+│ conversa limpa — sem narração crua de worker                                │
+│ [✅ Aprovar] [❌ Rejeitar] [🔍 Revisar]                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Em cima, um **palco** com 4 abas: **⚡ Atividade** (o que a equipe está
+No meio, um **palco** com 4 abas: **⚡ Atividade** (o que a equipe está
 fazendo agora — prompt completo, texto ao vivo, tool calls), **± Mudanças**
 (diff colorido do que ainda não foi aprovado), **📝 Editor**, **🎨 Idea
 Studio**. Embaixo, um **chat** fino de largura cheia — só conversa, nunca a
 narração crua de um worker. O palco pula sozinho pra Atividade quando uma
 tarefa começa (`/seguir off` desliga isso); se você trocar de aba na mão
 enquanto algo roda, ele respeita e avisa quando terminar.
+
+À direita fica o **painel lateral** (escondido até você abrir), com duas abas:
+**📊 Logs** (monitor dos agentes — abre sozinho quando um agente começa) e
+**🖥 Shell** — um **terminal de verdade dentro do Orquestra**, na pasta do projeto e
+com as chaves do cofre já no ambiente. Serve pra o que só você faz: `claude login`,
+`export CHAVE=...`, abrir um agente qualquer na pasta, rodar `git`/`vim`/`less` —
+sem sair da tela e vendo a Atividade e o chat ao mesmo tempo.
+
+- `Ctrl+E` (ou o botão `💻 Shell`) abre o painel já no shell, com o foco nele.
+- Com o foco no shell, **todas as teclas vão pra ele** (inclusive os atalhos do app);
+  `Ctrl+]` devolve o foco ao chat.
+- `Ctrl+T`, o botão `📊 Logs` ou o **✕** do painel fecham — só escondem; o shell
+  continua vivo e volta igual (com o histórico) ao reabrir.
+- `Ctrl+O` abre o **shell externo** (a TUI é suspensa e você cai num bash nativo,
+  `exit` volta). É o mais fiel: use pra copiar/colar, rolar o histórico ou apps de
+  tela cheia exigentes.
+- **Limites do painel:** sem scrollback, sem mouse e sem seleção/cópia; é um emulador
+  em Python (`pyte`), não idêntico ao seu terminal em apps de tela cheia mais exóticos.
 
 ## 🎓 Modo Aprendizado
 
@@ -143,6 +162,10 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 |---|---|
 | `Ctrl+1` … `Ctrl+4` | Abre a aba do palco: Atividade, Mudanças, Editor, Idea Studio. |
 | `Ctrl+B` | Mostra/oculta o painel Arquivos. |
+| `Ctrl+E` | Abre o painel lateral direto no 🖥 Shell (funciona mesmo com o foco no chat). |
+| `Ctrl+]` | Sai do shell embutido e volta o foco pro chat (dentro dele, tudo vai pro shell). |
+| `Ctrl+T` | Abre/fecha o painel lateral (o shell embutido continua vivo). |
+| `Ctrl+O` | Shell **externo**: suspende a TUI e abre um bash nativo (`exit` volta). |
 | `Ctrl+↑` / `Ctrl+↓` | Tamanho do chat: compact ↔ normal ↔ tall (fica salvo). |
 | `Ctrl+K` | Limpa a aba Atividade (não mexe no chat nem no histórico). |
 | `Ctrl+L` | Foco direto no campo de texto do chat. |
@@ -154,10 +177,14 @@ mestra e injeta suas credenciais como variáveis de ambiente da sessão. Comando
 |---|---|
 | `orquestra` | Launcher (abre a TUI; `--repl` cai no REPL). |
 | `orquestra_tui.py` | A interface (Textual). |
+| `orquestra_term.py` | `PtyTerminal`: o shell real embutido no painel lateral (pty + pyte). |
 | `orquestra.py` | Backend: config, memória, cofre, execução dos operários, Cão de Guarda. |
 | `orchestrator_brain.py` | O cérebro do Orquestrador — chat puro, zero ferramentas. |
 | `vault.py` | Cofre de credenciais por projeto. |
 | `AGENTES.md` | Documentação de arquitetura para contribuir. |
+| `NOTAS_TUI.md` | Armadilhas de layout da TUI + como o terminal real foi feito. |
+| `APRENDIZADOS.md` | Erros e acertos de cada sessão (a §12 é a do terminal real). |
+| `test_orquestra.py` · `test_orquestra_term.py` | Testes sem rede (`python3 <arquivo>`). |
 | `PLANO_PALCO_CHAT.md` | Plano do layout Palco + Chat (histórico, 6 etapas, todas feitas). |
 | `~/.orquestra.json` | Configuração (roles, workers, ui). |
 | `~/.orquestra_chats/memory.db` | Fila de tarefas + memória de lições (SQLite). |
