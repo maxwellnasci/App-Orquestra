@@ -547,6 +547,32 @@ class OrquestraTUI(App):
         border-bottom: solid $primary-background;
     }
 
+    #side-header {
+        height: 1;
+        background: $boost;
+    }
+
+    #side-title {
+        width: 1fr;
+        padding: 0 1;
+        color: $text-muted;
+    }
+
+    #btn-close-side {
+        width: 5;
+        min-width: 5;
+        height: 1;
+        border: none;
+        padding: 0;
+        background: $boost;
+        color: $text-muted;
+    }
+
+    #btn-close-side:hover {
+        background: $error;
+        color: white;
+    }
+
     #side-tabs {
         height: 1fr;
     }
@@ -609,6 +635,9 @@ class OrquestraTUI(App):
             # rodar `claude login`, `export KEY=...` ou abrir um agente na
             # pasta vendo o Orquestra trabalhar, sem sair da tela.
             with Vertical(id="terminal-panel"):
+                with Horizontal(id="side-header"):
+                    yield Label("Painel lateral · Ctrl+T abre/fecha", id="side-title")
+                    yield Button("✕", id="btn-close-side", tooltip="Fechar o painel (o shell continua vivo)")
                 with TabbedContent(id="side-tabs", initial="side-logs"):
                     with TabPane("📊 Logs", id="side-logs"):
                         yield RichLog(id="terminal-log", markup=True, wrap=True, max_lines=8000)
@@ -928,6 +957,12 @@ class OrquestraTUI(App):
         # Botão Logs (antigo Terminal): mostra/oculta painel lateral
         if event.button.id == "btn-terminal":
             self.action_toggle_terminal()
+            return
+
+        # ✕ do painel lateral: fecha (mesmo efeito do Ctrl+T); o shell segue vivo
+        if event.button.id == "btn-close-side":
+            if self.query_one("#terminal-panel").has_class("visible"):
+                self.action_toggle_terminal()
             return
 
         # Botão Shell: shell no painel lateral (Ctrl+O = shell externo, suspende a TUI)
@@ -1487,6 +1522,10 @@ class OrquestraTUI(App):
             panel.remove_class("visible")
             btn.remove_class("active")
             btn.label = "📊 Logs"
+            if self.focused is not None and panel in self.focused.ancestors_with_self:
+                # o painel some com o foco dentro (no shell ou no próprio ✕, que
+                # já tomou o foco no clique): devolve ao chat. O shell segue vivo.
+                self.action_focus_chat()
         else:
             panel.add_class("visible")
             btn.add_class("active")

@@ -253,6 +253,23 @@ async def tui_tests():
             check(app.focused is app.query_one("#chat-input"), "Ctrl+] devolve o foco ao chat")
             check(term.alive, "shell continua vivo depois de sair do foco")
             pid = term.pid
+
+            # ✕ do painel: fecha com o clique, mesmo com o foco DENTRO do terminal
+            await pilot.press("ctrl+e")
+            await wait_for(lambda: app.focused is term)
+            close = app.query_one("#btn-close-side")
+            check(close.region.width > 0 and close.region.right == panel.region.right,
+                  "✕ visível no canto superior direito do painel")
+            await pilot.click("#btn-close-side")
+            check(await wait_for(lambda: not panel.has_class("visible")), "clicar no ✕ fecha o painel")
+            check(term.alive and term.pid == pid, "✕ não mata o shell (só esconde o painel)")
+            check(app.focused is app.query_one("#chat-input"), "✕ devolve o foco ao chat")
+            await pilot.press("ctrl+e")
+            check(await wait_for(lambda: panel.has_class("visible") and app.focused is term),
+                  "Ctrl+E reabre o painel e o mesmo shell volta")
+            check(term.pid == pid, "é o mesmo shell (não reiniciou)")
+            await pilot.press("ctrl+right_square_bracket")
+            await pilot.pause()
         await asyncio.sleep(0.3)
         check(pid_gone(pid), "fechar o Orquestra mata o shell embutido")
 
