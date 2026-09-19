@@ -1,5 +1,32 @@
 # Changelog Orquestra
 
+## Terminal real dentro do Orquestra (18–19/09/2026) — PRs #4, #5, #6
+
+Erros e acertos completos em `APRENDIZADOS.md` §12; regras em `AGENTES.md`.
+
+- **Painel lateral `📊 Logs | 🖥 Shell`** (`#terminal-panel`, coluna da direita): shell
+  de verdade num pty (`ptyprocess`) desenhado por `pyte` num widget Textual próprio
+  (`orquestra_term.PtyTerminal`, `#embedded-term`). Ao lado da Atividade e acima do
+  chat — dá pra rodar `claude login`, `export KEY=...` ou abrir um agente na pasta sem
+  sair da tela. Sobe no primeiro acesso, no cwd do projeto, com o `os.environ` do cofre.
+- **Atalhos:** `Ctrl+E` abre no shell (prioritário — o `TextArea` do chat engolia),
+  `Ctrl+]` volta pro chat, `Ctrl+T` / **✕** fecham (shell segue vivo), `Ctrl+O` = shell
+  **externo** (`self.suspend()` + `$SHELL`).
+- **Fix: botão `💻 Shell` não fazia nada** — o handler chamava `action_open_shell` (async)
+  sem `await`; a coroutine nunca rodava. (Depois do PR #5 o botão abre o painel lateral;
+  o shell externo ficou no `Ctrl+O`.)
+- **Emulação:** tela alternativa (vim/less/codex) implementada em `_Screen` (o `pyte`
+  não faz), `_ignore_private` (o `pyte` levantava `TypeError` com `CSI ? … n/m` e o vim
+  aparecia em branco), cores ANSI/256/truecolor, resize (SIGWINCH), paste com colchetes,
+  reinício com Enter após `exit`, teclas por *nome* (`event.character` não é confiável).
+- **`_re_enable_input` não rouba mais o foco** de quem digita no terminal; fechar o painel
+  devolve o foco ao chat.
+- **Testes:** `test_orquestra_term.py` (62 checks: Pilot + shell real + integração na TUI).
+  `test_orquestra.py` segue verde.
+- **Dependências novas:** `pyte`, `ptyprocess` (README atualizado).
+- **Limites:** sem scrollback, mouse e cópia no painel; `claude`/`codex` de tela cheia
+  ainda **não foram validados** lá dentro (o `Ctrl+O` cobre).
+
 ## Não lançado — Gate de verificação + Cão de Guarda no DeepSeek (set/2026)
 
 Análise em `ANALISE_GATE_E_COPILOT_2026-09-10.md`. Duas melhorias no fluxo, sem
