@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, Container
-from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree, TabbedContent, TabPane
+from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree, TabbedContent, TabPane, Input
 from textual.widgets.option_list import Option
 from textual.screen import ModalScreen
 from textual.message import Message
@@ -164,6 +164,49 @@ class ModelSelectionModal(ModalScreen[str]):
             self.dismiss(None)
 
 
+class FileNameModal(ModalScreen[str]):
+    """Pergunta o nome de um arquivo novo (Ctrl+N no Editor). Enter confirma,
+    Esc/Cancelar fecha sem criar. Devolve o caminho digitado (relativo ao
+    projeto) ou None."""
+    CSS = """
+    FileNameModal { align: center middle; background: $background 50%; }
+    #fn-box {
+        width: 70%; max-width: 80; height: auto;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #fn-box Input { margin: 1 0; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancelar", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fn-box"):
+            yield Label("Nome do arquivo novo (caminho relativo ao projeto):", classes="panel-title")
+            yield Input(placeholder="ex: src/util/helpers.py", id="fn-input")
+            with Horizontal():
+                yield Button("Criar", id="fn-ok", variant="success")
+                yield Button("✕ Cancelar", id="fn-cancel", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#fn-input", Input).focus()
+
+    def _submit(self) -> None:
+        val = self.query_one("#fn-input", Input).value.strip()
+        self.dismiss(val or None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "fn-ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ─── Stub de LiveSection para usar as funções do orquestra.py ───────────────
 
 class _TUILiveSection:
@@ -235,6 +278,7 @@ class OrquestraTUI(App):
 
     BINDINGS = [
         Binding("ctrl+s", "save_file", "Salvar", show=False),
+        Binding("ctrl+n", "new_file", "Novo arquivo", show=False),
         Binding("ctrl+w", "close_tab", "Fechar aba", show=False),
         # PLANO_PALCO_CHAT.md, Etapa 1 — atalhos do palco/chat-dock.
         Binding("ctrl+1", "stage_tab('stage-activity')", "Atividade", show=False),
@@ -1108,6 +1152,11 @@ class OrquestraTUI(App):
             self._re_enable_input()
             self._feed_write(
                 "\n[dim]✏️ Diga o que quer mudar no plano.[/dim]\n")
+            # Bug real (achado em uso, 10/09/2026): ao mostrar o <PLANO>, o
+            # chat-input fica desabilitado esperando Executar/Ajustar — mas
+            # "Ajustar" só dava focus() sem reabilitar, então o usuário clicava
+            # e não conseguia digitar nada. _re_enable_input() faz os dois.
+            self._re_enable_input()
 
         elif event.button.id == "btn-cancel-plan":
             self.query_one("#plan-bar").add_class("hidden")
@@ -1178,6 +1227,23 @@ class OrquestraTUI(App):
         """Abre o arquivo clicado no Editor. Se o painel estiver oculto, abre-o."""
         self._open_file_in_editor(str(event.path))
 
+    def _snapshot_open_buffers(self) -> list[dict]:
+        """Snapshot (chamar na thread da UI) dos arquivos abertos no Editor com o
+        texto atual do buffer — insumo de orquestra.format_working_context, pro
+        Orquestrador enxergar o que o usuário está mexendo agora, salvo ou não."""
+        out: list[dict] = []
+        for pane_id, info in list(self._open_files.items()):
+            try:
+                ta = self.query_one(f"#code-{pane_id}", TextArea)
+            except Exception:
+                continue
+            out.append({
+                "path": info["path"],
+                "disk_text": info.get("original_text", ""),
+                "buffer_text": ta.text,
+            })
+        return out
+
     def _open_file_in_editor(self, filepath: str, switch_stage: bool = True) -> "TextArea | None":
         """Abre um arquivo numa aba do Editor. Se já estiver aberto, só foca a
         aba (nunca recarrega do disco — preservaria uma edição não salva).
@@ -1225,6 +1291,47 @@ class OrquestraTUI(App):
         if switch_stage:
             self._stage_show("stage-editor")
         return editor
+
+    def action_new_file(self) -> None:
+        """Ctrl+N: pergunta o nome e abre uma aba vazia no Editor. O arquivo só
+        nasce no disco no primeiro Ctrl+S (action_save_file grava info['path']
+        exista ou não). Caminho fora da pasta do projeto é recusado."""
+        import orquestra
+
+        def _create(rel: str | None) -> None:
+            if not rel:
+                return
+            cwd = orquestra.get_project_dir()
+            root = os.path.realpath(cwd)
+            abs_path = os.path.realpath(os.path.join(cwd, rel))
+            if abs_path != root and not abs_path.startswith(root + os.sep):
+                self.notify("Caminho fora da pasta do projeto — recusado.", severity="error")
+                return
+            if os.path.isdir(abs_path):
+                self.notify("Esse caminho é uma pasta.", severity="error")
+                return
+            if os.path.isfile(abs_path) or abs_path in self._path_to_pane:
+                self.notify("Arquivo já existe — abrindo.", timeout=2)
+                self._open_file_in_editor(abs_path)
+                return
+            try:
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            except OSError as e:
+                self.notify(f"Não consegui preparar a pasta: {e}", severity="error")
+                return
+            tabs = self.query_one("#editor-tabs", TabbedContent)
+            self._tab_counter += 1
+            pane_id = f"tab-{self._tab_counter}"
+            editor = TextArea("", language=_language_for_path(abs_path), id=f"code-{pane_id}")
+            tabs.add_pane(TabPane(f"● {Path(abs_path).name}", editor, id=pane_id))
+            tabs.active = pane_id
+            self._open_files[pane_id] = {"path": abs_path, "original_text": "", "dirty": True}
+            self._path_to_pane[abs_path] = pane_id
+            self._stage_show("stage-editor")
+            editor.focus()
+            self.notify(f"Ctrl+S para criar {Path(abs_path).name} no disco", timeout=3)
+
+        self.push_screen(FileNameModal(), _create)
 
     def _stage_show(self, pane_id: str) -> None:
         """Traz uma aba do palco (#stage-tabs) pra frente. Chamar só na thread
@@ -1830,7 +1937,11 @@ class OrquestraTUI(App):
         orquestra.save_chat_message("orquestrador", "user", prompt)
         history = orquestra.load_chat_history("orquestrador")
         memory = orquestra._load_memory_context(orquestra.get_project_id())
-        full_prompt = orquestra.build_orchestrator_prompt(config, history, memory)
+        # Estado de trabalho ao vivo: arquivos abertos + edições não salvas
+        # (snapshot na thread da UI) + diff pendente do repo (feito lá dentro).
+        buffers = self.call_from_thread(self._snapshot_open_buffers)
+        working = orquestra.format_working_context(buffers, orquestra.get_project_dir())
+        full_prompt = orquestra.build_orchestrator_prompt(config, history, memory, working)
 
         cmd, binary, ofile = orquestra._build_orchestrator_cmd(orq_role, full_prompt)
         env = os.environ.copy()
@@ -2192,6 +2303,7 @@ class OrquestraTUI(App):
                 comment = orquestra._orchestrator_react(
                     config, label, report_input, section=react_section,
                     has_pending_changes=bool(changes_summary),
+                    changed_files=result.changed_files or None,
                 )
                 self.call_from_thread(self._set_status, "")
                 if comment:

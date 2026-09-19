@@ -1939,6 +1939,15 @@ _FAMILIA_CHOICES = [
     ("opencode", "🌐 OpenCode               (opencode) — OpenRouter"),
 ]
 
+# Motores "com olhos" para o ORQUESTRADOR — rodam em modo plano/read-only: leem
+# arquivo e rodam comando de leitura pra dar contexto real, mas NUNCA escrevem
+# nem alteram nada (implementar é sempre do Operador). Usam a CLI já logada.
+_ORQ_AGENT_CHOICES = [
+    ("codex",    "👁  Codex (plano)         — lê o projeto e raciocina, não escreve"),
+    ("claude",   "👁  Claude Code (plano)   — lê o projeto e raciocina, não escreve"),
+    ("gemini",   "👁  Antigravity (plano)   — lê o projeto e raciocina, não escreve"),
+]
+
 # Muse não tem lista de modelos pra buscar (só existe o muse-spark) — o campo
 # "model" do worker carrega o reasoning_effort. "ultra" fica listado mas o
 # binário mesmo bloqueia (plano básico) e cai sozinho pra xhigh — confirmado
@@ -1958,6 +1967,10 @@ _BRAIN_CHOICES = [
     ("brain-deepseek", "🧠 DeepSeek (chat direto)   — rápido e barato, sem ferramentas"),
     ("brain-ollama",   "🧠 Ollama Cloud (Kimi/GPT)  — chat direto, sem ferramentas"),
 ]
+
+# O que o menu do REPL oferece pro Orquestrador: primeiro os motores com olhos
+# (recomendados — enxergam o código), depois os cérebros de chat puro.
+_ORQ_CHOICES = _ORQ_AGENT_CHOICES + _BRAIN_CHOICES
 
 _SLOT_LABELS = {
     "orquestrador": "Orquestrador (Estrategista)",
@@ -2058,8 +2071,9 @@ def interactive_agent_selection(config: dict):
 
         elif step == "familia":
             slot_label = _SLOT_LABELS.get(slot, slot)
-            # O Orquestrador só aceita "cérebros" de chat puro (zero ferramentas).
-            choices = _BRAIN_CHOICES if slot == "orquestrador" else _FAMILIA_CHOICES
+            # Orquestrador: motores com olhos (plano/read-only) + cérebros de chat
+            # puro. Nunca os motores de escrita crus — implementar é do Operador.
+            choices = _ORQ_CHOICES if slot == "orquestrador" else _FAMILIA_CHOICES
             familia = radiolist_dialog(
                 title="\n  🎼  Orquestra — Trocar Inteligência",
                 text=f"Passo 2 de 3  ──  Qual provedor para o {slot_label}?",
@@ -2977,13 +2991,20 @@ disso por construção. Todo trabalho braçal é feito pela sua equipe."""
 
 _ORCH_QUEM_VOCE_E_READONLY = """QUEM VOCÊ É
 Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você é um
-assistente exclusivamente consultivo e coordenador:
-- PODE ler arquivos do projeto para contextualizar suas respostas.
+assistente consultivo e coordenador, em modo plano/read-only:
+- PODE ler arquivos do projeto pra entender de verdade antes de responder.
 - Responda SEMPRE com texto normal ao usuário (ou com blocos <PLANO> / <DELEGATE>).
-- NUNCA execute ferramentas de comando de shell (como RunCommand ou equivalentes).
+- NUNCA execute ferramentas de comando de shell (como RunCommand ou equivalentes) e
+  NUNCA escreva nem altere arquivo.
 - Não tente rodar comandos você mesmo — se precisar inspecionar, testar ou executar algo,
   coloque no <PLANO> e delegue para o operador ou revisor via <DELEGATE>.
-- Toda ação prática é executada pela sua equipe."""
+- Implementar é sempre delegado pra sua equipe, nunca feito por você mesmo.
+
+USE essa leitura de verdade. Antes de opinar sobre qualquer coisa do projeto, abra os
+arquivos que importam e leia o que já existe — uma resposta sua que poderia ter sido
+escrita sem olhar o código quase sempre é rasa demais. Quando o Operador ou o Revisor
+te entregam um resultado, vá ler os arquivos que eles tocaram e forme opinião própria,
+não repita o que eles disseram."""
 
 # A regra "revisor só sob pedido explícito" abaixo é enforcement só de prompt —
 # igual toda a outra política deste sistema (o próprio gate de "espera aprovação
@@ -3015,17 +3036,29 @@ O Cão de Guarda roda sozinho depois de cada edição — você não precisa aci
 já cobre a revisão automática (é por isso que o revisor não precisa entrar por padrão).
 
 COMO VOCÊ TRABALHA
-1. Dúvida conceitual ("o que é X?", "qual a diferença entre Y e Z?", "vale a pena usar Z
-   aqui?") → responda você mesmo, direto e objetivo. Sem plano, sem delegação.
-2. Qualquer coisa que exija ver ou mexer no código (analisar, corrigir, implementar,
-   refatorar, revisar):
-   a. Escreva 1-2 frases com sua leitura do problema e o caminho que você propõe.
-   b. Emita um bloco <PLANO> com os passos (quem faz o quê).
+1. Conversa pra entender, analisar ou decidir ("o que tá rolando no meu servidor?",
+   "por que isso tá lento?", "vale a pena usar Z aqui?", "me explica esse módulo",
+   "o que tu acha dessa ideia?") → seja um parceiro de raciocínio de verdade, estilo
+   pair programming. LEIA o código relevante (você está em read-only, use isso),
+   traga a SUA leitura do problema, as opções que enxerga, os trade-offs de cada uma
+   e a sua recomendação com o porquê. Puxe assunto: aponte o que te chamou atenção,
+   o que investigaria a seguir, o risco que você vê. Nada de <PLANO> aqui — é conversa.
+   Só vira plano quando existe uma mudança concreta pra fazer E o usuário sinaliza que
+   quer partir pra ação.
+2. Pedido de mexer no código (corrigir, implementar, refatorar), ou uma tarefa que
+   precisa de execução de verdade (rodar o servidor/testes, SSH, varredura em muitos
+   arquivos) que o usuário já disse que quer que a equipe faça:
+   a. 1-2 frases com sua leitura do problema e o caminho que você propõe.
+   b. Um bloco <PLANO> com os passos (quem faz o quê).
    c. PARE nessa resposta. Espere o usuário aprovar ("pode ir", "sim", "manda ver").
    d. Só emita <DELEGATE> junto do <PLANO> se o usuário JÁ tiver dito claramente para
       executar ("faz isso", "corrige agora", "analisa aí").
 3. Depois do "sim": emita o(s) <DELEGATE>. Antes de cada bloco, 1-2 frases de intenção —
    é o que o usuário lê enquanto a equipe trabalha. Nunca delegue em silêncio.
+4. Quando a equipe te devolve um resultado: não pare em "foi feito, isto mudou, falta
+   aquilo". Leia o que eles produziram (e os arquivos que tocaram), forme opinião
+   própria e siga a conversa — o que você faria a seguir, o que priorizaria primeiro
+   e por quê, o que ainda te preocupa. O usuário quer teu raciocínio, não um relatório.
 
 FORMATO
 <PLANO>
@@ -3113,11 +3146,58 @@ def _mostrar_resolve_path(rel_path: str) -> str | None:
     return abs_path
 
 
-def build_orchestrator_prompt(config: dict, history: list, memory_context: str = "") -> str:
+def format_working_context(open_buffers: list, cwd: str, max_chars: int = 6000) -> str:
+    """Texto do bloco 'O que o usuário está mexendo agora' de
+    build_orchestrator_prompt. `open_buffers`: lista de dicts
+    {path, disk_text, buffer_text} — a TUI monta via _snapshot_open_buffers
+    (o REPL não tem editor, passa []). Junta três coisas: os arquivos abertos
+    no Editor, o diff das edições ainda NÃO salvas (buffer vs. disco) e o diff
+    pendente do repositório (salvo, mas não commitado). Bounded por max_chars."""
+    import difflib
+    lines: list[str] = []
+
+    def _rel(p: str) -> str:
+        try:
+            return os.path.relpath(p, cwd)
+        except ValueError:
+            return p
+
+    if open_buffers:
+        rels = [_rel(b["path"]) for b in open_buffers]
+        lines.append("Arquivos abertos no Editor: " + ", ".join(rels))
+        for b, rel in zip(open_buffers, rels):
+            if b.get("buffer_text", "") != b.get("disk_text", ""):
+                ud = difflib.unified_diff(
+                    b.get("disk_text", "").splitlines(), b.get("buffer_text", "").splitlines(),
+                    fromfile=f"{rel} (disco)", tofile=f"{rel} (não salvo)", lineterm="")
+                diff_txt = "\n".join(list(ud)[:120])
+                lines.append(f"\nEdições NÃO salvas em {rel}:\n{diff_txt}")
+    try:
+        stat_text, entries = git_diff_for_display(cwd, max_lines_per_file=120)
+    except Exception:
+        stat_text, entries = "", []
+    if entries:
+        lines.append(f"\nDiff pendente no repositório (salvo, não commitado) — {stat_text}:")
+        for e in entries[:10]:
+            lines.append(f"\n━━ {e['path']} (+{e['added']} −{e['removed']})\n{e['diff']}")
+    out = "\n".join(lines).strip()
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n… (contexto de trabalho truncado)"
+    return out
+
+
+def build_orchestrator_prompt(config: dict, history: list, memory_context: str = "",
+                              working_context: str = "") -> str:
     """Monta o prompt completo do Orquestrador (system + memória + histórico).
     Usado pelo REPL e pela TUI — fonte única do texto. O marcador literal
     'Histórico da Conversa:\\n' é o ponto onde orchestrator_brain.py corta
-    system/user, então não mude essa string."""
+    system/user, então não mude essa string.
+
+    working_context: estado de trabalho do usuário AGORA — arquivos abertos no
+    Editor, edições ainda não salvas, diff pendente da sessão. A TUI monta e
+    passa (ver _collect_working_context); vazio no REPL. Vai depois da árvore de
+    arquivos e antes do histórico pra o Orquestrador enxergar o que a gente está
+    mexendo, não só o que está commitado."""
     import datetime as _dt
     orq_binary = config.get("roles", {}).get("orquestrador", {}).get("binary", "brain")
     quem_voce_e = (
@@ -3140,7 +3220,12 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
         f"só existem estes, não invente caminhos):\n{file_tree}\n"
         if file_tree else ""
     )
-    parts = [system, memory_block, files_block, "\nHistórico da Conversa:\n"]
+    working_block = (
+        f"\nO que o usuário está mexendo agora (estado ao vivo do Editor e do repositório, "
+        f"não é o histórico da conversa):\n{working_context}\n"
+        if working_context else ""
+    )
+    parts = [system, memory_block, files_block, working_block, "\nHistórico da Conversa:\n"]
     for msg in history[-20:]:
         prefix = "Usuário" if msg.get("role") == "user" else "Orquestra"
         parts.append(f"{prefix}: {msg.get('content', '')}\n")
@@ -3323,7 +3408,8 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
 
 def _orchestrator_react(config: dict, event_label: str, raw_result: str,
                          section: "LiveSection | None" = None,
-                         has_pending_changes: bool = False) -> str:
+                         has_pending_changes: bool = False,
+                         changed_files: "list[str] | None" = None) -> str:
     """Modo chat: depois que um operário termina, pede pro próprio orquestrador
     comentar o resultado em linguagem simples e dar continuidade à conversa,
     em vez de só despejar a resposta crua + uma linha fixa. Retorna "" (string
@@ -3341,23 +3427,40 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     mesmo comportamento de antes) na revisão automática do Modo Aprendizado,
     que é sempre read_only e não teria nada pra aprovar."""
     role = config.get("roles", {}).get("orquestrador", {})
+    orq_binary = role.get("binary", "brain")
+    tem_olhos = orq_binary in ("agy", "claude", "codex")
 
     projeto = Path(get_project_dir()).name
     aprovacao_hint = (
-        "O resultado mexeu em arquivo(s) e está aguardando sua decisão — termine "
-        "lembrando que ele pode Aprovar, Rejeitar ou pedir pra Revisar antes de seguir.\n"
+        "O resultado mexeu em arquivo(s) e está aguardando a decisão do usuário — em algum "
+        "ponto da sua fala lembre que ele pode Aprovar, Rejeitar ou pedir pra Revisar.\n"
         if has_pending_changes else ""
     )
+    arquivos_hint = ""
+    if tem_olhos and changed_files:
+        lista = ", ".join(changed_files[:20])
+        arquivos_hint = (
+            f"Arquivos que {event_label} tocou: {lista}. ABRA e leia os que importam antes "
+            "de comentar — quero sua leitura do código, não a paráfrase do que ele escreveu.\n"
+        )
+    elif tem_olhos:
+        arquivos_hint = (
+            "Você está em read-only: se precisar de contexto pra opinar com propriedade, "
+            "abra os arquivos relevantes antes de responder.\n"
+        )
     prompt = (
-        f"Você é o Orquestra, assistente do projeto '{projeto}'. Você pediu para "
+        f"Você é o Orquestra, o estrategista do projeto '{projeto}'. Você pediu para "
         f"{event_label} executar uma tarefa e ele acabou de responder com isto:\n\n"
         f"{raw_result[:_ORCH_CONTEXT_CHARS]}\n\n"
-        "Comente esse resultado para o usuário, em português, em linguagem simples "
-        "e natural — como se você estivesse continuando a conversa, não repetindo "
-        "o resultado inteiro. Diga o que foi feito, o que mudou e o que falta. "
+        f"{arquivos_hint}"
+        "Agora CONTINUE A CONVERSA com o usuário, em português, como um parceiro de "
+        "raciocínio — não como um relatório de status. Diga em 1-2 frases o que saiu "
+        "disso, e então entre no que interessa: a SUA leitura do resultado, o que te "
+        "chamou atenção, o que você faria a seguir, o que priorizaria primeiro e por quê, "
+        "o risco que ainda vê. Se houver decisões a tomar, coloque as opções e recomende "
+        "uma. Não repita o resultado inteiro e não termine com a pergunta genérica "
+        "\"quer ajustar algo ou seguir para outra coisa?\" — proponha o próximo passo você mesmo. "
         f"{aprovacao_hint}"
-        "Termine perguntando se o usuário quer ajustar algo ou seguir para outra coisa "
-        "(pule essa pergunta se já tiver dado o lembrete de aprovação acima). "
         "Responda só com o texto da sua fala, sem tags e sem formatação especial.\n\n"
         "Se (e SÓ se) esse resultado revelar algo genuinamente reutilizável no futuro — uma "
         "preferência clara do usuário, um fato específico do projeto, ou uma lição sobre o que "
