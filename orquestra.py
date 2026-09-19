@@ -1685,10 +1685,27 @@ _CODEX_FALLBACK = [
     ("gpt-5-mini",    "gpt-5-mini        (5 Mini — Rápido)"),
 ]
 
+_AGY_FALLBACK = [
+    ("gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)"),
+    ("gemini-3.8-flash-medium",  "Gemini 3.8 Flash (Medium)"),
+    ("gemini-3.8-flash-low",     "Gemini 3.8 Flash (Low)"),
+    ("gemini-3.7-flash-high",    "Gemini 3.7 Flash (High)"),
+    ("gemini-3.7-flash-medium",  "Gemini 3.7 Flash (Medium)"),
+    ("gemini-3.7-flash-low",     "Gemini 3.7 Flash (Low)"),
+    ("gemini-3.6-flash-high",    "Gemini 3.6 Flash (High)"),
+    ("gemini-3.6-flash-medium",  "Gemini 3.6 Flash (Medium)"),
+    ("gemini-3.6-flash-low",     "Gemini 3.6 Flash (Low)"),
+    ("gemini-3.1-pro-high",      "Gemini 3.1 Pro (High)"),
+    ("gemini-3.1-pro-low",       "Gemini 3.1 Pro (Low)"),
+    ("claude-sonnet-4-6",        "Claude Sonnet 4.6 (Thinking)"),
+    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+    ("gpt-oss-120b-medium",      "GPT-OSS 120B (Medium)"),
+]
+
 def _fetch_agy_models() -> list[tuple[str, str]]:
     """Busca os modelos disponíveis no Antigravity em tempo real."""
     try:
-        result = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["agy", "--list-models"], capture_output=True, text=True, timeout=10)
         models = []
         for line in result.stdout.splitlines():
             parts = line.split(maxsplit=1)
@@ -1696,9 +1713,11 @@ def _fetch_agy_models() -> list[tuple[str, str]]:
                 model_id, label = parts[0].strip(), parts[1].strip()
                 if model_id and label and model_id != "Fetching":
                     models.append((model_id, f"{label:<45} ({model_id})"))
-        return models if models else []
+        if models:
+            return models
     except Exception:
-        return []
+        pass
+    return [(m_id, f"{lbl:<45} ({m_id})") for m_id, lbl in _AGY_FALLBACK]
 
 def _fetch_claude_models() -> list[tuple[str, str]]:
     """Busca os modelos Claude via API Anthropic. Fallback para lista fixa."""
@@ -2822,9 +2841,6 @@ def _narrate_muse_line(line: str, section: "LiveSection", state: dict, detail: s
             if detail == "full":
                 section.write(delta, end="")
             elif not state.get("_responding_announced"):
-                # minimal/normal: sem contexto suficiente pra saber se o delta
-                # cru está no meio de um bloco de código (igual ao agy) — só
-                # avisa que está respondendo, o texto limpo vem do terminal.
                 section.tool_call("respondendo...")
                 state["_responding_announced"] = True
     elif payload_type == "run.terminal.completed":
@@ -2835,6 +2851,24 @@ def _narrate_muse_line(line: str, section: "LiveSection", state: dict, detail: s
             reason = payload.get("reason")
             if reason:
                 section.tool_call(f"⚠ {reason}")
+    elif "tool" in payload_type or payload_type.startswith("run.tool"):
+        tool_name = payload.get("tool") or payload.get("name") or payload.get("call", {}).get("name") or "ferramenta"
+        target = payload.get("path") or payload.get("command") or payload.get("file") or ""
+        msg = f"tool: {tool_name}" + (f" ({target[:60]})" if target else "...")
+        section.tool_call(msg)
+    elif payload_type.startswith("task.lifecycle") or payload_type.startswith("run.step"):
+        step_name = payload.get("step") or payload.get("name") or payload.get("agent") or payload_type.split(".")[-1]
+        if step_name and step_name not in ("started", "completed"):
+            section.tool_call(f"{step_name}...")
+        elif not state.get("_started_announced"):
+            section.tool_call("executando...")
+            state["_started_announced"] = True
+    elif "thought" in payload_type or "reasoning" in payload_type:
+        section.tool_call("raciocinando...")
+    elif payload_type and payload_type not in ("run.output.delta", "run.terminal.completed"):
+        desc = payload.get("description") or payload.get("message") or payload_type.replace("run.", "").replace("_", " ")
+        if desc and len(desc) < 80:
+            section.tool_call(f"{desc}...")
 
 
 def _narrate_opencode_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
@@ -2915,7 +2949,14 @@ def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
                "--reasoning-effort", _muse_reasoning_effort(model)]
         return cmd, "muse", None
 
-    # claude — modo plano = read-only, usa o login do claude
+    if binary == "opencode":
+        cmd = ["opencode", "run", prompt, "--format", "json",
+               "--dir", get_project_dir(), "--agent", "plan"]
+        if model:
+            cmd.extend(["-m", model])
+        return cmd, "opencode", None
+
+    # claude — modo plano = read-only, usa o login do claude ou proxy via env_file
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
            "--permission-mode", "plan"]
     if model:
@@ -2935,11 +2976,14 @@ tem ferramentas: não lê arquivos, não escreve código, não roda comandos —
 disso por construção. Todo trabalho braçal é feito pela sua equipe."""
 
 _ORCH_QUEM_VOCE_E_READONLY = """QUEM VOCÊ É
-Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você roda
-em modo plano/read-only: PODE ler arquivos e rodar comandos de leitura pra entender o
-projeto de verdade antes de responder — mas NÃO escreve arquivo nem roda nada que
-altere o estado do projeto. Implementar é sempre delegado pra sua equipe, nunca feito
-por você mesmo."""
+Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você é um
+assistente exclusivamente consultivo e coordenador:
+- PODE ler arquivos do projeto para contextualizar suas respostas.
+- Responda SEMPRE com texto normal ao usuário (ou com blocos <PLANO> / <DELEGATE>).
+- NUNCA execute ferramentas de comando de shell (como RunCommand ou equivalentes).
+- Não tente rodar comandos você mesmo — se precisar inspecionar, testar ou executar algo,
+  coloque no <PLANO> e delegue para o operador ou revisor via <DELEGATE>.
+- Toda ação prática é executada pela sua equipe."""
 
 # A regra "revisor só sob pedido explícito" abaixo é enforcement só de prompt —
 # igual toda a outra política deste sistema (o próprio gate de "espera aprovação
@@ -3114,10 +3158,19 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
     except (json.JSONDecodeError, ValueError):
         return
     if kind == "agy":
-        if d.get("event") == "result":
+        if d.get("event") == "step_update":
+            upd = d.get("step_update", {})
+            if upd.get("step_type") == "agent_response":
+                delta = upd.get("text_delta")
+                if delta:
+                    state["_streamed_text"] = state.get("_streamed_text", "") + delta
+        elif d.get("event") == "result":
             res = d.get("result", {})
-            state["final_text"] = res.get("response", "") or ""
+            resp = res.get("response", "") or ""
+            state["final_text"] = resp or state.get("_streamed_text", "")
             state["is_error"] = res.get("status") != "SUCCESS"
+            if state["is_error"] and not state["final_text"]:
+                state["final_text"] = res.get("error", "") or ""
     elif kind == "codex":
         t = d.get("type", "")
         if t == "item.completed":
@@ -3131,25 +3184,24 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
             payload = d.get("payload") or {}
             state["final_text"] = payload.get("text", "") or state["final_text"]
             state["is_error"] = bool(payload.get("terminal")) and payload.get("terminal") != "completed"
+    elif kind == "opencode":
+        ev_type = d.get("type", "")
+        if ev_type == "text":
+            text = (d.get("part") or {}).get("text", "")
+            if text:
+                state["final_text"] += text
+        elif ev_type == "error":
+            state["is_error"] = True
     else:
         if d.get("type") == "result":
             state["final_text"] = d.get("result", "") or ""
             state["is_error"] = bool(d.get("is_error"))
+            if state["is_error"] and not state["final_text"]:
+                state["final_text"] = d.get("error", "") or ""
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    """Mata o processo E todo mundo que ele gerou (grupo inteiro), não só ele.
-
-    ACHADO (2026-09-18): `proc.kill()` sozinho não bastava — agy/claude/muse/
-    codex às vezes são wrappers que sobem um processo filho de verdade pra
-    fazer o trabalho. Matar só o wrapper deixa o filho vivo segurando a ponta
-    de escrita do pipe de stdout aberta, e o `for line in proc.stdout:` nunca
-    recebe EOF — trava pra sempre mesmo com o timer disparando (foi
-    exatamente o que aconteceu: Orquestrador passou dos 150s configurados e
-    ficou preso). Só funciona se o Popen que criou `proc` tiver sido aberto
-    com `start_new_session=True` (novo grupo de processo, herdado pelos
-    filhos) — sem isso, `os.killpg` mata só o grupo do processo pai (o
-    próprio Orquestra) e derruba a ferramenta inteira."""
+    """Mata o processo E todo mundo que ele gerou (grupo inteiro), não só ele."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except ProcessLookupError:
@@ -3161,31 +3213,16 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection",
                              timeout_s: int, output_file: str | None = None,
                              detail: str = "normal") -> tuple:
-    """Roda uma chamada do PRÓPRIO orquestrador (decisão inicial do turno ou
-    _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
-    silêncio total + spinner genérico de antes da reforma — e com um timeout
-    de verdade (mata o processo se passar de timeout_s), a mesma garantia que
-    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok, error_detail)
-    — error_detail vem preenchido quando ok=False (timeout/erro de processo/erro
-    do modelo), pro chamador poder mostrar o motivo de verdade em vez de um
-    "tente de novo" genérico.
-
-    detail: narra tool calls/texto ao vivo (PLANO_PALCO_CHAT.md, Etapa 0a) —
-    reaproveita o mesmo parser do motor que os operários já usam
-    (_narrate_codex_line/_narrate_claude_line/_narrate_agy_line), só pelos
-    efeitos colaterais em section.write()/section.tool_call(). Quem decide
-    final_text/is_error de verdade continua sendo SÓ _capture_orchestrator_result
-    (+ o arquivo -o no Codex, tratado abaixo) — o narrador escreve num dict
-    descartável (narrator_state), nunca em `state`. brain/ollama-cloud não têm
-    tool calls (chat completions puro) — narrator fica None, nada muda pra eles."""
     state = {"final_text": "", "is_error": False}
     # brain/ollama-cloud emitem o mesmo envelope {"event":"result",...} que o agy
     kind = ("agy" if binary in ("agy", "ollama-cloud", "brain")
             else "codex" if binary == "codex"
             else "muse" if binary == "muse"
+            else "opencode" if binary == "opencode"
             else "claude")
     narrator = {"codex": _narrate_codex_line, "claude": _narrate_claude_line,
-                "agy": _narrate_agy_line, "muse": _narrate_muse_line}.get(binary)
+                "agy": _narrate_agy_line, "muse": _narrate_muse_line,
+                "opencode": _narrate_opencode_line}.get(binary)
     narrator_state = {"final_text": "", "is_error": False, "cost_usd": 0.0,
                        "tokens_in": 0, "tokens_out": 0, "duration_ms": 0}
 
@@ -3257,6 +3294,9 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
                 os.unlink(output_file)
             except OSError:
                 pass
+
+    if not state["final_text"] and state.get("_streamed_text"):
+        state["final_text"] = state["_streamed_text"].strip()
 
     if timed_out["flag"]:
         err_msg = f"não respondeu em {timeout_s}s (timeout)"
@@ -3540,11 +3580,20 @@ def engine_for_model(model_id: str) -> dict:
     m = (model_id or "").lower().strip()
     if not m:
         return {}
+    # Modelos nativos do Antigravity CLI (Gemini, Claude Thinking e GPT-OSS via conta Google AI)
+    _AGY_MODELS = (
+        "gemini", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"
+    )
+    if any(m.startswith(p) for p in _AGY_MODELS) or "gemini" in m:
+        return {"binary": "agy", "model": model_id}
     if "openrouter" in m:
         return {"binary": "opencode", "model": model_id}
     if "muse" in m:
         return {"binary": "muse", "model": model_id}
-    if "claude" in m and "haiku" not in m and "deepseek" not in m:
+    if "deepseek" in m:
+        # interface do claude apontada pro endpoint alternativo via env_file.
+        return {"binary": "claude", "model": model_id, "env_file": str(DEEPSEEK_ENV)}
+    if "claude" in m and "haiku" not in m:
         return {"binary": "claude", "model": model_id}
     if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
         if "oss" in m:
@@ -3552,12 +3601,9 @@ def engine_for_model(model_id: str) -> dict:
         return {"binary": "codex", "model": model_id}
     if "copilot" in m or m.startswith("claude-haiku"):
         return {"binary": "copilot", "model": model_id}
-    if "deepseek" in m:
-        # interface do claude apontada pro endpoint alternativo via env_file.
-        return {"binary": "claude", "model": model_id, "env_file": str(DEEPSEEK_ENV)}
     if any(x in m for x in ("kimi", "nemotron", "mistral", "minimax", "glm", "gemma", "qwen")):
         return {"binary": "brain", "model": model_id, "provider": "ollama-cloud"}
-    return {"binary": "agy", "model": model_id}  # Gemini / Antigravity
+    return {"binary": "agy", "model": model_id}  # default seguro
 
 
 def apply_model_to_worker(worker_cfg: dict, model_id: str) -> dict:

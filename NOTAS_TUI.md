@@ -26,3 +26,33 @@ O framework `Textual` tem um comportamento rigoroso de layout e overflow. Os bot
    - A função `shorten_name` deve retirar prefixos inúteis (ex: `gemini-`, `claude-`) e abreviar sufixos (`-high` -> `-hi`, `-thinking` -> `-thk`).
    - A string de exibição **nunca pode ultrapassar 18 caracteres**. (Para que `Orq: {18_chars}` = 23 caracteres, cabendo no botão de 25 com padding).
 3. **BACKEND NÃO É AFETADO:** Essa limitação é **estritamente visual**. O `value` real que circula nas variáveis (ex: `gemini-3.7-flash-high`) permanece intacto para ser passado à API de backend.
+
+## Terminal real (set/2026) — botão 💻 Shell + aba 🖥 Terminal
+
+Duas formas de ter um shell de verdade dentro do Orquestra:
+
+1. **`💻 Shell` (header)** — `action_open_shell` usa `self.suspend()` e roda
+   `$SHELL`; a TUI congela até `exit`/Ctrl+D. Terminal 100% real (vim, claude,
+   codex, login interativo funcionam sem ressalva). *Bug corrigido:* o handler
+   chamava a action `async` sem `await`, então o botão não fazia nada — agora
+   é `self.call_later(self.action_open_shell)`.
+2. **`🖥 Terminal` (aba do palco, `Ctrl+E`)** — `orquestra_term.PtyTerminal`:
+   shell num pty (`ptyprocess`) desenhado por `pyte` dentro de um widget
+   Textual, ao lado do chat/diff. Sobe no primeiro acesso, no cwd do projeto,
+   com o `os.environ` já preenchido pelo vault. **Todas as teclas vão pro
+   shell** (inclusive os atalhos do app); `Ctrl+]` devolve o foco ao chat e
+   `Ctrl+E` volta à aba. Shell continua vivo em segundo plano; morre com o app.
+
+Decisões/armadilhas (o que não é óbvio no código):
+- **`event.character` não é confiável** (None pra Enter/Ctrl+letra no Pilot,
+  `\x08` pro Backspace): `key_to_bytes` mapeia pelo *nome* da tecla.
+- **pyte não faz tela alternativa** (vim/less/codex) nem aceita `private=` em
+  ~20 handlers CSI: `_Screen` implementa 1049/1047/47 e `_ignore_private` evita
+  o `TypeError` que matava o parser (vim aparecia em branco).
+- **Ctrl+5 = Ctrl+] em terminais sem protocolo kitty** (byte 0x1d) → o atalho
+  de abrir é Ctrl+E, não Ctrl+5.
+- `_re_enable_input` (fim de tarefa) não rouba o foco de quem digita no terminal.
+- Chave exportada no shell embutido vale só pra ele; pro Orquestra usar `/senha`.
+- **Limites**: sem scrollback, sem mouse, sem seleção/cópia (copie pelo
+  `💻 Shell` ou tmux); pyte não cobre 100% do xterm.
+- Testes: `python3 test_orquestra_term.py` (Pilot + shell real, 45 checks).
