@@ -45,7 +45,8 @@ Duas formas de ter um shell de verdade dentro do Orquestra:
    acesso, no cwd do projeto, com o `os.environ` já preenchido pelo vault.
    **Todas as teclas vão pro shell** (inclusive os atalhos do app); `Ctrl+]`
    devolve o foco ao chat, `Ctrl+T` fecha/abre o painel (o shell segue vivo) e
-   `Ctrl+E` volta pro shell. O shell morre com o app.
+   `Ctrl+E` volta pro shell. O **✕** no canto do painel fecha com o mouse (mesmo efeito
+   do Ctrl+T: só esconde, o shell segue vivo). O shell morre com o app.
    `Ctrl+O` continua abrindo o shell **externo** (suspende a TUI) — o mais fiel
    (copiar/colar, scrollback, apps de tela cheia exigentes).
 
@@ -58,6 +59,8 @@ Decisões/armadilhas (o que não é óbvio no código):
 - **Ctrl+5 = Ctrl+] em terminais sem protocolo kitty** (byte 0x1d) → o atalho
   de abrir é Ctrl+E, não Ctrl+5.
 - `_re_enable_input` (fim de tarefa) não rouba o foco de quem digita no terminal.
+- **Fechar o painel devolve o foco ao chat** se o foco estava dentro dele — inclusive
+  quando é o próprio ✕ (o clique passa o foco pro botão antes do handler rodar).
 - **Ctrl+E é binding `priority`**: o `TextArea` do chat liga Ctrl+E a "fim da
   linha" e engolia o atalho justo quando o foco estava no chat. Com o shell em
   foco a action repassa `\x05` ao shell (readline: fim da linha).
@@ -69,4 +72,4 @@ Decisões/armadilhas (o que não é óbvio no código):
 - Chave exportada no shell embutido vale só pra ele; pro Orquestra usar `/senha`.
 - **Limites**: sem scrollback, sem mouse, sem seleção/cópia (copie pelo
   `💻 Shell` ou tmux); pyte não cobre 100% do xterm.
-- Testes: `python3 test_orquestra_term.py` (Pilot + shell real, 56 checks).
+- Testes: `python3 test_orquestra_term.py` (Pilot + shell real, 62 checks).
