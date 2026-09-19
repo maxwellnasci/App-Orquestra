@@ -234,7 +234,9 @@ numa coluna". `#main-content` (Horizontal) tem só `#file-panel` (toggle) e
 `#chat-log`, `#chat-input`, `#status-indicator`, `#plan-panel`, `#plan-bar`,
 `#action-bar`, `#editor-tabs`, `#editor-toolbar`, `#suggestions-panel`,
 `#idea-image`, `#idea-md`, `#file-panel`, `#watchdog-footer`, `#usage-footer`,
-`#activity-log`, `#diff-log`, `#changes-header`, `#stage-tabs`, `#chat-dock`.
+`#activity-log`, `#diff-log`, `#changes-header`, `#stage-tabs`, `#chat-dock`,
+e, do painel lateral (seção abaixo): `#terminal-panel`, `#side-tabs`, `#side-logs`,
+`#side-shell`, `#terminal-log`, `#embedded-term`, `#btn-close-side`.
 
 - **`_stage_show(pane_id)`** — único jeito de trocar de aba do palco
   (`self.query_one("#stage-tabs", TabbedContent).active = pane_id`). Não há
@@ -297,6 +299,57 @@ duas vezes vinda de fontes diferentes — clique na árvore, GPS, `<MOSTRAR>`).
 
 ---
 
+## Painel lateral (`#terminal-panel`): 📊 Logs + 🖥 Shell embutido
+
+Terceira coluna de `#main-content` (à direita do palco, 45% da largura, acima do
+chat). Escondido por padrão; abre com `Ctrl+T`, com o botão `📊 Logs`, sozinho quando
+um agente começa (`_show_terminal_panel`) ou pelo shell (`Ctrl+E` / botão `💻 Shell`).
+Tem um cabeçalho de 1 linha (`#side-header`) com o **✕** (`#btn-close-side`) e um
+`TabbedContent` (`#side-tabs`) com duas abas: `side-logs` (o `RichLog` `#terminal-log`,
+monitor dos agentes, só leitura) e `side-shell` (o terminal de verdade).
+
+**O shell é o widget `PtyTerminal` (`orquestra_term.py`, `#embedded-term`):** `ptyprocess`
+faz o fork com um pty (TERM=xterm-256color, tamanho sincronizado com o widget →
+SIGWINCH), `pyte` interpreta as sequências de escape, `render_line` pinta a grade.
+Lê o pty pelo event loop (`add_reader`, sem thread). Sobe **só no primeiro acesso**,
+no `get_project_dir()`, herdando o `os.environ` (já com as chaves que o cofre
+injetou). Morre com o app (`on_unmount`). Fechar o painel **não** mata o shell.
+
+**Regras que não podem quebrar** (cada uma custou um bug real — detalhes em
+`APRENDIZADOS.md` §12):
+
+- **Todas as teclas vão pro shell enquanto ele tem o foco** — inclusive os atalhos do
+  app (`on_key` faz `stop()` + `prevent_default()`). A saída é `Ctrl+]`
+  (`EXIT_KEY`, devolve o foco ao chat). Não crie um atalho novo de app esperando que
+  funcione com o foco no terminal.
+- **`Ctrl+E` é binding `priority=True`** — o `TextArea` do chat liga `Ctrl+E` a "fim da
+  linha" e engolia o atalho. Com o shell em foco a action repassa `\x05` ao bash.
+- **Nunca use `Ctrl+5`** (nem `Ctrl+4`…): em terminal sem protocolo kitty
+  (xterm/qterminal) `Ctrl+5` chega como `0x1d`, o mesmo byte de `Ctrl+]`.
+- **`key_to_bytes` mapeia pelo NOME da tecla, não por `event.character`** (`None` pra
+  Enter/Ctrl+letra em alguns caminhos, `\x08` pro Backspace).
+- **`_Screen` (subclasse do `pyte.Screen`) é obrigatória**: implementa a tela alternativa
+  (1049/1047/47 — vim/less/codex) e `_ignore_private` faz ~20 handlers CSI aceitarem
+  `private=`. Sem isso o parser levanta `TypeError` com `CSI ? … n/m` (o vim manda) e a
+  aba para de atualizar. `_feed` recria o stream se o parser ainda assim falhar.
+- **`_re_enable_input` (fim de tarefa) não pode roubar o foco do terminal** — checa
+  `isinstance(self.focused, PtyTerminal)` antes de focar o chat.
+- **Fechar o painel devolve o foco ao chat** se o foco estava dentro dele (inclusive
+  no próprio ✕, que toma o foco no clique antes do handler rodar).
+- **`Ctrl+O` = shell externo** (`action_open_shell`, `self.suspend()` + `$SHELL`). É a
+  rota fiel (copiar/colar, scrollback, apps exigentes). `action_open_shell` é `async`:
+  chamada sem `await` de um handler síncrono vira no-op silencioso — sempre via
+  binding/`run_action`/`call_later`.
+- **Não digite no chat em teste automatizado sem garantir o foco no terminal**: o
+  Enter dispara chamada REAL ao Orquestrador (aconteceu; `test_orquestra_term.py`
+  tem guarda).
+- **`RichLog` oculto adia a escrita** (mesma regra do diff): com a aba Shell ativa os
+  logs novos só aparecem ao voltar pra `📊 Logs` — nada se perde.
+
+Limites conhecidos do widget: sem scrollback, sem mouse, sem seleção/cópia; `pyte`
+não cobre 100% do xterm. Testes: `python3 test_orquestra_term.py` (62 checks, Pilot +
+shell real).
+
 ## Cofre (`vault.py`)
 
 Fernet (AES-128-CBC + HMAC-SHA256), chave de 256 bits via PBKDF2-SHA256 (600k
@@ -311,9 +364,12 @@ entram no `.gitignore` sozinhos. Credenciais são injetadas como env vars da ses
 ```
 orquestra                → launcher (TUI; --repl = REPL antigo)
 orquestra_tui.py         → a interface (Textual)
+orquestra_term.py        → PtyTerminal: shell real (pty + pyte) embutido no painel lateral
 orquestra.py             → backend: config, memória SQLite, cofre, execução, Cão de Guarda
 orchestrator_brain.py    → cérebro do Orquestrador (chat puro, zero ferramentas)
 vault.py                 → cofre de credenciais
 test_orquestra.py        → testes sem rede (python3 test_orquestra.py)
+test_orquestra_term.py   → testes do terminal embutido + integração na TUI (python3 test_orquestra_term.py)
+NOTAS_TUI.md             → armadilhas de layout da TUI + seção do terminal real
 _archive/                → código aposentado (roles antigos, llm_orchestrator.py)
 ```

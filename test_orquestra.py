@@ -466,7 +466,7 @@ def _fake_build_cmd(role, prompt):
     return (["echo", "x"], "brain", None)
 
 with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
-     patch("orquestra._run_orchestrator_stream", return_value=("comentário do orquestrador", True)):
+     patch("orquestra._run_orchestrator_stream", return_value=("comentário do orquestrador", True, "")):
     comment = orquestra._orchestrator_react(
         orquestra.DEFAULT_CONFIG, "Operador", "editei X", has_pending_changes=True,
     )
@@ -481,7 +481,7 @@ with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
 # ── _orchestrator_react — modo parceiro (não relatório enlatado) ──────────
 print("_orchestrator_react — modo parceiro de raciocínio")
 with patch("orquestra._build_orchestrator_cmd", side_effect=_fake_build_cmd), \
-     patch("orquestra._run_orchestrator_stream", return_value=("ok", True)):
+     patch("orquestra._run_orchestrator_stream", return_value=("ok", True, "")):
     orquestra._orchestrator_react(orquestra.DEFAULT_CONFIG, "Operador", "editei X")
     _t = _captured_prompt["text"]
     check("parceiro de raciocínio" in _t, "pede postura de parceiro, não relatório")
@@ -671,6 +671,24 @@ with patch("orquestra.watchdog_verdict", return_value=("achado importante", True
 check(_saved and _saved[0][0] == "orquestrador" and "achado importante" in _saved[0][2],
       "_watchdog_report salva o achado no histórico do Orquestrador")
 check(not _react.called, "_watchdog_report NÃO chama _orchestrator_react (evita corrida)")
+
+
+# ── Cão de Guarda: turno automático + fechamento de tarefa ──────────────────
+print("build_watchdog_followup_prompt / format_task_closing")
+_fp = orquestra.build_watchdog_followup_prompt("  --force quebra a porta  ")
+check("--force quebra a porta" in _fp, "follow-up inclui o achado do Cão de Guarda")
+check("NÃO emita <DELEGATE>" in _fp and "<PIPELINE>" in _fp and "<PLANO>" in _fp,
+      "follow-up proíbe delegar/planejar (tarefa ainda pode estar pendente)")
+check(_fp.count("--force quebra a porta") == 1 and "  --force" not in _fp, "follow-up faz strip do texto")
+
+_c1 = orquestra.format_task_closing("docs/A.md", has_bug=False)
+check("Concluído" in _c1 and "docs/A.md" in _c1 and "limpo" in _c1, "fechamento: commit + Cão limpo")
+_c2 = orquestra.format_task_closing("a.py, b.py", has_bug=True)
+check("achou pontos" in _c2 and "limpo" not in _c2, "fechamento: Cão achou pontos")
+_c3 = orquestra.format_task_closing("", has_bug=False)
+check("sem commit" in _c3, "fechamento: sem commit quando nada mudou")
+_c4 = orquestra.format_task_closing("x.py", has_bug=False, wd_ran=False)
+check("não rodou" in _c4 and "limpo" not in _c4, "fechamento: Cão não rodou não vira 'limpo'")
 
 
 print()

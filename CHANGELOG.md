@@ -1,5 +1,60 @@
 # Changelog Orquestra
 
+## Não lançado — Cão de Guarda proativo + shell na pasta de lançamento (set/2026)
+
+Antes, quando o Cão de Guarda terminava, o achado só era gravado em silêncio no
+histórico do Orquestrador e a tela ficava parada: era preciso perguntar "o que
+aconteceu?" pra ele aparecer (e o texto era cortado em 1500 chars). Agora:
+
+- **Turno automático do Orquestrador.** Achado real (`has_bug`) → o Orquestrador
+  resume e propõe a correção sozinho (`build_watchdog_followup_prompt`, proíbe
+  `<DELEGATE>/<PIPELINE>/<PLANO>` no turno). No máximo **1 por pedido do usuário**
+  (`_watchdog_followup_done`, zerado no Enter) — sem loop. Só na revisão pós-Aprovar,
+  no gate por risco e no pipeline; **nunca** no Ctrl+S manual do editor. Se um
+  `<PIPELINE>` retoma logo após o Aprovar, o turno automático é pulado (o achado
+  segue no histórico e no rodapé).
+- **Mensagem de fechamento sem LLM** (`format_task_closing`): `✅ Concluído · commit:
+  … · Cão de Guarda: limpo ✅ | ⚠ achou pontos`, no feed e no histórico do chat.
+- **Alerta que não some.** Achado → rodapé vermelho persistente (só limpa quando você
+  digita), toast `warning` + bell. Texto do achado completo no feed (sem truncar) e
+  com markup escapado. Os 3 blocos duplicados viraram `_report_watchdog`.
+- **Shell na pasta de lançamento.** `OrquestraTUI._launch_dir` é fixado no boot (antes
+  do `compose`) e usado pelo shell embutido e pelo `Ctrl+O`, mesmo que o cwd do
+  processo mude depois. (A reprodução mostrou que o embutido já abria certo em
+  condições normais — isto blinda contra mudança de cwd e cobre o `Ctrl+O`.)
+- **Limite conhecido:** o commit do `Aprovar` continua saindo mesmo com achado — o
+  Cão audita *antes* do commit, mas só informa; quem decide é o Orquestrador/você.
+- Testes: `test_orquestra.py` (funções puras) e `test_orquestra_term.py` (Pilot: shell
+  na pasta de lançamento, alerta persistente, ordem veredito → commit → fechamento →
+  Orquestrador, Ctrl+S manual silencioso).
+
+## Terminal real dentro do Orquestra (18–19/09/2026) — PRs #4, #5, #6
+
+Erros e acertos completos em `APRENDIZADOS.md` §12; regras em `AGENTES.md`.
+
+- **Painel lateral `📊 Logs | 🖥 Shell`** (`#terminal-panel`, coluna da direita): shell
+  de verdade num pty (`ptyprocess`) desenhado por `pyte` num widget Textual próprio
+  (`orquestra_term.PtyTerminal`, `#embedded-term`). Ao lado da Atividade e acima do
+  chat — dá pra rodar `claude login`, `export KEY=...` ou abrir um agente na pasta sem
+  sair da tela. Sobe no primeiro acesso, no cwd do projeto, com o `os.environ` do cofre.
+- **Atalhos:** `Ctrl+E` abre no shell (prioritário — o `TextArea` do chat engolia),
+  `Ctrl+]` volta pro chat, `Ctrl+T` / **✕** fecham (shell segue vivo), `Ctrl+O` = shell
+  **externo** (`self.suspend()` + `$SHELL`).
+- **Fix: botão `💻 Shell` não fazia nada** — o handler chamava `action_open_shell` (async)
+  sem `await`; a coroutine nunca rodava. (Depois do PR #5 o botão abre o painel lateral;
+  o shell externo ficou no `Ctrl+O`.)
+- **Emulação:** tela alternativa (vim/less/codex) implementada em `_Screen` (o `pyte`
+  não faz), `_ignore_private` (o `pyte` levantava `TypeError` com `CSI ? … n/m` e o vim
+  aparecia em branco), cores ANSI/256/truecolor, resize (SIGWINCH), paste com colchetes,
+  reinício com Enter após `exit`, teclas por *nome* (`event.character` não é confiável).
+- **`_re_enable_input` não rouba mais o foco** de quem digita no terminal; fechar o painel
+  devolve o foco ao chat.
+- **Testes:** `test_orquestra_term.py` (62 checks: Pilot + shell real + integração na TUI).
+  `test_orquestra.py` segue verde.
+- **Dependências novas:** `pyte`, `ptyprocess` (README atualizado).
+- **Limites:** sem scrollback, mouse e cópia no painel; `claude`/`codex` de tela cheia
+  ainda **não foram validados** lá dentro (o `Ctrl+O` cobre).
+
 ## Não lançado — Orquestrador que enxerga o que a gente mexe (set/2026)
 
 Motivado por sessão real: o usuário pediu uma análise do servidor, a equipe

@@ -6,6 +6,7 @@ Arquitetura baseada em Papéis (Roles) e configuração via JSON.
 
 import os
 import sys
+import signal
 import subprocess
 import shutil
 import shlex
@@ -49,6 +50,19 @@ CONFIG_FILE = Path.home() / ".orquestra.json"
 HISTORY_FILE = Path.home() / ".orquestra_history"
 DEEPSEEK_ENV = Path.home() / ".claude-deepseek-env"
 CHAT_HISTORY_DIR = Path.home() / ".orquestra_chats"
+
+# Tamanho máximo (chars) do resultado de um worker que chega até o Orquestrador
+# (reação ao <DELEGATE>, relay entre etapas de <PIPELINE>). Era 3000/4000 e
+# cortava raciocínio/código de respostas longas antes do Orquestrador ver —
+# pedido explícito do usuário pra não perder informação entre os agentes.
+_ORCH_CONTEXT_CHARS = 20000
+
+# ACHADO (2026-09-18): _run_worker_headless (Operador/Revisor/Cão de Guarda)
+# não tinha NENHUM timeout — se o motor (agy/claude/muse/codex) travasse, a
+# chamada ficava presa pra sempre, sem o recurso que o Orquestrador já tinha.
+# Maior que o timeout do Orquestrador (150s) de propósito: tarefa de código
+# real demora mais que uma decisão de roteamento.
+_WORKER_TIMEOUT_S = 900
 
 # ── Arquitetura de 3 agentes + Cão de Guarda ────────────────────────────────
 # roles.orquestrador  → o ESTRATEGISTA. binary="brain" = chat completions puro
@@ -127,6 +141,18 @@ DEFAULT_CONFIG = {
             "icon": "🤖",
             "label": "Motor Codex",
             "description": "Atalho: força o Codex CLI (OpenAI)."
+        },
+        "muse": {
+            "binary": "muse",
+            # Pro Muse, o campo "model" carrega o reasoning_effort (none|minimal|
+            # low|medium|high|xhigh|max|ultra), não um model id — o binário só
+            # tem um modelo (muse-spark) selecionado pelo provider. "ultra" é
+            # bloqueado no plano básico e cai pra xhigh sozinho (confirmado
+            # rodando `muse exec --reasoning-effort ultra`).
+            "model": "max",
+            "icon": "🎭",
+            "label": "Motor Muse",
+            "description": "Atalho: força o Muse Code CLI (Meta)."
         },
         "opencode": {
             "binary": "opencode",
@@ -1624,10 +1650,13 @@ _CLAUDE_FALLBACK = [
 ]
 
 
+# Confirmado direto na API real em 2026-09-18 (GET /models com token válido):
+# só existem estes 2 ids hoje. "deepseek-v4-flash" e
+# "deepseek-v4-flash-vision-exp" saíram da listagem — a Deepseek aposentou o
+# nome antigo em 14/09/2026 (virou "deepseek-flash").
 _DEEPSEEK_FALLBACK = [
-    ("deepseek-v4-pro",              "deepseek-v4-pro               (V4 Pro — Mais capaz)"),
-    ("deepseek-v4-flash",            "deepseek-v4-flash             (V4 Flash — Rápido e barato)"),
-    ("deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp  (V4 Flash Vision — Experimental)"),
+    ("deepseek-flash",  "deepseek-flash       (V4.1 Flash — nome canônico atual)"),
+    ("deepseek-v4-pro", "deepseek-v4-pro      (alias legado — hoje serve o mesmo V4.1 Flash)"),
 ]
 
 # Codex CLI não tem um endpoint de listagem de modelos confiável hoje (ver
@@ -1656,10 +1685,27 @@ _CODEX_FALLBACK = [
     ("gpt-5-mini",    "gpt-5-mini        (5 Mini — Rápido)"),
 ]
 
+_AGY_FALLBACK = [
+    ("gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)"),
+    ("gemini-3.8-flash-medium",  "Gemini 3.8 Flash (Medium)"),
+    ("gemini-3.8-flash-low",     "Gemini 3.8 Flash (Low)"),
+    ("gemini-3.7-flash-high",    "Gemini 3.7 Flash (High)"),
+    ("gemini-3.7-flash-medium",  "Gemini 3.7 Flash (Medium)"),
+    ("gemini-3.7-flash-low",     "Gemini 3.7 Flash (Low)"),
+    ("gemini-3.6-flash-high",    "Gemini 3.6 Flash (High)"),
+    ("gemini-3.6-flash-medium",  "Gemini 3.6 Flash (Medium)"),
+    ("gemini-3.6-flash-low",     "Gemini 3.6 Flash (Low)"),
+    ("gemini-3.1-pro-high",      "Gemini 3.1 Pro (High)"),
+    ("gemini-3.1-pro-low",       "Gemini 3.1 Pro (Low)"),
+    ("claude-sonnet-4-6",        "Claude Sonnet 4.6 (Thinking)"),
+    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+    ("gpt-oss-120b-medium",      "GPT-OSS 120B (Medium)"),
+]
+
 def _fetch_agy_models() -> list[tuple[str, str]]:
     """Busca os modelos disponíveis no Antigravity em tempo real."""
     try:
-        result = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["agy", "--list-models"], capture_output=True, text=True, timeout=10)
         models = []
         for line in result.stdout.splitlines():
             parts = line.split(maxsplit=1)
@@ -1667,9 +1713,11 @@ def _fetch_agy_models() -> list[tuple[str, str]]:
                 model_id, label = parts[0].strip(), parts[1].strip()
                 if model_id and label and model_id != "Fetching":
                     models.append((model_id, f"{label:<45} ({model_id})"))
-        return models if models else []
+        if models:
+            return models
     except Exception:
-        return []
+        pass
+    return [(m_id, f"{lbl:<45} ({m_id})") for m_id, lbl in _AGY_FALLBACK]
 
 def _fetch_claude_models() -> list[tuple[str, str]]:
     """Busca os modelos Claude via API Anthropic. Fallback para lista fixa."""
@@ -1696,10 +1744,26 @@ def _fetch_claude_models() -> list[tuple[str, str]]:
             pass
     return _CLAUDE_FALLBACK
 
+# Descrição amigável por id — a API real de /models só devolve o id puro (sem
+# display_name), então isto só decora o rótulo mostrado no seletor.
+_DEEPSEEK_MODEL_HINTS = {
+    "deepseek-flash":  "V4.1 Flash — nome canônico atual",
+    "deepseek-v4-pro": "alias legado — hoje serve o mesmo V4.1 Flash, mesmo preço do Flash",
+}
+
+
 def _fetch_deepseek_models() -> list[tuple[str, str]]:
-    """Busca os modelos DeepSeek via API. Fallback para lista fixa."""
+    """Busca os modelos DeepSeek via API. Fallback para lista fixa.
+
+    ACHADO (2026-09-18): a chave lida daqui era "ANTHROPIC_AUTH_TOKEN", mas o
+    .claude-deepseek-env de verdade guarda a chave em "ANTHROPIC_API_KEY" — a
+    busca ao vivo NUNCA rodava (token sempre vazio), sempre caindo no fallback
+    fixo, que estava desatualizado (deepseek-v4-flash não existe mais na API
+    real desde 14/09/2026 — virou deepseek-flash). Corrigido e confirmado
+    rodando a chamada de verdade: hoje a API só lista deepseek-flash e
+    deepseek-v4-pro (esse último é alias legado, mesmo modelo por baixo)."""
     env = load_env_file(str(DEEPSEEK_ENV))
-    token = env.get("ANTHROPIC_AUTH_TOKEN", "")
+    token = env.get("ANTHROPIC_API_KEY", "")
     if token:
         try:
             req = urllib.request.Request(
@@ -1709,8 +1773,9 @@ def _fetch_deepseek_models() -> list[tuple[str, str]]:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
                 models = [
-                    (m["id"], f"{m.get('id', m['id']):<45}")
+                    (m["id"], f"{m['id']:<20} ({_DEEPSEEK_MODEL_HINTS.get(m['id'], 'DeepSeek')})")
                     for m in data.get("data", [])
+                    if m.get("id")
                 ]
                 if models:
                     return models
@@ -1756,6 +1821,46 @@ def _fetch_opencode_models() -> list[tuple[str, str]]:
         return models if models else _OPENCODE_FALLBACK
     except Exception:
         return _OPENCODE_FALLBACK
+
+# Muse Code só tem 1 modelo de verdade (muse-spark) — o que varia é o
+# reasoning_effort. Sem endpoint de listagem (nem faria sentido, não é um
+# catálogo de modelos). "ultra" fica de fora de propósito: testado rodando
+# `muse exec --reasoning-effort ultra`, o plano básico bloqueia e cai sozinho
+# pra xhigh — melhor não oferecer uma opção que degrada silenciosamente.
+_MUSE_FALLBACK = [
+    ("muse-spark-max",     "Muse Spark (Max)            — teto liberado no plano básico"),
+    ("muse-spark-xhigh",   "Muse Spark (XHigh)"),
+    ("muse-spark-high",    "Muse Spark (High)"),
+    ("muse-spark-medium",  "Muse Spark (Medium)         — padrão do binário"),
+    ("muse-spark-low",     "Muse Spark (Low)"),
+    ("muse-spark-minimal", "Muse Spark (Minimal)        — mais rápido/barato"),
+]
+
+
+def _fetch_muse_models() -> list[tuple[str, str]]:
+    """Sem endpoint de listagem no Muse CLI (só existe 1 modelo) — lista fixa
+    de variações de reasoning_effort, apresentadas como "modelo" pra encaixar
+    no mesmo seletor dos outros motores."""
+    return _MUSE_FALLBACK
+
+
+def _muse_reasoning_effort(model: str) -> str:
+    """Aceita tanto o id 'muse-spark-<effort>' (escolhido no seletor de modelo
+    real da TUI/engine_for_model) quanto o valor bruto '<effort>' (formato
+    antigo, gravado pelo /agentes trocar antes deste seletor existir) — os
+    dois representam o mesmo --reasoning-effort do binário, que só tem 1
+    modelo de verdade. Desconhecido/vazio cai em "medium" (mesmo default do
+    settings.json do binário)."""
+    m = (model or "").strip().lower()
+    valid = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+    if m in valid:
+        return m
+    if m.startswith("muse-spark-"):
+        suffix = m[len("muse-spark-"):]
+        if suffix in valid:
+            return suffix
+    return "medium"
+
 
 _OLLAMA_FALLBACK = [
     ("gpt-oss:120b", "GPT-OSS 120b (Ollama Cloud)"),
@@ -1827,6 +1932,7 @@ _DIALOG_STYLE = PTStyle.from_dict({
 _FAMILIA_CHOICES = [
     ("claude",   "💞 Claude Code            (claude) — Anthropic"),
     ("codex",    "🤖 Codex                  (codex)  — OpenAI"),
+    ("muse",     "🎭 Muse Code              (muse)   — Meta"),
     ("deepseek", "💙 Claude-DeepSeek        (claude) — DeepSeek V4"),
     ("gemini",   "💚 Antigravity            (agy)    — Google"),
     ("copilot",  "🐕 Copilot                (copilot)— GitHub"),
@@ -1840,6 +1946,20 @@ _ORQ_AGENT_CHOICES = [
     ("codex",    "👁  Codex (plano)         — lê o projeto e raciocina, não escreve"),
     ("claude",   "👁  Claude Code (plano)   — lê o projeto e raciocina, não escreve"),
     ("gemini",   "👁  Antigravity (plano)   — lê o projeto e raciocina, não escreve"),
+]
+
+# Muse não tem lista de modelos pra buscar (só existe o muse-spark) — o campo
+# "model" do worker carrega o reasoning_effort. "ultra" fica listado mas o
+# binário mesmo bloqueia (plano básico) e cai sozinho pra xhigh — confirmado
+# rodando `muse exec --reasoning-effort ultra`.
+_MUSE_REASONING_CHOICES = [
+    ("minimal", "🎭 Minimal — mais rápido/barato"),
+    ("low",     "🎭 Low"),
+    ("medium",  "🎭 Medium — padrão do binário"),
+    ("high",    "🎭 High"),
+    ("xhigh",   "🎭 XHigh"),
+    ("max",     "🎭 Max — maior nível liberado no plano básico (recomendado p/ Implementador)"),
+    ("ultra",   "🎭 Ultra — bloqueado no plano básico, cai sozinho pra XHigh"),
 ]
 
 # Cérebros para o ORQUESTRADOR (chat puro, ZERO ferramentas — só planeja e delega).
@@ -1896,6 +2016,10 @@ def _apply_familia(target: dict, familia: str, modelo: str):
     elif familia == "opencode":
         target["binary"] = "opencode"
         target["model"] = modelo
+        target.pop("env_file", None)
+    elif familia == "muse":
+        target["binary"] = "muse"
+        target["model"] = modelo or "medium"  # aqui "model" é o reasoning_effort
         target.pop("env_file", None)
     else:  # codex
         target["binary"] = "codex"
@@ -1977,6 +2101,8 @@ def interactive_agent_selection(config: dict):
                 model_choices = _fetch_ollama_models()
             elif familia == "opencode":
                 model_choices = _fetch_opencode_models()
+            elif familia == "muse":
+                model_choices = _MUSE_REASONING_CHOICES
             else:
                 model_choices = _fetch_codex_models()
             console.print("\r                                        \r", end="")
@@ -2695,6 +2821,70 @@ def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: 
         state["tokens_out"] = usage.get("output_tokens", 0) or 0
 
 
+def _narrate_muse_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
+    """Parser do --json do Muse CLI — schema próprio (MSP, Muse Session
+    Protocol): um log de eventos bem mais verboso que os outros três, com
+    task.lifecycle.* narrando até os subagentes internos automáticos que ele
+    mesmo dispara sozinho (skill-reminder/verify-reminder, em qualquer
+    prompt — confirmado rodando `muse exec` puro, 2 subagentes só pra
+    responder "ok"). Ignoramos esse ruído de propósito: só interessam os
+    deltas de texto (streaming real, igual ao agy) e o
+    payload_type == "run.terminal.completed", que traz o texto final
+    completo (não é incremental — testado, repete o texto inteiro) e o
+    status real da execução em payload["terminal"] ("completed" = sucesso;
+    qualquer outro valor = erro, com o motivo em payload["reason"]).
+
+    LACUNA CONHECIDA: ao contrário do _narrate_codex_line (que lê tokens_in/
+    tokens_out de "turn.completed".usage), este parser não preenche
+    state["cost_usd"]/tokens_in/tokens_out — não confirmei ainda qual
+    payload_type do MSP carrega uso de token (os testes feitos só tinham
+    bytes_read/wire_events_seen, não contagem de token). A feature de
+    gasto/uso vai reportar 0 pro Muse até isso ser confirmado e implementado
+    — melhor deixar zerado do que arriscar ler o campo errado."""
+    try:
+        d = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return
+
+    payload_type = d.get("payload_type", "")
+    payload = d.get("payload") or {}
+
+    if payload_type == "run.output.delta":
+        delta = payload.get("text", "")
+        if delta:
+            if detail == "full":
+                section.write(delta, end="")
+            elif not state.get("_responding_announced"):
+                section.tool_call("respondendo...")
+                state["_responding_announced"] = True
+    elif payload_type == "run.terminal.completed":
+        state["final_text"] = payload.get("text", "") or state.get("final_text", "")
+        terminal = payload.get("terminal")
+        if terminal and terminal != "completed":
+            state["is_error"] = True
+            reason = payload.get("reason")
+            if reason:
+                section.tool_call(f"⚠ {reason}")
+    elif "tool" in payload_type or payload_type.startswith("run.tool"):
+        tool_name = payload.get("tool") or payload.get("name") or payload.get("call", {}).get("name") or "ferramenta"
+        target = payload.get("path") or payload.get("command") or payload.get("file") or ""
+        msg = f"tool: {tool_name}" + (f" ({target[:60]})" if target else "...")
+        section.tool_call(msg)
+    elif payload_type.startswith("task.lifecycle") or payload_type.startswith("run.step"):
+        step_name = payload.get("step") or payload.get("name") or payload.get("agent") or payload_type.split(".")[-1]
+        if step_name and step_name not in ("started", "completed"):
+            section.tool_call(f"{step_name}...")
+        elif not state.get("_started_announced"):
+            section.tool_call("executando...")
+            state["_started_announced"] = True
+    elif "thought" in payload_type or "reasoning" in payload_type:
+        section.tool_call("raciocinando...")
+    elif payload_type and payload_type not in ("run.output.delta", "run.terminal.completed"):
+        desc = payload.get("description") or payload.get("message") or payload_type.replace("run.", "").replace("_", " ")
+        if desc and len(desc) < 80:
+            section.tool_call(f"{desc}...")
+
+
 def _narrate_opencode_line(line: str, section: "LiveSection", state: dict, detail: str = "normal"):
     """Parser do --format json do opencode: eventos step_start/tool_use/text/
     step_finish/error. Cada evento 'text' já vem como bloco de texto completo
@@ -2765,7 +2955,22 @@ def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
             cmd.extend(["-m", model])
         return cmd, "codex", output_file
 
-    # claude — modo plano = read-only, usa o login do claude
+    if binary == "muse":
+        # --disable-write/--disable-shell = mesmo read-only dos outros três;
+        # --approval-mode never evita travar esperando aprovação interativa.
+        cmd = ["muse", "exec", prompt, "--json", "--approval-mode", "never",
+               "--disable-write", "--disable-shell",
+               "--reasoning-effort", _muse_reasoning_effort(model)]
+        return cmd, "muse", None
+
+    if binary == "opencode":
+        cmd = ["opencode", "run", prompt, "--format", "json",
+               "--dir", get_project_dir(), "--agent", "plan"]
+        if model:
+            cmd.extend(["-m", model])
+        return cmd, "opencode", None
+
+    # claude — modo plano = read-only, usa o login do claude ou proxy via env_file
     cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose",
            "--permission-mode", "plan"]
     if model:
@@ -2785,11 +2990,15 @@ tem ferramentas: não lê arquivos, não escreve código, não roda comandos —
 disso por construção. Todo trabalho braçal é feito pela sua equipe."""
 
 _ORCH_QUEM_VOCE_E_READONLY = """QUEM VOCÊ É
-Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você roda
-em modo plano/read-only: PODE ler arquivos e rodar comandos de leitura pra entender o
-projeto de verdade antes de responder — mas NÃO escreve arquivo nem roda nada que
-altere o estado do projeto. Implementar é sempre delegado pra sua equipe, nunca feito
-por você mesmo.
+Você é a mente que pensa a solução, discute arquitetura e coordena a equipe. Você é um
+assistente consultivo e coordenador, em modo plano/read-only:
+- PODE ler arquivos do projeto pra entender de verdade antes de responder.
+- Responda SEMPRE com texto normal ao usuário (ou com blocos <PLANO> / <DELEGATE>).
+- NUNCA execute ferramentas de comando de shell (como RunCommand ou equivalentes) e
+  NUNCA escreva nem altere arquivo.
+- Não tente rodar comandos você mesmo — se precisar inspecionar, testar ou executar algo,
+  coloque no <PLANO> e delegue para o operador ou revisor via <DELEGATE>.
+- Implementar é sempre delegado pra sua equipe, nunca feito por você mesmo.
 
 USE essa leitura de verdade. Antes de opinar sobre qualquer coisa do projeto, abra os
 arquivos que importam e leia o que já existe — uma resposta sua que poderia ter sido
@@ -2797,6 +3006,13 @@ escrita sem olhar o código quase sempre é rasa demais. Quando o Operador ou o 
 te entregam um resultado, vá ler os arquivos que eles tocaram e forme opinião própria,
 não repita o que eles disseram."""
 
+# A regra "revisor só sob pedido explícito" abaixo é enforcement só de prompt —
+# igual toda a outra política deste sistema (o próprio gate de "espera aprovação
+# antes de executar" também é só instrução, sem checagem de código). Se o LLM do
+# Orquestrador ignorar/interpretar mal num turno e emitir <DELEGATE
+# binary="revisor"> sem o usuário ter pedido, nada em _run_pipeline/_resolve_worker
+# bloqueia — aceito como o mesmo tipo de risco que já existe pro resto do sistema,
+# não um gate técnico novo.
 _ORCH_SYSTEM = """Você é o Orquestra — o ESTRATEGISTA que coordena o projeto '{projeto}'.
 Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso total a ela).
 
@@ -2805,11 +3021,19 @@ Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso tot
 SUA EQUIPE (você aciona com a tag <DELEGATE>)
 - binary="operador"    → EXECUTA: lê o código, escreve, altera, roda comandos, cria
                           arquivos. É ele quem "analisa o projeto" quando o usuário pede.
-- binary="revisor"     → REVISA sob demanda: caça bugs, avalia arquitetura e segurança
-                          de um trecho de código ou de um diff.
+- binary="revisor"     → REVISA: caça bugs, avalia arquitetura e segurança de um
+                          trecho de código ou de um diff. USO RESTRITO: só delegue
+                          pro revisor quando o USUÁRIO pedir isso explicitamente
+                          ("revisa isso", "quer dar uma olhada", "segunda opinião",
+                          "chama o revisor"). Nunca encadeie revisor sozinho depois
+                          do operador "por precaução" — ele roda numa API paga por
+                          uso (custo real por chamada), diferente do resto da
+                          equipe. Terminar uma tarefa do operador SEM revisor é o
+                          comportamento padrão.
 - binary="open-design" → gera uma PRÉVIA VISUAL real (renderizada e navegável) de uma
                           mudança de interface.
-O Cão de Guarda roda sozinho depois de cada edição — você não precisa acioná-lo.
+O Cão de Guarda roda sozinho depois de cada edição — você não precisa acioná-lo, e ele
+já cobre a revisão automática (é por isso que o revisor não precisa entrar por padrão).
 
 COMO VOCÊ TRABALHA
 1. Conversa pra entender, analisar ou decidir ("o que tá rolando no meu servidor?",
@@ -2850,10 +3074,13 @@ objetivo, os arquivos/pastas relevantes e o resultado esperado).
 CADEIA (um passo alimenta o próximo) → um único <PIPELINE> com <DELEGATE> na ordem:
 <PIPELINE>
 <DELEGATE binary="operador">(1ª etapa)</DELEGATE>
-<DELEGATE binary="revisor">(revisa o que a 1ª etapa produziu)</DELEGATE>
+<DELEGATE binary="operador">(2ª etapa, usa o resultado da 1ª)</DELEGATE>
 </PIPELINE>
-Cada etapa recebe o resultado da anterior automaticamente — não copie esse resultado na
-instrução. Vários <DELEGATE> soltos (fora de <PIPELINE>) rodam em PARALELO — use só para
+Só inclua "revisor" numa cadeia dessas se o usuário pediu revisão explicitamente pra
+essa tarefa (ver regra do revisor acima) — senão a cadeia é só entre operador/
+open-design. Cada etapa recebe o resultado da anterior automaticamente — não copie
+esse resultado na instrução. Vários <DELEGATE> soltos (fora de <PIPELINE>) rodam em
+PARALELO — use só para
 tarefas realmente independentes.
 
 ANÁLISE LONGA: se o usuário pede um relatório ou análise extensa, mande o operador
@@ -2974,7 +3201,7 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
     import datetime as _dt
     orq_binary = config.get("roles", {}).get("orquestrador", {}).get("binary", "brain")
     quem_voce_e = (
-        _ORCH_QUEM_VOCE_E_READONLY if orq_binary in ("agy", "claude", "codex")
+        _ORCH_QUEM_VOCE_E_READONLY if orq_binary in ("agy", "claude", "codex", "muse")
         else _ORCH_QUEM_VOCE_E_SEM_FERRAMENTAS
     )
     system = _ORCH_SYSTEM.format(
@@ -3009,16 +3236,26 @@ def build_orchestrator_prompt(config: dict, history: list, memory_context: str =
 def _capture_orchestrator_result(line: str, kind: str, state: dict):
     """Extrai só final_text/is_error do stream de uma chamada do orquestrador.
     kind: 'agy' (agy/brain — envelope {"event":"result"}), 'codex' (schema
-    thread/turn/item), ou 'claude' ({"type":"result"})."""
+    thread/turn/item), 'muse' (schema MSP, payload_type run.terminal.completed),
+    ou 'claude' ({"type":"result"})."""
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         return
     if kind == "agy":
-        if d.get("event") == "result":
+        if d.get("event") == "step_update":
+            upd = d.get("step_update", {})
+            if upd.get("step_type") == "agent_response":
+                delta = upd.get("text_delta")
+                if delta:
+                    state["_streamed_text"] = state.get("_streamed_text", "") + delta
+        elif d.get("event") == "result":
             res = d.get("result", {})
-            state["final_text"] = res.get("response", "") or ""
+            resp = res.get("response", "") or ""
+            state["final_text"] = resp or state.get("_streamed_text", "")
             state["is_error"] = res.get("status") != "SUCCESS"
+            if state["is_error"] and not state["final_text"]:
+                state["final_text"] = res.get("error", "") or ""
     elif kind == "codex":
         t = d.get("type", "")
         if t == "item.completed":
@@ -3027,33 +3264,50 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
                 state["final_text"] = item.get("text", "") or state["final_text"]
         elif t in ("turn.failed", "error"):
             state["is_error"] = True
+    elif kind == "muse":
+        if d.get("payload_type") == "run.terminal.completed":
+            payload = d.get("payload") or {}
+            state["final_text"] = payload.get("text", "") or state["final_text"]
+            state["is_error"] = bool(payload.get("terminal")) and payload.get("terminal") != "completed"
+    elif kind == "opencode":
+        ev_type = d.get("type", "")
+        if ev_type == "text":
+            text = (d.get("part") or {}).get("text", "")
+            if text:
+                state["final_text"] += text
+        elif ev_type == "error":
+            state["is_error"] = True
     else:
         if d.get("type") == "result":
             state["final_text"] = d.get("result", "") or ""
             state["is_error"] = bool(d.get("is_error"))
+            if state["is_error"] and not state["final_text"]:
+                state["final_text"] = d.get("error", "") or ""
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Mata o processo E todo mundo que ele gerou (grupo inteiro), não só ele."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # já morreu sozinho entre o timer disparar e chegar aqui
+    except OSError:
+        proc.kill()  # start_new_session não foi usado nesse Popen — fallback
 
 
 def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSection",
                              timeout_s: int, output_file: str | None = None,
                              detail: str = "normal") -> tuple:
-    """Roda uma chamada do PRÓPRIO orquestrador (decisão inicial do turno ou
-    _orchestrator_react) com heartbeat ao vivo na LiveSection, em vez do
-    silêncio total + spinner genérico de antes da reforma — e com um timeout
-    de verdade (mata o processo se passar de timeout_s), a mesma garantia que
-    subprocess.run(timeout=...) dava antes. Retorna (final_text, ok).
-
-    detail: narra tool calls/texto ao vivo (PLANO_PALCO_CHAT.md, Etapa 0a) —
-    reaproveita o mesmo parser do motor que os operários já usam
-    (_narrate_codex_line/_narrate_claude_line/_narrate_agy_line), só pelos
-    efeitos colaterais em section.write()/section.tool_call(). Quem decide
-    final_text/is_error de verdade continua sendo SÓ _capture_orchestrator_result
-    (+ o arquivo -o no Codex, tratado abaixo) — o narrador escreve num dict
-    descartável (narrator_state), nunca em `state`. brain/ollama-cloud não têm
-    tool calls (chat completions puro) — narrator fica None, nada muda pra eles."""
     state = {"final_text": "", "is_error": False}
     # brain/ollama-cloud emitem o mesmo envelope {"event":"result",...} que o agy
-    kind = "agy" if binary in ("agy", "ollama-cloud", "brain") else ("codex" if binary == "codex" else "claude")
-    narrator = {"codex": _narrate_codex_line, "claude": _narrate_claude_line, "agy": _narrate_agy_line}.get(binary)
+    kind = ("agy" if binary in ("agy", "ollama-cloud", "brain")
+            else "codex" if binary == "codex"
+            else "muse" if binary == "muse"
+            else "opencode" if binary == "opencode"
+            else "claude")
+    narrator = {"codex": _narrate_codex_line, "claude": _narrate_claude_line,
+                "agy": _narrate_agy_line, "muse": _narrate_muse_line,
+                "opencode": _narrate_opencode_line}.get(binary)
     narrator_state = {"final_text": "", "is_error": False, "cost_usd": 0.0,
                        "tokens_in": 0, "tokens_out": 0, "duration_ms": 0}
 
@@ -3064,10 +3318,12 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
+            start_new_session=True,  # necessário pro _kill_process_group funcionar de verdade
         )
     except FileNotFoundError:
-        section.close(ok=False, error_detail=f"binário '{binary}' não encontrado")
-        return "", False
+        err_msg = f"binário '{binary}' não encontrado"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     stop_heartbeat = threading.Event()
 
@@ -3083,7 +3339,7 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
 
     def _kill_on_timeout():
         timed_out["flag"] = True
-        proc.kill()
+        _kill_process_group(proc)
 
     timer = threading.Timer(timeout_s, _kill_on_timeout)
     timer.start()
@@ -3124,26 +3380,30 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
             except OSError:
                 pass
 
+    if not state["final_text"] and state.get("_streamed_text"):
+        state["final_text"] = state["_streamed_text"].strip()
+
     if timed_out["flag"]:
-        section.close(ok=False, error_detail=f"não respondeu em {timeout_s}s (timeout)")
-        return "", False
+        err_msg = f"não respondeu em {timeout_s}s (timeout)"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     if not state["final_text"] and proc.returncode != 0:
-        detail = "".join(stderr_lines[-20:]).strip() or "processo terminou sem resposta"
-        section.close(ok=False, error_detail=detail)
-        return "", False
+        err_msg = "".join(stderr_lines[-20:]).strip() or "processo terminou sem resposta"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     if state["is_error"]:
         # O processo pode sair com código 0 mesmo reportando erro no envelope
         # JSON (is_error/status) — sem checar isso, um erro "educado" do
         # modelo seria tratado como resposta válida e tentaria ser escaneado
         # por <DELEGATE>/<PIPELINE> como se fosse texto normal.
-        detail = state["final_text"] or "".join(stderr_lines[-20:]).strip() or "o modelo reportou erro"
-        section.close(ok=False, error_detail=detail)
-        return "", False
+        err_msg = state["final_text"] or "".join(stderr_lines[-20:]).strip() or "o modelo reportou erro"
+        section.close(ok=False, error_detail=err_msg)
+        return "", False, err_msg
 
     section.close(ok=True)
-    return state["final_text"].strip(), True
+    return state["final_text"].strip(), True, ""
 
 
 def _orchestrator_react(config: dict, event_label: str, raw_result: str,
@@ -3191,7 +3451,7 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     prompt = (
         f"Você é o Orquestra, o estrategista do projeto '{projeto}'. Você pediu para "
         f"{event_label} executar uma tarefa e ele acabou de responder com isto:\n\n"
-        f"{raw_result[:8000]}\n\n"
+        f"{raw_result[:_ORCH_CONTEXT_CHARS]}\n\n"
         f"{arquivos_hint}"
         "Agora CONTINUE A CONVERSA com o usuário, em português, como um parceiro de "
         "raciocínio — não como um relatório de status. Diga em 1-2 frases o que saiu "
@@ -3219,8 +3479,8 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
     if section is None:
         section = LiveSection("Orquestra", role.get("icon", "🎼"), role.get("color", "cyan"))
         section.open()
-    text, ok = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile,
-                                        detail=_detail_level(config))
+    text, ok, _err = _run_orchestrator_stream(cmd, env, binary, section, timeout_s=100, output_file=ofile,
+                                              detail=_detail_level(config))
     if not ok:
         return ""
 
@@ -3246,7 +3506,8 @@ class WorkerResult:
 
 def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection", is_agy: bool,
                           detail: str = "normal", is_codex: bool = False, is_copilot: bool = False,
-                          is_opencode: bool = False, output_file: str | None = None) -> WorkerResult:
+                          is_opencode: bool = False, is_muse: bool = False,
+                          output_file: str | None = None) -> WorkerResult:
     """Roda um operário headless, narrando eventos ao vivo na LiveSection — em
     NENHUM nível de detalhe fica em silêncio total (ver _detail_level). Abre e
     fecha a seção aqui mesmo, já com o resumo de erro embutido no fechamento.
@@ -3274,10 +3535,12 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
+            start_new_session=True,  # necessário pro _kill_process_group funcionar de verdade
         )
     except FileNotFoundError as e:
-        section.close(ok=False, error_detail=f"binário não encontrado: {e}")
-        return "", True, f"binário não encontrado: {e}"
+        msg = f"binário não encontrado: {e}"
+        section.close(ok=False, error_detail=msg)
+        return WorkerResult(final_text="", is_error=True, error_detail=msg, changes_summary="")
 
     def _drain_stderr():
         for l in proc.stderr:
@@ -3293,13 +3556,26 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
         parser = _narrate_agy_line
     elif is_opencode:
         parser = _narrate_opencode_line
+    elif is_muse:
+        parser = _narrate_muse_line
     else:
         parser = _narrate_claude_line
 
-    for line in proc.stdout:
-        line = line.strip()
-        if line:
-            parser(line, section, state, detail=detail)
+    timed_out = {"flag": False}
+
+    def _kill_on_timeout():
+        timed_out["flag"] = True
+        _kill_process_group(proc)
+
+    timer = threading.Timer(_WORKER_TIMEOUT_S, _kill_on_timeout)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line:
+                parser(line, section, state, detail=detail)
+    finally:
+        timer.cancel()
 
     proc.wait()
     section.end_line()
@@ -3312,6 +3588,11 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
                 state["final_text"] = file_text
         except OSError:
             pass
+
+    if timed_out["flag"]:
+        state["is_error"] = True
+        state["final_text"] = ""  # o que veio até travar não é confiável — não faz sentido entregar parcial
+        stderr_lines.append(f"não respondeu em {_WORKER_TIMEOUT_S}s (timeout)\n")
 
     if not state["final_text"] and proc.returncode != 0:
         state["is_error"] = True
@@ -3402,9 +3683,20 @@ def engine_for_model(model_id: str) -> dict:
     m = (model_id or "").lower().strip()
     if not m:
         return {}
+    # Modelos nativos do Antigravity CLI (Gemini, Claude Thinking e GPT-OSS via conta Google AI)
+    _AGY_MODELS = (
+        "gemini", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"
+    )
+    if any(m.startswith(p) for p in _AGY_MODELS) or "gemini" in m:
+        return {"binary": "agy", "model": model_id}
     if "openrouter" in m:
         return {"binary": "opencode", "model": model_id}
-    if "claude" in m and "haiku" not in m and "deepseek" not in m:
+    if "muse" in m:
+        return {"binary": "muse", "model": model_id}
+    if "deepseek" in m:
+        # interface do claude apontada pro endpoint alternativo via env_file.
+        return {"binary": "claude", "model": model_id, "env_file": str(DEEPSEEK_ENV)}
+    if "claude" in m and "haiku" not in m:
         return {"binary": "claude", "model": model_id}
     if "gpt" in m or "codex" in m or "o1" in m or "o3" in m:
         if "oss" in m:
@@ -3412,12 +3704,9 @@ def engine_for_model(model_id: str) -> dict:
         return {"binary": "codex", "model": model_id}
     if "copilot" in m or m.startswith("claude-haiku"):
         return {"binary": "copilot", "model": model_id}
-    if "deepseek" in m:
-        # interface do claude apontada pro endpoint alternativo via env_file.
-        return {"binary": "claude", "model": model_id, "env_file": str(DEEPSEEK_ENV)}
     if any(x in m for x in ("kimi", "nemotron", "mistral", "minimax", "glm", "gemma", "qwen")):
         return {"binary": "brain", "model": model_id, "provider": "ollama-cloud"}
-    return {"binary": "agy", "model": model_id}  # Gemini / Antigravity
+    return {"binary": "agy", "model": model_id}  # default seguro
 
 
 def apply_model_to_worker(worker_cfg: dict, model_id: str) -> dict:
@@ -3536,6 +3825,20 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
                "-o", output_file]
         if worker_model:
             cmd.extend(["-m", worker_model])
+    elif actual_binary == "muse":
+        # Muse só carrega AGENTS.md/skills do projeto com --trust-workspace —
+        # sem essa flag ele ignora completamente (testado: aparece "workspace
+        # is untrusted" no --json), então o mesmo problema do Codex acima
+        # (AGENTS.md global dizendo "Orquestrador nunca executa sozinho")
+        # nem chega a aparecer aqui — não precisamos do prefixo "[PAPEL: ...]
+        # prevalece". Se um dia passarmos --trust-workspace pro Muse usar as
+        # skills do projeto, essa lacuna reabre e precisa do mesmo tratamento.
+        # --approval-mode never evita ele travar esperando aprovação que
+        # nunca chega (não tem terminal interativo do outro lado do pipe).
+        cmd = ["muse", "exec", instruction, "--json",
+               "--approval-mode", "never", "--reasoning-effort", _muse_reasoning_effort(worker_model)]
+        if read_only:
+            cmd += ["--disable-write", "--disable-shell"]
     elif actual_binary == "copilot":
         # gh copilot -p retorna texto puro por padrão.
         # Não suporta --output-format json (flag só existe no Copilot agent CLI nativo,
@@ -3665,6 +3968,13 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
             cmd += ["--model", model]
     elif binary == "codex":
         cmd = ["codex", "exec", prompt, "--sandbox", "read-only", "--skip-git-repo-check"]
+    elif binary == "muse":
+        # Sem --json, o Muse já separa limpo: stdout só tem o texto final, todo
+        # o ruído de diagnóstico (skills carregadas, workspace untrusted etc.)
+        # vai pro stderr sozinho — testado, não precisa de filtro extra aqui.
+        cmd = ["muse", "exec", prompt, "--approval-mode", "never",
+               "--disable-write", "--disable-shell",
+               "--reasoning-effort", _muse_reasoning_effort(model)]
     else:
         # claude (inclui deepseek via env_file) — plan = read-only, pode ler mas
         # nunca escrever. Sem --output-format → stdout é texto puro.
@@ -3703,6 +4013,35 @@ def _watchdog_report(cfg: dict):
         console.print(f"\n{marker}🐕 Cão de Guarda[/]\n{text}\n")
     save_chat_message("orquestrador", "assistant",
                       f"[Cão de Guarda — revisão automática]:\n{text}")
+
+
+def build_watchdog_followup_prompt(text: str) -> str:
+    """Prompt sintético do turno automático do Orquestrador quando o Cão de
+    Guarda acha algo. Sem isso o achado só era gravado no histórico e o usuário
+    precisava perguntar "o que aconteceu?" pra ele aparecer. A instrução proíbe
+    <DELEGATE>/<PIPELINE>/<PLANO>: a tarefa ainda pode estar pendente de Aprovar
+    e uma delegação nova competiria com ela — o Orquestrador só resume e propõe."""
+    return (
+        "[Aviso automático do sistema — o Cão de Guarda terminou a revisão e achou "
+        "problemas]:\n"
+        f"{text.strip()}\n\n"
+        "Resuma pro Max, em português e em poucas linhas, o que foi achado, diga o que "
+        "você recomenda fazer e pergunte se ele quer que a correção seja delegada. "
+        "NÃO emita <DELEGATE>, <PIPELINE> nem <PLANO> neste turno."
+    )
+
+
+def format_task_closing(commit: str, has_bug: bool, wd_ran: bool = True) -> str:
+    """Linha determinística (zero LLM) de fechamento de tarefa: diz que acabou,
+    o que foi commitado e o veredito do Cão de Guarda."""
+    if not wd_ran:
+        wd = "não rodou"
+    elif has_bug:
+        wd = "⚠ achou pontos (veja acima)"
+    else:
+        wd = "limpo ✅"
+    what = f"commit: {commit}" if commit else "sem commit (nada mudou)"
+    return f"✅ Concluído · {what} · Cão de Guarda: {wd}"
 
 
 def _run_copilot_watchdog(config: dict = None):
@@ -3843,7 +4182,8 @@ def _run_verification_gate(config: dict, worker: dict, actual_binary: str, tag: 
         res = _run_worker_headless(
             w_cmd, w_env, project_dir, sec, actual_binary == "agy", detail=detail,
             is_codex=actual_binary == "codex", is_copilot=actual_binary == "copilot",
-            is_opencode=actual_binary == "opencode", output_file=ofile,
+            is_opencode=actual_binary == "opencode", is_muse=actual_binary == "muse",
+            output_file=ofile,
         )
         if ofile:
             try:
@@ -3884,7 +4224,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         if previous_result:
             full_instruction = (
                 f"Contexto — resultado da etapa anterior do pipeline ({step_summaries[-1][0]}):\n\n"
-                f"{previous_result[:4000]}\n\n"
+                f"{previous_result[:_ORCH_CONTEXT_CHARS]}\n\n"
                 f"Sua tarefa agora:\n{instruction}"
             )
 
@@ -3900,7 +4240,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             cmd, worker_env, get_project_dir(), section,
             actual_binary == "agy", detail=detail,
             is_codex=(actual_binary == "codex"), is_copilot=(actual_binary == "copilot"),
-            is_opencode=(actual_binary == "opencode"), output_file=output_file,
+            is_opencode=(actual_binary == "opencode"), is_muse=(actual_binary == "muse"),
+            output_file=output_file,
         )
         final_text, is_error, error_detail, changes_summary = (
             result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -3915,7 +4256,8 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
         # numa LiveSection NOVA (a anterior já foi fechada por _run_worker_headless).
         low_err = (error_detail or "").lower()
         if is_error and ("429" in low_err or "credit" in low_err or "quota" in low_err or "rate limit" in low_err):
-            fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude", "opencode": "copilot"}
+            fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot",
+                      "copilot": "claude", "opencode": "copilot", "muse": "claude"}
             fb_bin = fb_map.get(actual_binary, "copilot")
             console.print(f"[bold yellow]⚠️ {label} atingiu limite — failover para {fb_bin}...[/bold yellow]")
             fb_cmd, fb_env, fb_out = _build_worker_cmd({"binary": fb_bin, "model": ""}, fb_bin, full_instruction)
@@ -3924,7 +4266,7 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
             result = _run_worker_headless(
                 fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
                 is_codex=(fb_bin == "codex"), is_copilot=(fb_bin == "copilot"),
-                is_opencode=(fb_bin == "opencode"), output_file=fb_out,
+                is_opencode=(fb_bin == "opencode"), is_muse=(fb_bin == "muse"), output_file=fb_out,
             )
             final_text, is_error, error_detail, changes_summary = (
                 result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -3967,12 +4309,12 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
 
         captured = final_text.strip()
         step_summaries.append((label, captured))
-        save_chat_message("orquestrador", "assistant", f"[Pipeline etapa {idx}/{total} — {label}]:\n{captured[:4000]}")
+        save_chat_message("orquestrador", "assistant", f"[Pipeline etapa {idx}/{total} — {label}]:\n{captured[:_ORCH_CONTEXT_CHARS]}")
         _record_agent_performance(get_project_id(), label, _infer_task_kind(instruction), "success",
                                    result.cost_usd, result.tokens_in, result.tokens_out, result.duration_ms)
         previous_result = captured
 
-    combined = "\n\n".join(f"--- {lbl} ---\n{txt[:3000]}" for lbl, txt in step_summaries)
+    combined = "\n\n".join(f"--- {lbl} ---\n{txt[:_ORCH_CONTEXT_CHARS]}" for lbl, txt in step_summaries)
     chain_desc = " → ".join(lbl for lbl, _ in step_summaries)
 
     if chat_mode:
@@ -4502,15 +4844,17 @@ def main():
             # aborta direto — a LiveSection já mostrou o motivo ao fechar).
             clean_output = ""
             hard_fail = False
+            hard_fail_detail = ""
             for attempt in range(2):
                 cmd, cmd_binary, cmd_ofile = _build_orchestrator_cmd(role, prompt)
                 section = LiveSection(role_name.capitalize(), icon, color)
                 section.open()
-                text, ok = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150,
-                                                    output_file=cmd_ofile, detail=_detail_level(config))
+                text, ok, err_detail = _run_orchestrator_stream(cmd, env, cmd_binary, section, timeout_s=150,
+                                                                 output_file=cmd_ofile, detail=_detail_level(config))
 
                 if not ok:
                     hard_fail = True
+                    hard_fail_detail = err_detail
                     break
 
                 clean_output = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text or '').strip()
@@ -4521,6 +4865,8 @@ def main():
                     console.print(f"[dim]⚠ {icon} {role_name.capitalize()} voltou vazio na 1ª tentativa — tentando de novo...[/dim]")
 
             if hard_fail:
+                if hard_fail_detail:
+                    console.print(f"[dim]{hard_fail_detail[:500]}[/dim]")
                 console.print("[dim]Nada foi salvo no histórico. Tente perguntar de novo.[/dim]\n")
                 continue
 
@@ -4678,9 +5024,11 @@ def main():
                     is_codex = actual_binary == "codex"
                     is_copilot = actual_binary == "copilot"
                     is_opencode = actual_binary == "opencode"
+                    is_muse = actual_binary == "muse"
                     result = _run_worker_headless(
                         w_cmd, w_env, get_project_dir(), section, is_agy, detail=detail,
-                        is_codex=is_codex, is_copilot=is_copilot, is_opencode=is_opencode, output_file=output_file,
+                        is_codex=is_codex, is_copilot=is_copilot, is_opencode=is_opencode,
+                        is_muse=is_muse, output_file=output_file,
                     )
                     final_text, is_error, error_detail, changes_summary = (
                         result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -4688,8 +5036,9 @@ def main():
 
                     if is_error and ("429" in (error_detail or "") or "credit" in (error_detail or "").lower() or "quota" in (error_detail or "").lower()):
                         console.print(f"[bold yellow]⚠️ Failover Automático: {lbl} atingiu limite/erro. Tentando fallback...[/bold yellow]")
-                        # Simple fallback: if claude->copilot, deepseek->claude, codex->copilot, agy->copilot, copilot->claude, opencode->copilot
-                        fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot", "copilot": "claude", "opencode": "copilot"}
+                        # Simple fallback: if claude->copilot, deepseek->claude, codex->copilot, agy->copilot, copilot->claude, opencode->copilot, muse->claude
+                        fb_map = {"claude": "copilot", "deepseek": "claude", "codex": "copilot", "agy": "copilot",
+                                  "copilot": "claude", "opencode": "copilot", "muse": "claude"}
                         fb_bin = fb_map.get(actual_binary, "copilot")
                         fb_worker = {"binary": fb_bin, "model": ""}
                         fb_cmd, fb_env, fb_out = _build_worker_cmd(fb_worker, fb_bin, delegate_instruction)
@@ -4699,7 +5048,7 @@ def main():
                         result = _run_worker_headless(
                             fb_cmd, fb_env, get_project_dir(), fb_section, fb_bin == "agy", detail=detail,
                             is_codex=(fb_bin=="codex"), is_copilot=(fb_bin=="copilot"),
-                            is_opencode=(fb_bin=="opencode"), output_file=fb_out,
+                            is_opencode=(fb_bin=="opencode"), is_muse=(fb_bin=="muse"), output_file=fb_out,
                         )
                         final_text, is_error, error_detail, changes_summary = (
                             result.final_text, result.is_error, result.error_detail, result.changes_summary,
@@ -4774,7 +5123,7 @@ def main():
                     if not gate_passed and gate_summary:
                         captured = (captured + f"\n\n[Verificação automática ainda falha: {gate_summary}]").strip()
                     if captured:
-                        summary = f"[Resposta do {lbl}]:\n{captured[:4000]}"
+                        summary = f"[Resposta do {lbl}]:\n{captured[:_ORCH_CONTEXT_CHARS]}"
                         save_chat_message("orquestrador", "assistant", summary)
                     if chat_mode:
                         comment = _orchestrator_react(config, lbl, captured) if captured else ""

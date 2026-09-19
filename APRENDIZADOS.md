@@ -797,3 +797,135 @@ pra "nunca ganha ferramenta de **escrita**". Doc atrás do código, de novo.
 → "abra os arquivos", `format_working_context` com/sem edição não salva,
 `working_context` no prompt, `_ORQ_CHOICES`). Falta o teste ao vivo na TUI com o
 Codex (rodar `orquestra` e pedir uma análise).
+
+---
+
+## 12. Sessão de 18–19/09/2026 — Terminal real dentro do Orquestra (PRs #4, #5, #6)
+
+**O pedido:** "adicionar o terminal real do Linux dentro do Orquestra" — pra poder abrir
+um agente na pasta, rodar `claude login`, `export CHAVE=...` e outras coisas que só o
+usuário faz, sem sair da TUI. Depois: "deixar o terminal na tela dos logs, junto do
+Orquestra" e "um X pra fechar clicando".
+
+**Como terminou:** um painel lateral `📊 Logs | 🖥 Shell` (ao lado da Atividade e acima
+do chat), com um shell de verdade num pty, `Ctrl+E` abre, `Ctrl+]` volta pro chat,
+`Ctrl+T`/✕ fecham (shell segue vivo), `Ctrl+O` = shell externo. Regras em `AGENTES.md`
+("Painel lateral"), resumo em `NOTAS_TUI.md`, changelog em `CHANGELOG.md`.
+
+| PR | Commit | O que entregou |
+|---|---|---|
+| #4 | `26116ea` (wip) + `8ebed71` | botão `💻 Shell` corrigido + aba `🖥 Terminal` no palco (`orquestra_term.py`) |
+| #5 | `29382d1` | terminal sai do palco e vai pro painel lateral; `Ctrl+E` prioritário; `Ctrl+O` externo |
+| #6 | `cfdee79` | botão ✕ pra fechar o painel com o mouse |
+
+### ✅ Acertos
+
+- **Ler antes de propor.** A análise inicial achou, só lendo o código, que já existia um
+  "terminal" (`action_open_shell` com `self.suspend()`) e que ele provavelmente estava
+  morto — e disse "provável", porque ainda não tinha rodado. Isso mudou o plano: de "criar
+  do zero" para "consertar 1 linha + prototipar o embutido".
+- **Validação em 3 camadas**, cada uma pegou coisa que a anterior não pegou:
+  1. unitária (`key_to_bytes`, parser do `pyte`);
+  2. Pilot do Textual com **shell real** num pty (`test_orquestra_term.py`, 62 checks:
+     teclas, cwd, Ctrl+C, tela alternativa, cores, resize, exit/restart, sem processo
+     órfão, layout lado a lado, foco);
+  3. **e2e no tmux real**, com bytes de teclado de verdade e clique de mouse (sequência
+     SGR) — o único que pegou o vim em branco.
+- **Widget próprio e enxuto** (`orquestra_term.py`, ~400 linhas com comentários) em cima
+  de `ptyprocess` + `pyte`, que já estavam instalados — sem dependência nova pesada.
+- **PRs pequenos e revisáveis** (#4 base, #5 layout, #6 ✕), cada um mesclado pelo usuário e
+  seguido de `git pull` em fast-forward limpo.
+- **Limites escritos, não escondidos:** sem scrollback/mouse/cópia; `claude`/`codex` de
+  tela cheia **não foram validados** lá dentro (o `Ctrl+O` cobre).
+- **Limpeza testada:** sair do app mata o shell filho; `exit` coleta o processo (sem zumbi);
+  fechar o painel não mata o shell.
+
+### ❌ Erros e armadilhas (sintoma → causa → correção → lição)
+
+**1. O botão `💻 Shell` não fazia nada.** `action_open_shell` é `async`, mas o handler
+síncrono chamava `self.action_open_shell()` sem `await` — cria a coroutine e ela nunca roda,
+sem erro nenhum. *Correção:* `call_later` (depois `action_focus_shell`). *Lição:* action
+`async` chamada de um handler síncrono é um no-op silencioso; só por binding/`run_action`/
+`call_later`.
+
+**2. "Provei" a correção só com mock — e o usuário ainda via o botão morto.** O primeiro
+teste do botão usou um mock de `action_open_shell`. Quando o usuário disse "cliquei e não
+acontece nada", a causa **não era o código**: o checkout dele ainda tinha a linha antiga
+(faltava o `git pull`). Confirmei lendo o arquivo dele (sem tocar em git) e depois com um
+**clique real no tmux** (banner do bash → `echo` → `exit` → TUI volta). *Lição:* mock não é
+prova; e antes de depurar, confira se o usuário está rodando o código novo.
+
+**3. O worktree partiu do `master` commitado — sem o trabalho não commitado do usuário.**
+O botão Shell só existia nas ~570 linhas ainda não commitadas do checkout principal.
+Copiei esses 3 arquivos num commit `wip` separado (`26116ea`) e fiz o meu por cima; o `wip`
+**entrou no PR #4 e no `master`**. Foi avisado na descrição do PR, mas ainda assim o PR levou
+trabalho que não era da feature. *Lição:* antes de isolar em worktree, olhe o `git status`
+do checkout principal e combine com o usuário o que fazer com o não commitado.
+
+**4. `event.character` não é confiável.** Sintoma: no teste, os comandos se acumulavam na
+mesma linha do shell — o Enter não chegava. `key_to_character("enter")` é `None`, `ctrl+c`
+também, e o Backspace vem como `\x08` em vez de `\x7f`. *Correção:* `key_to_bytes` mapeia
+pelo **nome** da tecla (Enter, Backspace, `ctrl+letra`, setas com modificadores, F1–F12) e usa
+`character` só pro resto.
+
+**5. O vim aparecia em branco — e os testes estavam verdes.** `less` passava no Pilot; o
+vim, no tmux real, não desenhava nada. Causa: o parser do `pyte` chama todo handler CSI
+com `private=True` quando a sequência tem `?` (o vim manda `CSI ? 6 n` etc.), e ~20 handlers
+não aceitam esse argumento → `TypeError` que derruba o parser. *Correção:* `_ignore_private`
+(ignora a variante DEC) + `_feed` que recria o stream se o parser ainda falhar + testes de
+regressão. *Lição:* teste verde com `less` **não** prova o vim; só o app real pegou.
+
+**6. O `pyte` não tem tela alternativa** (`?1049h`) — vim/less/codex desenhariam por cima
+do histórico e deixariam lixo ao sair. *Correção:* `_Screen` guarda/restaura a grade.
+
+**7. `textual-terminal` (0.3.0) já estava instalado, mas quebra no Textual 8**
+(`ImportError: DEFAULT_COLORS`). Descartado; widget próprio.
+
+**8. `Ctrl+5` é o mesmo byte de `Ctrl+]`** (`0x1d`) em terminal sem protocolo kitty
+(xterm/qterminal). Abrir o terminal com `Ctrl+5` teria aberto e já saído. *Correção:*
+`Ctrl+E`. *Hipótese não verificada:* os `Ctrl+1..4` que já existiam no app podem sofrer do
+mesmo problema no `qterminal`.
+
+**9. O `TextArea` do chat engolia o `Ctrl+E`** (liga `end,ctrl+e` a "fim da linha") — o
+atalho falhava justo com o foco no chat, o caso principal. *Correção:* binding
+`priority=True`; com o shell em foco a action repassa `\x05` ao bash. (O Textual não
+avisou; o teste falhou.)
+
+**10. Um teste quebrado falou com o LLM de verdade — duas vezes.** Como o `Ctrl+E` falhou
+(item 9), o foco ficou no chat, o teste digitou `echo integrado-…` e apertou Enter: chamada
+**real** ao Orquestrador (o traceback do `_heartbeat` denunciou). *Correção:* o teste agora
+só digita se `app.focused is term`, senão aborta. *Lição:* teste que digita em TUI precisa
+garantir o foco antes; Enter no chat dispara uma chamada real (que pode custar; aqui foram 2 mensagens curtas, custo não medido).
+
+**11. O fim de uma tarefa roubava o foco do shell.** `_re_enable_input` sempre focava o chat;
+com você digitando no terminal, ele te tirava de lá. *Correção:* só foca se o foco não estiver
+no `PtyTerminal`.
+
+**12. Clicar no ✕ passa o foco pro próprio botão antes do handler rodar** — então a regra "se
+o foco está no terminal, devolve ao chat" não disparava. Achado pelo teste. *Correção:* vale
+para qualquer foco dentro do painel (`panel in focused.ancestors_with_self`).
+
+**13. Um check meu falhou por estar errado, não o código:** `RichLog` oculto **adia** a escrita
+(regra que já está no `AGENTES.md`); com a aba Shell ativa os logs só aparecem ao voltar
+pra `📊 Logs`. O teste passou a trocar de aba antes de conferir.
+
+**14. Git: `git checkout worktree-terminal-lateral` falhou pro usuário** ("já está em uso
+pelo worktree…") — a branch estava aberta no worktree da minha sessão e eu não conferi o
+`git worktree list` antes de mandar o comando. Saídas: rodar o launcher de dentro do
+worktree pra testar, ou PR + merge + `git pull`.
+
+**15. `python orquestra_tui.py` cai no assistente do cofre** (senha mestra). Meu primeiro
+e2e digitou dentro desse prompt. Pra automação: `python -c 'from orquestra_tui import
+OrquestraTUI; OrquestraTUI().run()'`; pro usuário: sempre `orquestra`.
+
+**16. Ferramentas de teste:** `pytest` diz "no tests ran" (as suítes são scripts:
+`python3 test_orquestra.py`); o `pyproject.toml` do checkout do usuário está sem versionar,
+então `pyte`/`ptyprocess` só constam no `pip install` do README.
+
+### O que continua NÃO validado
+
+- `claude` e `codex` (TUIs de tela cheia) dentro do painel — pode haver cor/posição
+  imperfeita; o `Ctrl+O` é o plano B.
+- Scrollback, mouse e seleção/cópia não existem no painel (ver `ROADMAP.md`).
+- Terminais com protocolo kitty (onde `Ctrl+5` etc. chegam distintos) não foram testados.
+- Uso longo: nenhum teste de carga (saída muito grande e contínua) no widget.

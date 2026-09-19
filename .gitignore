@@ -1,6 +1,8 @@
 .sdd/runtime/
 __pycache__/
 *.pyc
+.venv/
+venv/
 .orquestra_logs.md
 .orquestra_preview.html
 .orquestra_preview.png
