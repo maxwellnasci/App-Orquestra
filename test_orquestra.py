@@ -613,6 +613,24 @@ check(_saved and _saved[0][0] == "orquestrador" and "achado importante" in _save
 check(not _react.called, "_watchdog_report NÃO chama _orchestrator_react (evita corrida)")
 
 
+# ── Cão de Guarda: turno automático + fechamento de tarefa ──────────────────
+print("build_watchdog_followup_prompt / format_task_closing")
+_fp = orquestra.build_watchdog_followup_prompt("  --force quebra a porta  ")
+check("--force quebra a porta" in _fp, "follow-up inclui o achado do Cão de Guarda")
+check("NÃO emita <DELEGATE>" in _fp and "<PIPELINE>" in _fp and "<PLANO>" in _fp,
+      "follow-up proíbe delegar/planejar (tarefa ainda pode estar pendente)")
+check(_fp.count("--force quebra a porta") == 1 and "  --force" not in _fp, "follow-up faz strip do texto")
+
+_c1 = orquestra.format_task_closing("docs/A.md", has_bug=False)
+check("Concluído" in _c1 and "docs/A.md" in _c1 and "limpo" in _c1, "fechamento: commit + Cão limpo")
+_c2 = orquestra.format_task_closing("a.py, b.py", has_bug=True)
+check("achou pontos" in _c2 and "limpo" not in _c2, "fechamento: Cão achou pontos")
+_c3 = orquestra.format_task_closing("", has_bug=False)
+check("sem commit" in _c3, "fechamento: sem commit quando nada mudou")
+_c4 = orquestra.format_task_closing("x.py", has_bug=False, wd_ran=False)
+check("não rodou" in _c4 and "limpo" not in _c4, "fechamento: Cão não rodou não vira 'limpo'")
+
+
 print()
 if FAILS:
     print(f"\033[31m✗ {len(FAILS)} falha(s):\033[0m")

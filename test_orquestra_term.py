@@ -276,6 +276,119 @@ async def tui_tests():
 
 asyncio.run(tui_tests())
 
+
+# ── shell na pasta de lançamento + UX do Cão de Guarda ───────────────────────
+print("Shell na pasta de lançamento / Cão de Guarda proativo")
+
+
+async def launch_dir_and_watchdog_tests():
+    dir_a = tempfile.mkdtemp(prefix="orq_launch_")
+    dir_b = tempfile.mkdtemp(prefix="orq_other_")
+    prev = os.getcwd()
+    os.chdir(dir_a)
+    try:
+        followups = []
+        with patch.object(OrquestraTUI, "_run_orchestrator", lambda self, prompt: followups.append(prompt)), \
+             patch("orquestra.save_chat_message") as chat:
+            app = OrquestraTUI()
+            async with app.run_test(size=(140, 40)) as pilot:
+                await pilot.pause()
+                os.chdir(dir_b)   # algo muda o cwd do processo depois do boot
+                term = app.query_one("#embedded-term", PtyTerminal)
+                check(app._launch_dir == os.path.realpath(dir_a) or app._launch_dir == dir_a,
+                      "_launch_dir guarda a pasta de onde o app foi aberto")
+                app.action_focus_shell()
+                check(await wait_for(lambda: term.alive), "shell embutido sobe")
+                await pilot.press(*"pwd", "enter")
+                check(await wait_for(lambda: Path(dir_a).name in term.screen_text()),
+                      "shell abre na pasta de lançamento mesmo após os.chdir")
+                check(Path(dir_b).name not in term.screen_text().split("pwd", 1)[-1],
+                      "shell NÃO abre na pasta que o cwd virou depois")
+
+                # ── alerta persistente ───────────────────────────────────────
+                footer = app.query_one("#watchdog-footer")
+                bells = []
+                app.bell = lambda: bells.append(1)
+                await asyncio.to_thread(app._report_watchdog, "achei [bold]problema[/bold] X", True, False)
+                await pilot.pause()
+                check(footer.has_class("alert"), "achado real → rodapé vermelho (alert)")
+                check(app._watchdog_timer is None, "achado real NÃO agenda auto-limpeza do rodapé")
+                check(bells == [1], "achado real toca o bell")
+                feed = "\n".join(str(l.text) for l in app.query_one("#activity-log").lines)
+                check("problema" in feed, "achado completo aparece no feed (markup escapado, sem quebrar)")
+                long_txt = "linha longa " * 400     # ~4.8k chars, passava de 1500 e cortava no meio
+                await asyncio.to_thread(app._report_watchdog, long_txt + "FIM-DO-TEXTO", True, False)
+                await pilot.pause()
+                feed = "\n".join(str(l.text) for l in app.query_one("#activity-log").lines)
+                check("FIM-DO-TEXTO" in feed, "texto do achado NÃO é mais truncado em 1500 chars")
+                check(chat.call_count == 0, "to_chat=False não grava no histórico")
+
+                await asyncio.to_thread(app._report_watchdog, "", False, False)
+                await pilot.pause()
+                check(not footer.has_class("alert"), "sem achado → alerta some")
+                await asyncio.to_thread(app._report_watchdog, "achado y", True, True)
+                check(chat.call_count == 1 and "achado y" in chat.call_args[0][2],
+                      "to_chat=True grava o veredito no histórico do Orquestrador")
+
+                # ── follow-up automático (1x por pedido) ─────────────────────
+                await asyncio.to_thread(app._watchdog_followup, "achado y", False)
+                await asyncio.to_thread(app._watchdog_followup, "", True)
+                await pilot.pause()
+                check(followups == [], "sem has_bug/sem texto → Orquestrador NÃO é chamado")
+                await asyncio.to_thread(app._watchdog_followup, "achado y", True)
+                await pilot.pause()
+                check(len(followups) == 1 and "achado y" in followups[0] and "NÃO emita" in followups[0],
+                      "has_bug → Orquestrador é chamado com o achado")
+                await asyncio.to_thread(app._watchdog_followup, "achado z", True)
+                await pilot.pause()
+                check(len(followups) == 1, "2º achado no mesmo pedido NÃO dispara outro turno (sem loop)")
+                app._watchdog_followup_done = False   # o que on_chat_input_submitted faz
+                await asyncio.to_thread(app._watchdog_followup, "achado z", True)
+                await pilot.pause()
+                check(len(followups) == 2, "novo pedido do usuário libera um novo follow-up")
+
+                # ── fechamento de tarefa ─────────────────────────────────────
+                chat.reset_mock()
+                await asyncio.to_thread(app._close_task, "docs/A.md", False)
+                await pilot.pause()
+                feed = "\n".join(str(l.text) for l in app.query_one("#activity-log").lines)
+                check("Concluído" in feed and "docs/A.md" in feed, "fechamento aparece no feed")
+                check(chat.call_count == 1 and "Conclusão da tarefa" in chat.call_args[0][2],
+                      "fechamento é gravado no histórico do chat")
+
+                # ── ponta a ponta: Aprovar → Cão acha algo → commit → fecha → Orquestrador fala ──
+                order = []
+                app._watchdog_followup_done = False
+                app._pipeline_rest = None
+                with patch("orquestra.watchdog_verdict", return_value=("3 inconsistências na doc", True)), \
+                     patch("orquestra.commit_pending", side_effect=lambda *a: order.append("commit") or "docs/X.md"), \
+                     patch("orquestra.save_chat_message",
+                           side_effect=lambda r, ro, c: order.append("chat:" + c.split("]")[0].lstrip("["))), \
+                     patch.object(OrquestraTUI, "_run_orchestrator",
+                                  lambda self, prompt: order.append("orquestrador")):
+                    await app._run_watchdog(commit_after=True).wait()
+                    await pilot.pause()
+                check(order == ["chat:Cão de Guarda — revisão automática", "commit",
+                                "chat:Conclusão da tarefa", "orquestrador"],
+                      f"Aprovar com achado: veredito → commit → fechamento → Orquestrador fala ({order})")
+                check(app.query_one("#watchdog-footer").has_class("alert"),
+                      "alerta continua aceso depois do fluxo inteiro")
+
+                # save manual no editor (file_path): não polui chat, não fecha tarefa, não chama Orquestrador
+                order.clear()
+                with patch("orquestra.watchdog_verdict", return_value=("achado no editor", True)), \
+                     patch("orquestra.save_chat_message", side_effect=lambda *a: order.append("chat")), \
+                     patch.object(OrquestraTUI, "_run_orchestrator", lambda self, prompt: order.append("orquestrador")):
+                    app._watchdog_followup_done = False
+                    await app._run_watchdog(commit_after=False, file_path="/tmp/x.py").wait()
+                    await pilot.pause()
+                check(order == [], f"Ctrl+S manual no editor continua silencioso pro chat/Orquestrador ({order})")
+    finally:
+        os.chdir(prev)
+
+
+asyncio.run(launch_dir_and_watchdog_tests())
+
 print()
 if FAILS:
     print(f"\033[31m✗ {len(FAILS)} falha(s):\033[0m")

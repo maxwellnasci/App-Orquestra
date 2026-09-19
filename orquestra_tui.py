@@ -589,6 +589,12 @@ class OrquestraTUI(App):
     }
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Pasta de onde o Orquestra foi aberto, fixada UMA vez (antes do compose): o
+        # shell embutido e o Ctrl+O abrem sempre aqui, mesmo se algo mudar o cwd depois.
+        self._launch_dir: str = os.getcwd()
+
     def compose(self) -> ComposeResult:
         # ── Header ───────────────────────────────────────────────────────────
         # PLANO_PALCO_CHAT.md, Etapa 1: Editor/Idea Studio saem do header —
@@ -647,7 +653,7 @@ class OrquestraTUI(App):
                             f"{EXIT_KEY_LABEL} volta pro chat · Ctrl+E volta pra cá",
                             id="term-hint",
                         )
-                        yield PtyTerminal(cwd=self._project_dir(), id="embedded-term")
+                        yield PtyTerminal(cwd=self._launch_dir, id="embedded-term")
 
 
         # ── Dock de Prompt estilo Antigravity ──
@@ -703,6 +709,7 @@ class OrquestraTUI(App):
         self._pending_changes: str = ""         # Resumo das mudanças do Operador
         self._plan_pending: str = ""            # <PLANO> aguardando "Executar"
         self._last_user_prompt: str = ""        # último pedido do usuário (p/ re-enviar no "Executar")
+        self._watchdog_followup_done: bool = False  # 1 turno automático do Orquestrador por pedido do usuário
         self._pipeline_rest = None              # etapas restantes de um <PIPELINE> pausado na aprovação
         self._learning_mode: bool = bool(cfg.get("ui", {}).get("learning_mode", False))
         self._last_auto_review: float = 0.0     # cooldown da revisão automática ao salvar
@@ -1556,7 +1563,8 @@ class OrquestraTUI(App):
             print("Digite 'exit' ou pressione Ctrl+D para retornar ao Orquestra.")
             print("="*80 + "\n")
             try:
-                subprocess.run([os.environ.get("SHELL", "/bin/bash")])
+                subprocess.run([os.environ.get("SHELL", "/bin/bash")],
+                               cwd=self._launch_dir if os.path.isdir(self._launch_dir) else None)
             except Exception as e:
                 print(f"Erro ao abrir shell interativo: {e}")
                 input("Pressione Enter para voltar...")
@@ -1595,6 +1603,7 @@ class OrquestraTUI(App):
         self._stage_show("stage-activity")
         self._feed_write(f"\n[bold bright_white]👤 Você:[/bold bright_white] {prompt}\n")
         self._reset_watchdog_footer()
+        self._watchdog_followup_done = False
         self.query_one("#chat-input").disabled = True
         self._run_orchestrator(prompt)
 
@@ -2241,27 +2250,18 @@ class OrquestraTUI(App):
 
             auto_ok = (not read_only) and self._should_auto_approve(config, result.changed_files)
             has_bug = False
+            wtext = ""
             if auto_ok:
-                footer = self.query_one("#watchdog-footer")
-                self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
+                self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
                 wtext, has_bug = orquestra.watchdog_verdict(config)
-                if wtext and has_bug:
-                    self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
-                    self.call_from_thread(footer.add_class, "alert")
-                    self._feed_write(f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
-                else:
-                    self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
-                    self.call_from_thread(footer.remove_class, "alert")
-                if wtext:
-                    orquestra.save_chat_message("orquestrador", "assistant",
-                                                f"[Cão de Guarda — revisão automática]:\n{wtext}")
-                self.call_from_thread(self._schedule_watchdog_cleanup)
+                self._report_watchdog(wtext, has_bug)
 
             if auto_ok and not has_bug:
                 self._feed_write("\n[dim](gate por risco: seguindo sem pausar)[/dim]\n")
                 commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
                 if commited:
                     self._feed_write(f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                    self._close_task(commited, has_bug=False)
                     if attribution:
                         for fp in attribution["files"]:
                             orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
@@ -2273,6 +2273,7 @@ class OrquestraTUI(App):
                         "\n[dim](gate por risco: caminho parecia seguro, mas o Cão de Guarda achou algo — pausando mesmo assim)[/dim]\n")
                 self._pending_attribution = attribution
                 self.call_from_thread(self._show_action_bar)
+                self._watchdog_followup(wtext, has_bug)
         else:
             self.call_from_thread(self._re_enable_input)
 
@@ -2290,34 +2291,20 @@ class OrquestraTUI(App):
         vez de desistir em silêncio. gh copilot/claude/agy/codex não precisam
         de git pra rodar; só o cálculo do diff precisava."""
         import orquestra
-        footer = self.query_one("#watchdog-footer")
-        self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
+        self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
 
         config = orquestra.load_config()
         text, has_bug = orquestra.watchdog_verdict(config, file_path=file_path)
 
-        if not text:
-            self.call_from_thread(footer.update, "🐕 Cão de Guarda: nada a apontar. ✅")
-            self.call_from_thread(footer.remove_class, "alert")
-        elif has_bug:
-            self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {text[:220]}")
-            self.call_from_thread(footer.add_class, "alert")
-            self._feed_write(f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{text[:1500]}\n")
-        else:
-            self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {text[:220]}")
-            self.call_from_thread(footer.remove_class, "alert")
-
-        # Agenda a limpeza do rodapé após 8 segundos para a tela não ficar poluída
-        self.call_from_thread(self._schedule_watchdog_cleanup)
-
-        # Rota pro Orquestrador só na revisão pós-Aprovar (não na auditoria de
-        # save manual do editor, que seria ruído a cada Ctrl+S).
-        if text and commit_after and file_path is None:
-            orquestra.save_chat_message("orquestrador", "assistant",
-                                        f"[Cão de Guarda — revisão automática]:\n{text}")
+        # Rota pro chat do Orquestrador só na revisão pós-Aprovar (não na auditoria
+        # de save manual do editor, que seria ruído a cada Ctrl+S).
+        is_approval_review = commit_after and file_path is None
+        self._report_watchdog(text, has_bug, to_chat=is_approval_review)
 
         if commit_after:
             commited = orquestra.commit_pending(orquestra.get_project_dir(), "Orquestra: mudança aprovada")
+            if is_approval_review:
+                self._close_task(commited, has_bug)
             if commited:
                 self._feed_write(f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
                 self._refresh_changes_panel()
@@ -2344,6 +2331,61 @@ class OrquestraTUI(App):
                 self._run_pipeline_tui(cont["steps"], previous=cont["previous"], is_resume=True)
             else:
                 self.call_from_thread(self._re_enable_input)
+                if is_approval_review:
+                    self._watchdog_followup(text, has_bug)
+
+    def _set_watchdog_footer(self, text: str) -> None:
+        try:
+            self.query_one("#watchdog-footer", Label).update(text)
+        except Exception:
+            pass
+
+    def _report_watchdog(self, text: str, has_bug: bool, to_chat: bool = True) -> None:
+        """Mostra o veredito do Cão de Guarda (chamar de thread worker). Achado real
+        → rodapé vermelho que NÃO se limpa sozinho (só quando você digita), texto
+        completo no feed, toast + bell. Sem achado → rodapé verde que some em 8s.
+        to_chat: grava o veredito no histórico do Orquestrador."""
+        import orquestra
+        footer = self.query_one("#watchdog-footer", Label)
+        flat = " ".join(text.split()) if text else ""
+        if text and has_bug:
+            self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {rich_escape(flat[:200])} · digite algo pra dispensar")
+            self.call_from_thread(footer.add_class, "alert")
+            self._feed_write(f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{rich_escape(text[:8000])}\n")
+            self.call_from_thread(self.notify, "🐕 Cão de Guarda achou pontos na mudança — veja em ⚡ Atividade.",
+                                  severity="warning", timeout=10)
+            self.call_from_thread(self.bell)
+        else:
+            self.call_from_thread(footer.update,
+                                  f"🐕 Cão de Guarda: {rich_escape(flat[:220]) if text else 'nada a apontar. ✅'}")
+            self.call_from_thread(footer.remove_class, "alert")
+            self.call_from_thread(self._schedule_watchdog_cleanup)
+        if text and to_chat:
+            orquestra.save_chat_message("orquestrador", "assistant",
+                                        f"[Cão de Guarda — revisão automática]:\n{text}")
+
+    def _close_task(self, commit: str, has_bug: bool, wd_ran: bool = True) -> None:
+        """Fecha a tarefa dizendo que acabou (feed + histórico do chat), sem LLM."""
+        import orquestra
+        line = orquestra.format_task_closing(commit, has_bug, wd_ran)
+        style = "bold yellow" if has_bug else "bold green"
+        self._feed_write(f"\n[{style}]{rich_escape(line)}[/{style}]\n")
+        orquestra.save_chat_message("orquestrador", "assistant", f"[Conclusão da tarefa]:\n{line}")
+
+    def _watchdog_followup(self, text: str, has_bug: bool) -> None:
+        """Achado real → o Orquestrador fala sozinho (resume e propõe a correção),
+        em vez de esperar você perguntar. 1x por pedido do usuário (sem loop).
+        Chamar de thread worker."""
+        if not (text and has_bug) or self._watchdog_followup_done:
+            return
+        import orquestra
+        self._watchdog_followup_done = True
+        self._feed_write("\n[dim]🎼 Chamando o Orquestrador pra comentar o achado do Cão de Guarda...[/dim]\n")
+        self.call_from_thread(self._start_followup_turn, orquestra.build_watchdog_followup_prompt(text))
+
+    def _start_followup_turn(self, prompt: str) -> None:
+        self.query_one("#chat-input").disabled = True
+        self._run_orchestrator(prompt)
 
     def _schedule_watchdog_cleanup(self, delay_s: float = 8.0) -> None:
         """Agenda a limpeza suave do #watchdog-footer após delay_s segundos."""
@@ -2696,20 +2738,11 @@ class OrquestraTUI(App):
 
                 auto_ok = self._should_auto_approve(config, result.changed_files)
                 has_bug = False
+                wtext = ""
                 if auto_ok:
-                    footer = self.query_one("#watchdog-footer")
-                    self.call_from_thread(footer.update, "🐕 Cão de Guarda: analisando o diff...")
+                    self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
                     wtext, has_bug = orquestra.watchdog_verdict(config)
-                    if wtext and has_bug:
-                        self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {wtext[:220]}")
-                        self.call_from_thread(footer.add_class, "alert")
-                        self._feed_write(f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{wtext[:1500]}\n")
-                    else:
-                        self.call_from_thread(footer.update, f"🐕 Cão de Guarda: {wtext[:220] if wtext else 'nada a apontar. ✅'}")
-                        self.call_from_thread(footer.remove_class, "alert")
-                    if wtext:
-                        orquestra.save_chat_message("orquestrador", "assistant",
-                                                    f"[Cão de Guarda — revisão automática]:\n{wtext}")
+                    self._report_watchdog(wtext, has_bug)
 
                 if auto_ok and not has_bug:
                     # Gate por risco: nenhum caminho sensível e o Cão de Guarda não
@@ -2718,6 +2751,7 @@ class OrquestraTUI(App):
                     commited = orquestra.commit_pending(cwd, f"Orquestra: {label} (gate por risco)")
                     if commited:
                         self._feed_write(f"\n[dim]📦 Commit criado: {commited}[/dim]\n")
+                        self._close_task(commited, has_bug=False)
                         if attribution:
                             for fp in attribution["files"]:
                                 orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
@@ -2734,6 +2768,7 @@ class OrquestraTUI(App):
                         self._feed_write(
                             f"\n[dim](o pipeline continua depois do Aprovar: {len(remaining)} etapa(s))[/dim]\n")
                     self.call_from_thread(self._show_action_bar)
+                    self._watchdog_followup(wtext, has_bug)
                     return
 
         self.call_from_thread(self._clear_plan_panel)
