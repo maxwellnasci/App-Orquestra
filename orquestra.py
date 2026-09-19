@@ -3912,6 +3912,35 @@ def _watchdog_report(cfg: dict):
                       f"[Cão de Guarda — revisão automática]:\n{text}")
 
 
+def build_watchdog_followup_prompt(text: str) -> str:
+    """Prompt sintético do turno automático do Orquestrador quando o Cão de
+    Guarda acha algo. Sem isso o achado só era gravado no histórico e o usuário
+    precisava perguntar "o que aconteceu?" pra ele aparecer. A instrução proíbe
+    <DELEGATE>/<PIPELINE>/<PLANO>: a tarefa ainda pode estar pendente de Aprovar
+    e uma delegação nova competiria com ela — o Orquestrador só resume e propõe."""
+    return (
+        "[Aviso automático do sistema — o Cão de Guarda terminou a revisão e achou "
+        "problemas]:\n"
+        f"{text.strip()}\n\n"
+        "Resuma pro Max, em português e em poucas linhas, o que foi achado, diga o que "
+        "você recomenda fazer e pergunte se ele quer que a correção seja delegada. "
+        "NÃO emita <DELEGATE>, <PIPELINE> nem <PLANO> neste turno."
+    )
+
+
+def format_task_closing(commit: str, has_bug: bool, wd_ran: bool = True) -> str:
+    """Linha determinística (zero LLM) de fechamento de tarefa: diz que acabou,
+    o que foi commitado e o veredito do Cão de Guarda."""
+    if not wd_ran:
+        wd = "não rodou"
+    elif has_bug:
+        wd = "⚠ achou pontos (veja acima)"
+    else:
+        wd = "limpo ✅"
+    what = f"commit: {commit}" if commit else "sem commit (nada mudou)"
+    return f"✅ Concluído · {what} · Cão de Guarda: {wd}"
+
+
 def _run_copilot_watchdog(config: dict = None):
     """Dispara o Cão de Guarda numa thread daemon (não bloqueia o operário).
     Cooldown de 15s pra não rodar N vezes quando vários operários paralelos
