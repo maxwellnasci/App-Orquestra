@@ -23,6 +23,7 @@ from textual.message import Message
 from textual.binding import Binding
 from textual import work, events
 from textual.widget import Widget
+from orquestra_term import PtyTerminal, EXIT_KEY, EXIT_KEY_LABEL
 from rich.markup import escape as rich_escape
 from rich.markdown import Markdown as RichMarkdown
 
@@ -240,6 +241,10 @@ class OrquestraTUI(App):
         Binding("ctrl+2", "stage_tab('stage-changes')", "Mudanças", show=False),
         Binding("ctrl+3", "stage_tab('stage-editor')", "Editor", show=False),
         Binding("ctrl+4", "stage_tab('stage-idea')", "Idea Studio", show=False),
+        # Ctrl+E e não Ctrl+5: em terminais sem protocolo kitty (xterm, qterminal)
+        # Ctrl+5 chega como 0x1d, o mesmo byte do Ctrl+] (sair do terminal).
+        Binding("ctrl+e", "stage_tab('stage-terminal')", "Terminal embutido", show=False),
+        Binding(EXIT_KEY, "leave_terminal", "Sair do terminal", show=False),
         Binding("ctrl+t", "toggle_terminal", "Terminal", show=False),
         Binding("ctrl+b", "toggle_files", "Arquivos", show=False),
         Binding("ctrl+up", "resize_chat(1)", "Chat maior", show=False),
@@ -405,6 +410,13 @@ class OrquestraTUI(App):
         height: 1;
         padding: 0 1;
         background: $boost;
+    }
+
+    #term-hint {
+        height: 1;
+        padding: 0 1;
+        background: $boost;
+        color: $text-muted;
     }
 
     .hidden {
@@ -574,6 +586,13 @@ class OrquestraTUI(App):
                         yield Button("🔍 Revisão profunda", id="btn-deep-review", classes="action-btn")
                     yield Vertical(id="suggestions-panel", classes="hidden")
                     yield TabbedContent(id="editor-tabs")
+                with TabPane("🖥 Terminal", id="stage-terminal"):
+                    yield Label(
+                        f"Shell real na pasta do projeto · todas as teclas vão pro shell · "
+                        f"{EXIT_KEY_LABEL} volta pro chat · Ctrl+E volta pra cá",
+                        id="term-hint",
+                    )
+                    yield PtyTerminal(cwd=self._project_dir(), id="embedded-term")
                 with TabPane("🎨 Idea Studio", id="stage-idea"):
                     yield Container(id="idea-image")
                     yield Markdown(
@@ -899,7 +918,9 @@ class OrquestraTUI(App):
 
         # Botão Shell: abre o shell interativo
         if event.button.id == "btn-shell":
-            self.action_open_shell()
+            # action_open_shell é async: chamar sem await só criava a coroutine
+            # e o botão não fazia nada. call_later agenda e aguarda de verdade.
+            self.call_later(self.action_open_shell)
             return
 
         # Toggles de painéis
@@ -1402,8 +1423,24 @@ class OrquestraTUI(App):
     # ── Atalhos do palco/chat-dock (PLANO_PALCO_CHAT.md, Etapa 1) ────────────
 
     def action_stage_tab(self, pane_id: str) -> None:
-        """Ctrl+1..4: troca a aba ativa do palco direto pelo teclado."""
+        """Ctrl+1..4 / Ctrl+E: troca a aba ativa do palco direto pelo teclado."""
         self._stage_show(pane_id)
+
+    def action_leave_terminal(self) -> None:
+        """Ctrl+]: devolve o foco ao chat (o terminal embutido consome as
+        demais teclas, inclusive os atalhos do app)."""
+        self.action_focus_chat()
+
+    @staticmethod
+    def _project_dir() -> str:
+        import orquestra
+        return orquestra.get_project_dir()
+
+    def _focus_embedded_term(self) -> None:
+        """Sobe o shell (na 1ª vez) e põe o foco nele."""
+        term = self.query_one("#embedded-term", PtyTerminal)
+        term.start()
+        term.focus()
 
     def action_toggle_files(self) -> None:
         """Ctrl+B: mostra/oculta o painel Arquivos (mesmo efeito do botão)."""
@@ -2648,6 +2685,9 @@ class OrquestraTUI(App):
         usuário lendo o Editor levaria um "puxão" de volta a cada chamada)."""
         if event.tabbed_content.id == "stage-tabs" and self._active_workers > 0:
             self._stage_pinned = True
+        if event.tabbed_content.id == "stage-tabs" and event.pane.id == "stage-terminal":
+            # depois do refresh: o widget só tem tamanho real quando a aba aparece
+            self.call_after_refresh(self._focus_embedded_term)
 
     # ── Helpers de UI (devem ser chamados na thread da UI) ────────────────────
 
@@ -2660,7 +2700,9 @@ class OrquestraTUI(App):
 
     def _re_enable_input(self) -> None:
         self.query_one("#chat-input").disabled = False
-        self.query_one("#chat-input").focus()
+        # Não rouba o foco de quem está digitando no terminal embutido.
+        if not isinstance(self.focused, PtyTerminal):
+            self.query_one("#chat-input").focus()
 
     # Etapa 5 (polimento) — cor por agente na Atividade. Baseado no `label`
     # (não no worker_cfg["color"] repassado por 19 call sites diferentes —

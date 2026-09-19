@@ -92,7 +92,7 @@ clica na árvore ou o próprio Orquestrador mostra código durante a conversa
 ## Instalação
 
 ```bash
-pip install rich prompt_toolkit cryptography textual textual-image rich-pixels --break-system-packages
+pip install rich prompt_toolkit cryptography textual textual-image rich-pixels pyte ptyprocess --break-system-packages
 # deixar o comando `orquestra` disponível em qualquer pasta:
 ln -sf "$PWD/orquestra" ~/.local/bin/orquestra
 ```
