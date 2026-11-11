@@ -122,7 +122,7 @@ DEFAULT_CONFIG = {
         },
         "agy": {
             "binary": "agy",
-            "model": "gemini-3.1-pro-high",
+            "model": "gemini-4-argon-high",
             "icon": "💚",
             "label": "Motor Antigravity",
             "description": "Atalho: força o Antigravity (Gemini)."
@@ -424,6 +424,16 @@ def load_config() -> dict:
                       "automática do Copilot deixou de ser grátis (jun/2026). Use /agentes "
                       "trocar pra ajustar.[/dim]")
         needs_save = True
+
+    # Antigravity: modelo que o `agy models` atual não lista mais. Troca pelo
+    # default do CLI novo; a lista ao vivo entra em _fetch_agy_models.
+    for bucket in (cfg.get("roles", {}), cfg.get("workers", {})):
+        for entry in bucket.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("binary") == "agy" and entry.get("model") in _RETIRED_AGY_MODELS:
+                entry["model"] = _current_agy_model(entry.get("model") or "")
+                needs_save = True
 
     # Garante que a seção ui existe e tem 'detail'
     if "ui" not in cfg:
@@ -1009,12 +1019,14 @@ def _store_lesson(project_id: str | None, category: str, text: str, source: str 
                         "UPDATE lessons SET weight = weight + 1, use_count = use_count + 1, last_used_at = ? WHERE id = ?",
                         (now, existing[0]),
                     )
+                    lid = existing[0]
                 else:
-                    conn.execute(
+                    cur = conn.execute(
                         "INSERT INTO lessons (project_id, category, text, source, weight, created_at, last_used_at, use_count) "
                         "VALUES (?, ?, ?, ?, 1.0, ?, ?, 0)",
                         (project_id, category, text, source, now, now),
                     )
+                    lid = cur.lastrowid
                     conn.execute(
                         "DELETE FROM lessons WHERE project_id IS ? AND id NOT IN ("
                         "  SELECT id FROM lessons WHERE project_id IS ? ORDER BY weight DESC, last_used_at DESC LIMIT 200"
@@ -1022,10 +1034,54 @@ def _store_lesson(project_id: str | None, category: str, text: str, source: str 
                         (project_id, project_id),
                     )
                 conn.commit()
+                return lid
             finally:
                 conn.close()
     except sqlite3.Error:
-        pass
+        return None
+
+
+def store_project_lesson(text: str, category: str = "projeto", project_id: str | None = None) -> int | None:
+    """Interface pública para gravar uma lição aprendida no projeto. Retorna o ID da lição."""
+    pid = project_id or get_project_id()
+    return _store_lesson(pid, category, text, source="manual")
+
+
+def list_project_lessons(project_id: str | None = None) -> list[dict]:
+    """Retorna a lista de lições gravadas para o projeto atual e globais."""
+    pid = project_id or get_project_id()
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                rows = conn.execute(
+                    "SELECT id, category, text, weight, use_count, created_at FROM lessons "
+                    "WHERE project_id IS ? OR project_id IS NULL ORDER BY id DESC LIMIT 50",
+                    (pid,)
+                ).fetchall()
+                return [
+                    {"id": r[0], "category": r[1], "text": r[2], "weight": r[3], "use_count": r[4], "created_at": r[5]}
+                    for r in rows
+                ]
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        return []
+
+
+def delete_project_lesson(lesson_id: int) -> bool:
+    """Remove uma lição por id."""
+    try:
+        with _memory_db_lock:
+            conn = sqlite3.connect(MEMORY_DB_FILE)
+            try:
+                cur = conn.execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+    except sqlite3.Error:
+        return False
 
 
 _LESSON_RE = re.compile(r'\n?LI[ÇC][ÃA]O:\s*(.+)', re.IGNORECASE)
@@ -1097,7 +1153,22 @@ def _load_memory_context(project_id: str, max_chars: int = 1500) -> str:
                         continue
                     perf_lines.append(f"- {agent_tag}: {counts['success']}/{total} sucessos em tarefas de '{task_kind}'")
 
+                # Diretrizes persistentes do projeto em arquivo markdown
+                doc_lines = []
+                try:
+                    pdir = Path(get_project_dir())
+                    for candidate in (pdir / ".orquestra" / "aprendizado.md", pdir / "APRENDIZADO.md"):
+                        if candidate.exists() and candidate.is_file():
+                            c_text = candidate.read_text(encoding="utf-8", errors="replace").strip()
+                            if c_text:
+                                doc_lines.append(f"Diretrizes persistentes ({candidate.name}):\n{c_text[:1200]}")
+                                break
+                except Exception:
+                    pass
+
                 parts = []
+                if doc_lines:
+                    parts.extend(doc_lines)
                 if lines:
                     parts.append("Lições aprendidas em sessões anteriores:\n" + "\n".join(lines))
                 if perf_lines:
@@ -1130,7 +1201,7 @@ def handle_safe_exit(config: dict):
                 
                 try:
                     result = subprocess.run(
-                        ["agy", "--model", "gemini-3.1-pro-high", "-p", prompt],
+                        ["agy", "-p", prompt],
                         capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
                     )
                 except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
@@ -1685,35 +1756,81 @@ _CODEX_FALLBACK = [
     ("gpt-5-mini",    "gpt-5-mini        (5 Mini — Rápido)"),
 ]
 
+# Ids que o `agy models` desta máquina deixou de listar. Config antiga que
+# ainda aponta pra eles é reescrita pro default atual em load_config.
+# id antigo → id que o `agy models` desta versão ainda lista.
+# Confirmado em 2026-10-19: claude-opus-4-6-thinking é rejeitado pelo CLI 1.4.2.
+_RETIRED_AGY_MODELS = {
+    "gemini-3.1-pro-high": "gemini-4-argon-high",
+    "gemini-3.1-pro-low": "gemini-4-argon-low",
+    "gemini-3.6-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.6-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.6-flash-low": "gemini-3.8-flash-low",
+    "gemini-3.7-flash-high": "gemini-3.8-flash-high",
+    "gemini-3.7-flash-medium": "gemini-3.8-flash-medium",
+    "gemini-3.7-flash-low": "gemini-3.8-flash-low",
+    "claude-opus-4-6-thinking": "claude-opus-5-5-high",
+    "claude-sonnet-4-6": "claude-sonnet-5-5-high",
+}
+_AGY_DEFAULT_MODEL = "gemini-4-argon-high"
+
+
+def _current_agy_model(model: str) -> str:
+    """Troca um id que o Antigravity instalado não reconhece mais pelo sucessor."""
+    return _RETIRED_AGY_MODELS.get((model or "").strip(), model)
+
 _AGY_FALLBACK = [
+    ("gemini-4-argon-high",      "Gemini 4 Argon (High)"),
+    ("gemini-4-argon-medium",    "Gemini 4 Argon (Medium)"),
+    ("gemini-4-argon-low",       "Gemini 4 Argon (Low)"),
     ("gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)"),
     ("gemini-3.8-flash-medium",  "Gemini 3.8 Flash (Medium)"),
     ("gemini-3.8-flash-low",     "Gemini 3.8 Flash (Low)"),
-    ("gemini-3.7-flash-high",    "Gemini 3.7 Flash (High)"),
-    ("gemini-3.7-flash-medium",  "Gemini 3.7 Flash (Medium)"),
-    ("gemini-3.7-flash-low",     "Gemini 3.7 Flash (Low)"),
-    ("gemini-3.6-flash-high",    "Gemini 3.6 Flash (High)"),
-    ("gemini-3.6-flash-medium",  "Gemini 3.6 Flash (Medium)"),
-    ("gemini-3.6-flash-low",     "Gemini 3.6 Flash (Low)"),
-    ("gemini-3.1-pro-high",      "Gemini 3.1 Pro (High)"),
-    ("gemini-3.1-pro-low",       "Gemini 3.1 Pro (Low)"),
-    ("claude-sonnet-4-6",        "Claude Sonnet 4.6 (Thinking)"),
-    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+    ("claude-opus-5-5-high",     "Claude Opus 5.5 (High) — via Antigravity"),
+    ("claude-sonnet-5-5-high",   "Claude Sonnet 5.5 (High) — via Antigravity"),
     ("gpt-oss-120b-medium",      "GPT-OSS 120B (Medium)"),
 ]
 
-def _fetch_agy_models() -> list[tuple[str, str]]:
-    """Busca os modelos disponíveis no Antigravity em tempo real."""
-    try:
-        result = subprocess.run(["agy", "--list-models"], capture_output=True, text=True, timeout=10)
-        models = []
-        for line in result.stdout.splitlines():
+# Preenchido por _fetch_agy_models com o que o binário logado listou agora.
+_AGY_LIVE_IDS: set[str] = set()
+
+def _parse_agy_models_text(text: str) -> list[tuple[str, str]]:
+    """Lê a saída de `agy models` (id<TAB>rótulo, uma linha por modelo).
+
+    O CLI 1.4.x tirou `--list-models`. Linha de status ("Fetching...") e
+    log vão fora; só entra linha com um id sem espaço."""
+    models = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.lower().startswith("fetching"):
+            continue
+        if "\t" in line:
+            model_id, label = line.split("\t", 1)
+        else:
             parts = line.split(maxsplit=1)
-            if len(parts) == 2:
-                model_id, label = parts[0].strip(), parts[1].strip()
-                if model_id and label and model_id != "Fetching":
-                    models.append((model_id, f"{label:<45} ({model_id})"))
+            if len(parts) != 2:
+                continue
+            model_id, label = parts
+        model_id, label = model_id.strip(), label.strip()
+        if not model_id or not label or " " in model_id:
+            continue
+        models.append((model_id, f"{label:<45} ({model_id})"))
+    return models
+
+
+def _fetch_agy_models() -> list[tuple[str, str]]:
+    """Modelos do Antigravity logado nesta máquina, via o binário `agy` do PATH.
+
+    Atualizar o programa (`agy update`) passa a valer no próximo arranque:
+    a lista não fica gravada no código."""
+    try:
+        result = subprocess.run(
+            ["agy", "models"], capture_output=True, text=True, timeout=20,
+        )
+        models = _parse_agy_models_text(result.stdout)
         if models:
+            _AGY_LIVE_IDS.clear()
+            _AGY_LIVE_IDS.update(m_id.lower() for m_id, _lbl in models)
             return models
     except Exception:
         pass
@@ -2619,6 +2736,9 @@ def _narrate_claude_line(line: str, section: "LiveSection", state: dict, detail:
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
 
     etype = d.get("type")
@@ -2703,6 +2823,9 @@ def _narrate_agy_line(line: str, section: "LiveSection", state: dict, detail: st
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
 
     event = d.get("event")
@@ -2785,6 +2908,9 @@ def _narrate_codex_line(line: str, section: "LiveSection", state: dict, detail: 
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
 
     ev_type = d.get("type", "")
@@ -2844,6 +2970,9 @@ def _narrate_muse_line(line: str, section: "LiveSection", state: dict, detail: s
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
 
     payload_type = d.get("payload_type", "")
@@ -2893,6 +3022,9 @@ def _narrate_opencode_line(line: str, section: "LiveSection", state: dict, detai
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
 
     ev_type = d.get("type", "")
@@ -2942,6 +3074,7 @@ def _build_orchestrator_cmd(role: dict, prompt: str) -> tuple:
     if binary == "agy":
         cmd = ["agy", "-p", prompt, "--output-format", "stream-json",
                "--mode", "plan", "--add-dir", get_project_dir()]
+        model = _current_agy_model(model or "")
         if model:
             cmd.extend(["--model", model])
         return cmd, "agy", None
@@ -3021,15 +3154,15 @@ Hoje é {agora}. O projeto está na pasta '{cwd}' (sua equipe já tem acesso tot
 SUA EQUIPE (você aciona com a tag <DELEGATE>)
 - binary="operador"    → EXECUTA: lê o código, escreve, altera, roda comandos, cria
                           arquivos. É ele quem "analisa o projeto" quando o usuário pede.
-- binary="revisor"     → REVISA: caça bugs, avalia arquitetura e segurança de um
-                          trecho de código ou de um diff. USO RESTRITO: só delegue
-                          pro revisor quando o USUÁRIO pedir isso explicitamente
-                          ("revisa isso", "quer dar uma olhada", "segunda opinião",
-                          "chama o revisor"). Nunca encadeie revisor sozinho depois
-                          do operador "por precaução" — ele roda numa API paga por
-                          uso (custo real por chamada), diferente do resto da
-                          equipe. Terminar uma tarefa do operador SEM revisor é o
-                          comportamento padrão.
+- binary="revisor"     → REVISA E SEGUNDA OPINIÃO: audita código, caça bugs, avalia
+                          arquitetura e segurança. DIRETRIZ MULTI-MODELOS: você NÃO deve
+                          decidir arquitetura ou mudanças críticas sozinho. Sempre que
+                          precisar validar uma abordagem técnica, auditar entregas complexas
+                          do operador, planejar infraestrutura ou ponderar riscos, BUSQUE
+                          ativamente a ajuda e o parecer do Revisor (e de outros modelos).
+                          Deliberem juntos: peçam opiniões mútuas para decidir com a
+                          inteligência combinada de múltiplos modelos, trazendo uma decisão
+                          mais sólida e confiável para o usuário.
 - binary="open-design" → gera uma PRÉVIA VISUAL real (renderizada e navegável) de uma
                           mudança de interface.
 O Cão de Guarda roda sozinho depois de cada edição — você não precisa acioná-lo, e ele
@@ -3059,6 +3192,10 @@ COMO VOCÊ TRABALHA
    aquilo". Leia o que eles produziram (e os arquivos que tocaram), forme opinião
    própria e siga a conversa — o que você faria a seguir, o que priorizaria primeiro
    e por quê, o que ainda te preocupa. O usuário quer teu raciocínio, não um relatório.
+5. Decisão Multi-Modelos e Colaboração Contínua:
+   Você é o estrategista, mas não decide no vácuo. Sempre que houver dúvidas arquiteturais,
+   avaliações de segurança, infraestrutura ou entregas importantes, consulte o Revisor
+   para confrontar ideias, validar hipóteses e decidirem juntos com mais modelos.
 
 FORMATO
 <PLANO>
@@ -3241,6 +3378,9 @@ def _capture_orchestrator_result(line: str, kind: str, state: dict):
     try:
         d = json.loads(line)
     except (json.JSONDecodeError, ValueError):
+        # Claude às vezes cospe erros da API em texto puro no stdout (ex: API Error: 500)
+        if "error" in line.lower() or "500" in line or "fail" in line.lower():
+            state["raw_error"] = line
         return
     if kind == "agy":
         if d.get("event") == "step_update":
@@ -3409,7 +3549,8 @@ def _run_orchestrator_stream(cmd: list, env: dict, binary: str, section: "LiveSe
 def _orchestrator_react(config: dict, event_label: str, raw_result: str,
                          section: "LiveSection | None" = None,
                          has_pending_changes: bool = False,
-                         changed_files: "list[str] | None" = None) -> str:
+                         changed_files: "list[str] | None" = None,
+                         allow_dispatch: bool = False) -> str:
     """Modo chat: depois que um operário termina, pede pro próprio orquestrador
     comentar o resultado em linguagem simples e dar continuidade à conversa,
     em vez de só despejar a resposta crua + uma linha fixa. Retorna "" (string
@@ -3448,6 +3589,15 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
             "Você está em read-only: se precisar de contexto pra opinar com propriedade, "
             "abra os arquivos relevantes antes de responder.\n"
         )
+
+    if allow_dispatch and not has_pending_changes:
+        dispatch_hint = (
+            "Se houver mais tarefas pendentes do plano atual que precisam ser executadas agora "
+            "(ex: você as dividiu passo a passo), você PODE emitir um bloco <DELEGATE> ou <PIPELINE> "
+            "no final da sua fala para dar continuidade automaticamente.\n"
+        )
+    else:
+        dispatch_hint = "Responda só com o texto da sua fala, sem tags <DELEGATE> e sem formatação especial.\n"
     prompt = (
         f"Você é o Orquestra, o estrategista do projeto '{projeto}'. Você pediu para "
         f"{event_label} executar uma tarefa e ele acabou de responder com isto:\n\n"
@@ -3461,7 +3611,7 @@ def _orchestrator_react(config: dict, event_label: str, raw_result: str,
         "uma. Não repita o resultado inteiro e não termine com a pergunta genérica "
         "\"quer ajustar algo ou seguir para outra coisa?\" — proponha o próximo passo você mesmo. "
         f"{aprovacao_hint}"
-        "Responda só com o texto da sua fala, sem tags e sem formatação especial.\n\n"
+        f"{dispatch_hint}\n"
         "Se (e SÓ se) esse resultado revelar algo genuinamente reutilizável no futuro — uma "
         "preferência clara do usuário, um fato específico do projeto, ou uma lição sobre o que "
         "funcionou/não funcionou — termine sua resposta numa linha própria, à parte, no formato "
@@ -3599,6 +3749,9 @@ def _run_worker_headless(cmd: list, env: dict, cwd: str, section: "LiveSection",
 
     if state["is_error"]:
         stderr_detail = "".join(stderr_lines[-40:]).strip()
+        raw_err = state.get("raw_error", "")
+        if not stderr_detail and raw_err:
+            stderr_detail = raw_err
         # Codex reporta o erro de verdade no stdout (JSON), não no stderr —
         # sem isso, o erro chegaria em tela como "(sem detalhes de stderr)"
         # mesmo já sabendo a causa real (capturada em final_text pelo parser).
@@ -3683,11 +3836,18 @@ def engine_for_model(model_id: str) -> dict:
     m = (model_id or "").lower().strip()
     if not m:
         return {}
-    # Modelos nativos do Antigravity CLI (Gemini, Claude Thinking e GPT-OSS via conta Google AI)
+    # Modelos servidos pelo Antigravity CLI (conta Google), não pelo Claude Code.
+    # claude-opus-5 / claude-sonnet-5 continuam no binário `claude`. Os ids
+    # claude-*-5-5-* são o mesmo nome hospedado no `agy` (listado por `agy models`).
     _AGY_MODELS = (
-        "gemini", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium"
+        "gemini",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "gpt-oss-120b",
     )
-    if any(m.startswith(p) for p in _AGY_MODELS) or "gemini" in m:
+    if m in _AGY_LIVE_IDS or any(m.startswith(p) for p in _AGY_MODELS) or "gemini" in m:
         return {"binary": "agy", "model": model_id}
     if "openrouter" in m:
         return {"binary": "opencode", "model": model_id}
@@ -3764,7 +3924,160 @@ def _resolve_worker(config: dict, target_binary_tag: str) -> tuple:
     )
 
 
-def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_only: bool = False) -> tuple:
+
+_WORKER_SESSIONS_MEM: dict[str, dict[str, str]] = {}
+
+def _get_worker_session_file(project_id: str | None = None) -> Path:
+    """Retorna o caminho do arquivo de estado de sessões do projeto."""
+    pid = project_id or get_project_id()
+    clean_pid = re.sub(r'[^a-zA-Z0-9_-]', '_', pid)
+    try:
+        pdir = Path(get_project_dir())
+        if pdir.exists() and os.access(pdir, os.W_OK):
+            return pdir / f".orquestra_sessions_{clean_pid}.json"
+    except Exception:
+        pass
+    return Path.home() / f".orquestra_sessions_{clean_pid}.json"
+
+def get_worker_session(role: str, project_id: str | None = None) -> str | None:
+    """Lê o session_id ativo para o papel no projeto (disco ou memória)."""
+    pid = project_id or get_project_id()
+    r = role.lower().strip()
+    try:
+        f = _get_worker_session_file(pid)
+        if f.exists():
+            data = json.loads(f.read_text(encoding="utf-8"))
+            val = data.get(r)
+            if val:
+                return val
+    except Exception:
+        pass
+    return _WORKER_SESSIONS_MEM.get(pid, {}).get(r)
+
+def set_worker_session(role: str, session_id: str, project_id: str | None = None) -> None:
+    """Salva o session_id ativo para o papel no projeto (disco e memória)."""
+    pid = project_id or get_project_id()
+    r = role.lower().strip()
+    _WORKER_SESSIONS_MEM.setdefault(pid, {})[r] = session_id
+    try:
+        f = _get_worker_session_file(pid)
+        data = {}
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data[r] = session_id
+        f.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def reset_worker_session(role: str | None = None, project_id: str | None = None) -> None:
+    """Reseta a sessão do papel (ou de todos os papéis) do projeto."""
+    pid = project_id or get_project_id()
+    if role:
+        r = role.lower().strip()
+        if pid in _WORKER_SESSIONS_MEM:
+            _WORKER_SESSIONS_MEM[pid].pop(r, None)
+    else:
+        _WORKER_SESSIONS_MEM.pop(pid, None)
+    try:
+        f = _get_worker_session_file(pid)
+        if f.exists():
+            if role:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                data.pop(role.lower().strip(), None)
+                f.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            else:
+                f.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+_LAST_WORKER_PROMPTS: dict[str, dict[str, str]] = {}
+
+def set_last_worker_prompt(role: str, prompt: str, project_id: str | None = None) -> None:
+    """Registra a última instrução/prompt enviada para um papel específico."""
+    pid = project_id or get_project_id()
+    r = role.lower().strip()
+    _LAST_WORKER_PROMPTS.setdefault(pid, {})[r] = prompt
+
+def get_last_worker_prompt(role: str, project_id: str | None = None) -> str:
+    """Recupera a última instrução/prompt enviada para um papel específico."""
+    pid = project_id or get_project_id()
+    r = role.lower().strip()
+    return _LAST_WORKER_PROMPTS.get(pid, {}).get(r, "")
+
+def build_interactive_worker_cmd(
+    role: str,
+    config: dict | None = None,
+    session_id: str | None = None,
+    model: str = "",
+    project_id: str = "",
+    resume: bool = False,
+) -> tuple[list[str], dict[str, str], str]:
+    """Monta o comando para executar o agente de forma interativa no terminal embutido.
+
+    Retorna (cmd, worker_env, actual_binary).
+    Por padrão (resume=False), inicia o agente limpo (sem despejar tarefas passadas),
+    pronto para o usuário digitar e conversar.
+    Se resume=True e houver session_id ativa, retoma a sessão anterior.
+    """
+    if config is None:
+        config = load_config()
+    canon = _WORKER_ALIASES.get(role.lower().strip(), role.lower().strip())
+    worker_cfg, actual_binary, label, icon, color = _resolve_worker(config, canon)
+    worker_cfg = dict(worker_cfg)
+    if model:
+        worker_cfg = apply_model_to_worker(worker_cfg, model)
+        actual_binary = worker_cfg.get("binary", actual_binary)
+
+    worker_model = worker_cfg.get("model", "")
+    worker_env_file = worker_cfg.get("env_file", "")
+
+    if session_id is None:
+        session_id = get_worker_session(canon, project_id=project_id)
+
+    if actual_binary == "claude":
+        cmd = ["claude"]
+        _m = (worker_model or "").lower()
+        if worker_model and (_m.startswith("claude") or _m.startswith("deepseek")):
+            cmd.extend(["--model", worker_model])
+        if resume and session_id:
+            cmd.extend(["--resume", session_id])
+    elif actual_binary == "codex":
+        if resume and session_id:
+            cmd = ["codex", "resume", session_id]
+        else:
+            cmd = ["codex", "--sandbox", "workspace-write"]
+            if worker_model:
+                cmd.extend(["-m", worker_model])
+    elif actual_binary == "muse":
+        if resume and session_id:
+            cmd = ["muse", "resume", session_id]
+        else:
+            cmd = ["muse"]
+            if worker_model:
+                cmd.extend(["--model", worker_model])
+    elif actual_binary == "agy":
+        cmd = ["agy"]
+        if resume and session_id:
+            cmd.extend(["--continue"])
+        worker_model = _current_agy_model(worker_model or "")
+        if worker_model:
+            cmd.extend(["--model", worker_model])
+    else:
+        cmd = [actual_binary]
+
+    worker_env = {}
+    if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
+        worker_env.update(load_env_file(worker_env_file))
+    if actual_binary == "claude":
+        worker_env["CLAUDE_CODE_NO_FLICKER"] = "1"
+
+    return cmd, worker_env, actual_binary
+
+def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_only: bool = False,
+                      session_id: str | None = None, resume_session: bool = False) -> tuple:
     """Monta o comando headless e o env pra rodar um operário — mesma lógica pra
     chamada solta (<DELEGATE>) ou dentro de um <PIPELINE>. Retorna
     (cmd, worker_env, output_file) — output_file é None pra claude/agy (o texto
@@ -3781,6 +4094,16 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
     worker_model = worker.get("model", "")
     worker_env_file = worker.get("env_file", "")
     output_file = None
+    # Diretriz de aguardo ativo em processos assíncronos
+    wait_directive = (
+        "\n\n[DIRETRIZ DE AGUARDO DE SERVIDORES / BUILDS / PROCESSOS ASSÍNCRONOS]:\n"
+        "Se a tarefa envolver build (ex: docker build), subida de container, servidor ou processo "
+        "assíncrono demorado, NÃO encerre sua resposta antes de obter a resposta real. "
+        "Monitore o processo ativamente (via loop de polling, checagem periódica de logs ou "
+        "aguardando o término da execução) até ter o resultado definitivo de sucesso ou erro."
+    )
+    instruction = instruction + wait_directive
+
 
     if actual_binary == "agy":
         # SEM --project: com --project, o agy opera no workspace-brain dele
@@ -3791,8 +4114,11 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
         cmd = ["agy", "-p", instruction, "--output-format", "stream-json"]
         cmd += ["--mode", "plan"] if read_only else ["--dangerously-skip-permissions"]
         cmd += ["--add-dir", get_project_dir()]
+        worker_model = _current_agy_model(worker_model or "")
         if worker_model:
             cmd.extend(["--model", worker_model])
+        if session_id and resume_session:
+            cmd.extend(["--continue"])
     elif actual_binary == "codex":
         fd, output_file = tempfile.mkstemp(prefix="orquestra_codex_", suffix=".txt")
         os.close(fd)
@@ -3819,10 +4145,17 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
             "abaixo de verdade (editar/criar arquivos, rodar comandos) — não pergunte "
             "confirmação, você já foi autorizado a agir. Ao terminar, resuma o que fez.\n\n"
         )
-        cmd = ["codex", "exec", papel + instruction,
-               "--json", "--sandbox", sandbox,
-               "--skip-git-repo-check",
-               "-o", output_file]
+        if session_id and resume_session:
+            cmd = ["codex", "exec", "resume", session_id,
+                   papel + instruction,
+                   "--json", "--sandbox", sandbox,
+                   "--skip-git-repo-check",
+                   "-o", output_file]
+        else:
+            cmd = ["codex", "exec", papel + instruction,
+                   "--json", "--sandbox", sandbox,
+                   "--skip-git-repo-check",
+                   "-o", output_file]
         if worker_model:
             cmd.extend(["-m", worker_model])
     elif actual_binary == "muse":
@@ -3835,8 +4168,12 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
         # skills do projeto, essa lacuna reabre e precisa do mesmo tratamento.
         # --approval-mode never evita ele travar esperando aprovação que
         # nunca chega (não tem terminal interativo do outro lado do pipe).
-        cmd = ["muse", "exec", instruction, "--json",
-               "--approval-mode", "never", "--reasoning-effort", _muse_reasoning_effort(worker_model)]
+        if session_id and resume_session:
+            cmd = ["muse", "resume", session_id, instruction, "--json",
+                   "--approval-mode", "never", "--reasoning-effort", _muse_reasoning_effort(worker_model)]
+        else:
+            cmd = ["muse", "exec", instruction, "--json",
+                   "--approval-mode", "never", "--reasoning-effort", _muse_reasoning_effort(worker_model)]
         if read_only:
             cmd += ["--disable-write", "--disable-shell"]
     elif actual_binary == "copilot":
@@ -3869,6 +4206,11 @@ def _build_worker_cmd(worker: dict, actual_binary: str, instruction: str, read_o
         _m = (worker_model or "").lower()
         if worker_model and (_m.startswith("claude") or _m.startswith("deepseek") or actual_binary == "claude"):
             cmd.extend(["--model", worker_model])
+        if session_id:
+            if resume_session:
+                cmd.extend(["--resume", session_id])
+            else:
+                cmd.extend(["--session-id", session_id])
 
     worker_env = os.environ.copy()
     if worker_env_file and Path(os.path.expanduser(worker_env_file)).exists():
@@ -3948,6 +4290,7 @@ def watchdog_verdict(config: dict, cwd: str = None, file_path: str = None) -> tu
     alvo = ("As mudanças não-commitadas do projeto estão abaixo."
             if modo == "diff" else
             "O conteúdo abaixo é um arquivo (não há git pra comparar com a versão anterior).")
+
     prompt = (
         f"Você é o Cão de Guarda, revisor de código. {alvo} Você PODE ler outros arquivos "
         "do repositório (quem chama as funções alteradas, arquivos vizinhos, testes) pra "
@@ -4230,7 +4573,18 @@ def _run_pipeline(config: dict, steps: list, chat_mode: bool, detail: str):
 
         console.print(f"[dim]🔗 Pipeline — etapa {idx}/{total}: {label}[/dim]")
 
-        cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, full_instruction)
+        canon = _WORKER_ALIASES.get(tag.lower().strip(), tag.lower().strip())
+        set_last_worker_prompt(canon, full_instruction)
+        active_sess = get_worker_session(canon)
+        is_resume_worker = bool(active_sess)
+        if not active_sess:
+            import uuid
+            active_sess = str(uuid.uuid4())
+            set_worker_session(canon, active_sess)
+        cmd, worker_env, output_file = _build_worker_cmd(
+            worker, actual_binary, full_instruction,
+            session_id=active_sess, resume_session=is_resume_worker
+        )
         section = LiveSection(label, icon, color)
         section.open()
         
@@ -4784,14 +5138,16 @@ def main():
                 console.print()
 
         elif low in ("/limpar-chat", "/clear-chat", "/reset-chat"):
+            reset_worker_session(project_id=get_project_id())
             active_role = config.get("active_role", "")
             chat_file = get_chat_file(active_role)
             session_file = CHAT_HISTORY_DIR / f"{active_role}.session"
             if chat_file.exists(): chat_file.unlink()
             if session_file.exists(): session_file.unlink()
-            console.print(f"[green]✓ Histórico do {active_role.capitalize()} apagado. Próxima conversa começa do zero.[/green]")
+            console.print(f"[green]✓ Histórico e sessões do {active_role.capitalize()} apagados. Próxima conversa começa do zero.[/green]")
 
         elif low in ("/limpar", "/clear", "clear"):
+            reset_worker_session(project_id=get_project_id())
             console.clear()
             print_banner()
 
@@ -5011,7 +5367,18 @@ def main():
                     # liberadas. Sem TTY pra confirmar nada em modo headless — sem bypass,
                     # o processo travaria esperando uma aprovação que nunca chega.
                     worker, actual_binary, label, icon, color = _resolve_worker(config, target_binary_tag)
-                    cmd, worker_env, output_file = _build_worker_cmd(worker, actual_binary, delegate_instruction)
+                    canon = _WORKER_ALIASES.get(target_binary_tag.lower().strip(), target_binary_tag.lower().strip())
+                    set_last_worker_prompt(canon, delegate_instruction)
+                    active_sess = get_worker_session(canon)
+                    is_resume_worker = bool(active_sess)
+                    if not active_sess:
+                        import uuid
+                        active_sess = str(uuid.uuid4())
+                        set_worker_session(canon, active_sess)
+                    cmd, worker_env, output_file = _build_worker_cmd(
+                        worker, actual_binary, delegate_instruction,
+                        session_id=active_sess, resume_session=is_resume_worker
+                    )
 
                     section = LiveSection(label, icon, color)
                     section.open()

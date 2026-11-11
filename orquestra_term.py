@@ -53,6 +53,73 @@ class _Screen(pyte.Screen):
     def __init__(self, columns: int, lines: int) -> None:
         super().__init__(columns, lines)
         self._saved: tuple | None = None
+        self._sco_cursor: tuple[int, int] | None = None
+        self._last_drawn_char: str | None = None
+
+    def draw(self, data: str) -> None:
+        if data:
+            self._last_drawn_char = data[-1]
+        super().draw(data)
+
+    def csi_save_cursor(self, *args, **kwargs) -> None:
+        """CSI s (SCOSC): Salva posição do cursor."""
+        self._sco_cursor = (self.cursor.x, self.cursor.y)
+        self.save_cursor()
+
+    def restore_cursor(self) -> None:
+        """Sobrescreve restore_cursor para evitar pular para (0, 0) quando pilha vazia."""
+        if self.savepoints:
+            super().restore_cursor()
+        elif getattr(self, "_sco_cursor", None) is not None:
+            self.cursor.x, self.cursor.y = self._sco_cursor
+            self.ensure_hbounds()
+            self.ensure_vbounds(use_margins=True)
+
+    def csi_restore_cursor(self, *args, **kwargs) -> None:
+        """CSI u (SCORC): Restaura posição do cursor salva por CSI s ou ESC 7."""
+        self.restore_cursor()
+
+    def scroll_up(self, count: int = 1, *args, **kwargs) -> None:
+        """CSI S (SU): Rola a tela `count` linhas para cima dentro das margens."""
+        count = max(1, count or 1)
+        top, bottom = self.margins or (0, self.lines - 1)
+        self.dirty.update(range(top, bottom + 1))
+        for y in range(top, bottom + 1):
+            if y + count <= bottom:
+                if y + count in self.buffer:
+                    self.buffer[y] = self.buffer.pop(y + count)
+                else:
+                    self.buffer.pop(y, None)
+            else:
+                self.buffer.pop(y, None)
+
+    def scroll_down(self, count: int = 1, *args, **kwargs) -> None:
+        """CSI T (SD): Rola a tela `count` linhas para baixo dentro das margens."""
+        count = max(1, count or 1)
+        top, bottom = self.margins or (0, self.lines - 1)
+        self.dirty.update(range(top, bottom + 1))
+        for y in range(bottom, top - 1, -1):
+            if y - count >= top:
+                if y - count in self.buffer:
+                    self.buffer[y] = self.buffer.pop(y - count)
+                else:
+                    self.buffer.pop(y, None)
+            else:
+                self.buffer.pop(y, None)
+
+    def repeat(self, count: int = 1, *args, **kwargs) -> None:
+        """CSI b (REP): Repete o último caractere desenhado `count` vezes."""
+        count = max(1, count or 1)
+        last_char = getattr(self, "_last_drawn_char", None)
+        if last_char:
+            super().draw(last_char * count)
+
+    def backtab(self, count: int = 1, *args, **kwargs) -> None:
+        """CSI Z (CBT): Volta o cursor para a parada de tabulação anterior."""
+        count = max(1, count or 1)
+        for _ in range(count):
+            stops = [s for s in sorted(self.tabstops) if s < self.cursor.x]
+            self.cursor.x = stops[-1] if stops else 0
 
     @property
     def in_alt_screen(self) -> bool:
@@ -88,6 +155,29 @@ class _Screen(pyte.Screen):
         self.cursor.x, self.cursor.y = x, y
         self.dirty.update(range(self.lines))
 
+    def form_feed(self) -> None:
+        """Form Feed (Ctrl+L / 0x0c): limpa tela inteira e move cursor para o topo."""
+        self.erase_in_display(2)
+        self.cursor_position()
+        self.dirty.update(range(self.lines))
+
+    def linefeed(self) -> None:
+        super().linefeed()
+        if self.cursor.x >= self.columns:
+            self.cursor.x = max(0, self.columns - 1)
+
+
+# Mapeia sequências básicas e CSI que o pyte original não inclui no dispatch
+pyte.Stream.basic["\x0c"] = "form_feed"
+pyte.Stream.csi.update({
+    "s": "csi_save_cursor",
+    "u": "csi_restore_cursor",
+    "S": "scroll_up",
+    "T": "scroll_down",
+    "b": "repeat",
+    "Z": "backtab",
+})
+
 
 def _ignore_private(name: str):
     base = getattr(pyte.Screen, name)
@@ -106,9 +196,10 @@ def _ignore_private(name: str):
 # o TypeError mata o gerador do parser e a aba para de atualizar. Aqui esses
 # handlers passam a ignorar a variante privada.
 for _name in {n for n in pyte.Stream.csi.values()}:
-    _params = inspect.signature(getattr(pyte.Screen, _name)).parameters
-    if "private" not in _params and not any(p.kind is p.VAR_KEYWORD for p in _params.values()):
-        setattr(_Screen, _name, _ignore_private(_name))
+    if hasattr(pyte.Screen, _name):
+        _params = inspect.signature(getattr(pyte.Screen, _name)).parameters
+        if "private" not in _params and not any(p.kind is p.VAR_KEYWORD for p in _params.values()):
+            setattr(_Screen, _name, _ignore_private(_name))
 
 
 # ── Teclas → bytes ────────────────────────────────────────────────────────────
@@ -187,16 +278,20 @@ class PtyTerminal(Widget, can_focus=True):
 
     DEFAULT_CSS = """
     PtyTerminal {
-        background: $background;
+        background: #0d1117;
         height: 1fr;
         width: 1fr;
     }
     """
 
-    def __init__(self, cwd: str | None = None, shell: str | None = None, **kwargs) -> None:
+    def __init__(self, cwd: str | None = None, shell: str | None = None,
+                 command: list[str] | str | None = None,
+                 env: dict[str, str] | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._cwd = cwd
         self._shell = shell
+        self._command = command
+        self._extra_env = dict(env) if env else {}
         self._proc = None
         self._fd: int | None = None
         self._screen: _Screen | None = None
@@ -214,8 +309,12 @@ class PtyTerminal(Widget, can_focus=True):
     def pid(self) -> int | None:
         return self._proc.pid if self._proc is not None else None
 
-    def start(self) -> None:
-        """Sobe o shell (idempotente). Se o widget ainda não tem tamanho, adia."""
+    def start(self, command: list[str] | str | None = None, env: dict[str, str] | None = None) -> None:
+        """Sobe o processo no PTY (idempotente). Se o widget ainda não tem tamanho, adia."""
+        if command is not None:
+            self._command = command
+        if env is not None:
+            self._extra_env = dict(env)
         if self.alive:
             return
         cols, rows = self.size.width, self.size.height
@@ -225,18 +324,30 @@ class PtyTerminal(Widget, can_focus=True):
         self._pending_start = False
         from ptyprocess import PtyProcess
 
-        shell = self._shell or os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
-        env = os.environ.copy()          # inclui as chaves que o vault injetou
-        env["TERM"] = "xterm-256color"
-        env["COLORTERM"] = "truecolor"
-        env.pop("COLUMNS", None)
-        env.pop("LINES", None)
+        spawn_cmd = self._command
+        if not spawn_cmd:
+            shell = self._shell or os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
+            spawn_cmd = [shell]
+        elif isinstance(spawn_cmd, str):
+            import shlex
+            spawn_cmd = shlex.split(spawn_cmd)
+        else:
+            spawn_cmd = list(spawn_cmd)
+
+        proc_env = os.environ.copy()          # inclui as chaves que o vault injetou
+        proc_env["TERM"] = "xterm-256color"
+        proc_env["COLORTERM"] = "truecolor"
+        proc_env["CLAUDE_CODE_NO_FLICKER"] = "1"
+        proc_env.pop("COLUMNS", None)
+        proc_env.pop("LINES", None)
+        if self._extra_env:
+            proc_env.update(self._extra_env)
 
         self._screen = _Screen(cols, rows)
         self._stream = pyte.ByteStream(self._screen)
         self._exit_code = None
         self._proc = PtyProcess.spawn(
-            [shell], cwd=self._cwd or os.getcwd(), env=env, dimensions=(rows, cols),
+            spawn_cmd, cwd=self._cwd or os.getcwd(), env=proc_env, dimensions=(rows, cols),
         )
         self._fd = self._proc.fd
         # O pyte responde a consultas do app (posição do cursor, DA) por aqui.
@@ -260,9 +371,19 @@ class PtyTerminal(Widget, can_focus=True):
             except Exception:
                 pass
 
-    def restart(self) -> None:
+    def restart(self, command: list[str] | str | None = None, env: dict[str, str] | None = None) -> None:
         self.stop()
-        self.start()
+        self.start(command=command, env=env)
+
+    def clear(self) -> None:
+        """Limpa a tela do terminal e reseta o buffer visual do emulador."""
+        if self._screen is not None:
+            self._screen.erase_in_display(2)
+            self._screen.cursor_position()
+            self._screen.dirty.update(range(self._screen.lines))
+        if self.alive:
+            self._write(b"\x0c")
+        self.refresh()
 
     def on_unmount(self) -> None:
         self.stop()
@@ -365,14 +486,19 @@ class PtyTerminal(Widget, can_focus=True):
             self.refresh()
 
     # ── desenho ──────────────────────────────────────────────────────────────
+    DEFAULT_BG = "#0d1117"
+
     def _style(self, ch, cursor: bool) -> Style:
         key = (ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough,
                ch.reverse, ch.blink, cursor)
         style = self._style_cache.get(key)
         if style is None:
+            bg_color = _color(ch.bg) or self.DEFAULT_BG
+            is_space = ch.data in (" ", "")
+            underline = ch.underscore and not is_space
             style = Style(
-                color=_color(ch.fg), bgcolor=_color(ch.bg), bold=ch.bold,
-                italic=ch.italics, underline=ch.underscore, strike=ch.strikethrough,
+                color=_color(ch.fg), bgcolor=bg_color, bold=ch.bold,
+                italic=ch.italics, underline=underline, strike=ch.strikethrough,
                 reverse=ch.reverse != cursor, blink=ch.blink,
             )
             self._style_cache[key] = style
@@ -382,7 +508,7 @@ class PtyTerminal(Widget, can_focus=True):
         width = self.size.width
         screen = self._screen
         if screen is None or y >= screen.lines:
-            return Strip.blank(width)
+            return Strip([Segment(" " * width, Style(bgcolor=self.DEFAULT_BG))])
         row = screen.buffer[y]
         show_cursor = self.has_focus and not screen.cursor.hidden and self.alive
         cx = screen.cursor.x if show_cursor and screen.cursor.y == y else -1
@@ -401,4 +527,7 @@ class PtyTerminal(Widget, can_focus=True):
                 run, run_style = ch.data, style
         if run:
             segments.append(Segment(run, run_style))
+        rendered_len = sum(len(s.text) for s in segments)
+        if rendered_len < width:
+            segments.append(Segment(" " * (width - rendered_len), Style(bgcolor=self.DEFAULT_BG)))
         return Strip(segments).adjust_cell_length(width)

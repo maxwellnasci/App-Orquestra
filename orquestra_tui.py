@@ -14,6 +14,7 @@ import threading
 import time
 import os
 from pathlib import Path
+from textual.events import MouseUp, Click, MouseDown, MouseMove
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, Container
 from textual.widgets import Label, Button, RichLog, TextArea, Markdown, OptionList, DirectoryTree, TabbedContent, TabPane, Input
@@ -273,6 +274,92 @@ class ChatInput(TextArea):
 
 # ─── Aplicação Principal ──────────────────────────────────────────────────────
 
+
+
+import webbrowser
+class ClickableTextArea(TextArea):
+    def on_mouse_up(self, event: MouseUp) -> None:
+        try:
+            if getattr(self, "selected_text", ""):
+                return
+            row, col = self.cursor_location
+            line = self.document.get_line(row)
+            import re
+            for m in re.finditer(r'https?://[^\s()\[\]{}\'">]+', line):
+                if m.start() <= col <= m.end():
+                    url = m.group().rstrip(".,;!?:")
+                    self.app.notify(f"Abrindo link no navegador...")
+                    webbrowser.open(url)
+                    break
+        except Exception:
+            pass
+
+
+import subprocess
+import shutil
+
+def copy_to_system_clipboard(text: str) -> bool:
+    """Copia diretamente para a área de transferência do sistema (X11 / Wayland / Linux)."""
+    if not text:
+        return False
+    try:
+        if shutil.which("xclip"):
+            for sel in ("clipboard", "primary"):
+                p = subprocess.Popen(["xclip", "-selection", sel], stdin=subprocess.PIPE)
+                p.communicate(input=text.encode("utf-8"))
+            return True
+        elif shutil.which("xsel"):
+            for flag in ("-b", "-p"):
+                p = subprocess.Popen(["xsel", flag, "-i"], stdin=subprocess.PIPE)
+                p.communicate(input=text.encode("utf-8"))
+            return True
+        elif shutil.which("wl-copy"):
+            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+            p.communicate(input=text.encode("utf-8"))
+            return True
+    except Exception:
+        pass
+    return False
+
+class VerticalDivider(Widget):
+    """Divisor vertical arrastável para redimensionar o painel lateral com o mouse."""
+    DEFAULT_CSS = """
+    VerticalDivider {
+        width: 1;
+        height: 1fr;
+        background: #30363d;
+        color: #8b949e;
+        display: none;
+    }
+    VerticalDivider.visible {
+        display: block;
+    }
+    VerticalDivider:hover {
+        background: #58a6ff;
+        color: #58a6ff;
+    }
+    """
+
+    def render(self) -> str:
+        return "│\n" * max(1, self.size.height)
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        self.capture_mouse()
+        self._dragging = True
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if getattr(self, "_dragging", False):
+            screen_width = self.app.size.width
+            new_width = max(20, min(screen_width - 30, screen_width - event.screen_x))
+            try:
+                self.app.query_one("#terminal-panel").styles.width = new_width
+            except Exception:
+                pass
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        self.release_mouse()
+        self._dragging = False
+
 class OrquestraTUI(App):
     """Interface Orquestra Terminal IDE v3.0"""
 
@@ -296,6 +383,7 @@ class OrquestraTUI(App):
         Binding("ctrl+up", "resize_chat(1)", "Chat maior", show=False),
         Binding("ctrl+down", "resize_chat(-1)", "Chat menor", show=False),
         Binding("ctrl+l", "focus_chat", "Foco no chat", show=False),
+        Binding("ctrl+y", "copy_code", "Copiar Código", show=False, priority=True),
         Binding("ctrl+k", "clear_activity", "Limpar Atividade", show=False),
     ]
 
@@ -458,11 +546,40 @@ class OrquestraTUI(App):
         background: $boost;
     }
 
-    #term-hint {
+    #term-hint, #operador-term-hint, #revisor-term-hint {
         height: 1;
         padding: 0 1;
         background: $boost;
         color: $text-muted;
+    }
+
+    .worker-term-toolbar {
+        height: 3;
+        background: #161b22;
+        border-bottom: solid #30363d;
+        padding: 0 1;
+        align: left middle;
+    }
+
+    .worker-status-lbl {
+        height: 1;
+        width: 1fr;
+        color: #58a6ff;
+        text-style: bold;
+    }
+
+    .term-btn {
+        min-width: 8;
+        height: 1;
+        margin: 0 1;
+        border: none;
+        background: #21262d;
+        color: #c9d1d9;
+    }
+
+    .term-btn:hover {
+        background: #30363d;
+        color: #58a6ff;
     }
 
     .hidden {
@@ -519,7 +636,7 @@ class OrquestraTUI(App):
         padding: 1;
     }
 
-    #action-bar, #plan-bar, #delegate-bar {
+    #action-bar, #plan-bar, #delegate-bar, #copy-bar {
         height: 3;
         layout: horizontal;
         align: center middle;
@@ -528,7 +645,7 @@ class OrquestraTUI(App):
         border-top: solid $primary-background;
     }
 
-    #action-bar.hidden, #plan-bar.hidden, #delegate-bar.hidden {
+    #action-bar.hidden, #plan-bar.hidden, #delegate-bar.hidden, #copy-bar.hidden {
         display: none;
     }
 
@@ -568,6 +685,20 @@ class OrquestraTUI(App):
     .action-btn {
         margin: 0 1;
         min-width: 18;
+    }
+
+    .mini-action-btn {
+        height: 1;
+        min-width: 15;
+        border: none;
+        background: #21262d;
+        color: #8b949e;
+        margin: 0 1;
+        padding: 0 1;
+    }
+    .mini-action-btn:hover {
+        background: #da3633;
+        color: white;
     }
 
     #terminal-panel {
@@ -638,6 +769,7 @@ class OrquestraTUI(App):
         # Pasta de onde o Orquestra foi aberto, fixada UMA vez (antes do compose): o
         # shell embutido e o Ctrl+O abrem sempre aqui, mesmo se algo mudar o cwd depois.
         self._launch_dir: str = os.getcwd()
+        self._current_running_worker: str | None = None
 
     def compose(self) -> ComposeResult:
         # ── Header ───────────────────────────────────────────────────────────
@@ -680,6 +812,8 @@ class OrquestraTUI(App):
                         id="idea-md",
                     )
 
+            yield VerticalDivider(id="main-divider")
+
             # ── Painel lateral direito (Ctrl+T): 📊 Logs dos agentes | 🖥 Shell ──
             # O shell fica ao lado da Atividade e acima do chat — dá pra
             # rodar `claude login`, `export KEY=...` ou abrir um agente na
@@ -690,7 +824,26 @@ class OrquestraTUI(App):
                     yield Button("✕", id="btn-close-side", tooltip="Fechar o painel (o shell continua vivo)")
                 with TabbedContent(id="side-tabs", initial="side-logs"):
                     with TabPane("📊 Logs", id="side-logs"):
-                        yield RichLog(id="terminal-log", markup=True, wrap=True, max_lines=8000)
+                        yield Label("💡 Selecione o texto e use Ctrl+C para copiar. Clique nos links para abrir o navegador!", id="side-logs-hint")
+                        yield ClickableTextArea(id="terminal-log", read_only=True, language="markdown")
+                    with TabPane("🤖 Operador", id="side-operador"):
+                        with Horizontal(classes="worker-term-toolbar"):
+                            yield Label("🤖 Operador", id="operador-status-lbl", classes="worker-status-lbl")
+                            yield Button("📊 Ver Logs", id="btn-logs-operador", classes="term-btn")
+                            yield Button("📋 Ver Prompt", id="btn-prompt-operador", classes="term-btn")
+                            yield Button("🧹 Limpar", id="btn-clear-operador", classes="term-btn")
+                            yield Button("⚡ Reconectar", id="btn-reconnect-operador", classes="term-btn")
+                            yield Button("🐚 Bash", id="btn-bash-operador", classes="term-btn")
+                        yield PtyTerminal(cwd=self._launch_dir, id="operador-term")
+                    with TabPane("🔍 Revisor", id="side-revisor"):
+                        with Horizontal(classes="worker-term-toolbar"):
+                            yield Label("🔍 Revisor", id="revisor-status-lbl", classes="worker-status-lbl")
+                            yield Button("📊 Ver Logs", id="btn-logs-revisor", classes="term-btn")
+                            yield Button("📋 Ver Prompt", id="btn-prompt-revisor", classes="term-btn")
+                            yield Button("🧹 Limpar", id="btn-clear-revisor", classes="term-btn")
+                            yield Button("⚡ Reconectar", id="btn-reconnect-revisor", classes="term-btn")
+                            yield Button("🐚 Bash", id="btn-bash-revisor", classes="term-btn")
+                        yield PtyTerminal(cwd=self._launch_dir, id="revisor-term")
                     with TabPane("🖥 Shell", id="side-shell"):
                         yield Label(
                             f"Shell real · todas as teclas vão pro shell · "
@@ -718,6 +871,12 @@ class OrquestraTUI(App):
             with Container(id="delegate-bar", classes="hidden"):
                 yield Button("▶ Rodar agora", id="btn-run-delegates", classes="action-btn", variant="success")
                 yield Button("✋ Cancelar", id="btn-cancel-delegates", classes="action-btn", variant="error")
+
+            # Barra de cópia rápida — aparece quando há código ou resposta do agente
+            with Container(id="copy-bar", classes="hidden"):
+                yield Button("📋 Copiar Código (Ctrl+Y)", id="btn-copy-code", classes="action-btn", variant="success")
+                yield Button("📋 Copiar Mensagem", id="btn-copy-all", classes="action-btn")
+                yield Button("✕ Fechar", id="btn-close-copy", classes="action-btn")
 
             yield Label("", id="status-indicator", classes="hidden")
             yield ChatInput(placeholder="Pergunte ao Orquestrador ou peça uma alteração... [Enter envia · Ctrl+J quebra linha]", id="chat-input")
@@ -819,6 +978,7 @@ class OrquestraTUI(App):
         self._stage_follow: bool = bool(cfg.get("ui", {}).get("stage_follow", True))
 
         self._update_usage_footer()
+        self._reset_watchdog_footer()
         self._refresh_changes_panel()  # mudança pendente de uma sessão anterior, se houver
         self._load_models_and_config()
 
@@ -827,23 +987,6 @@ class OrquestraTUI(App):
         """Carrega modelos de todos os provedores e config em background."""
         import asyncio
         import orquestra
-
-        _AGY_FALLBACK = [
-            ("gemini-3.8-flash-high",    "Gemini 3.8 Flash (High)"),
-            ("gemini-3.8-flash-medium",  "Gemini 3.8 Flash (Medium)"),
-            ("gemini-3.8-flash-low",     "Gemini 3.8 Flash (Low)"),
-            ("gemini-3.7-flash-high",    "Gemini 3.7 Flash (High)"),
-            ("gemini-3.7-flash-medium",  "Gemini 3.7 Flash (Medium)"),
-            ("gemini-3.7-flash-low",     "Gemini 3.7 Flash (Low)"),
-            ("gemini-3.6-flash-high",    "Gemini 3.6 Flash (High)"),
-            ("gemini-3.6-flash-medium",  "Gemini 3.6 Flash (Medium)"),
-            ("gemini-3.6-flash-low",     "Gemini 3.6 Flash (Low)"),
-            ("gemini-3.1-pro-high",      "Gemini 3.1 Pro (High)"),
-            ("gemini-3.1-pro-low",       "Gemini 3.1 Pro (Low)"),
-            ("claude-sonnet-4-6",        "Claude Sonnet 4.6 (Thinking)"),
-            ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
-            ("gpt-oss-120b-medium",      "GPT-OSS 120B (Medium)"),
-        ]
 
         loop = asyncio.get_running_loop()
         (orq_raw, claude_raw, copilot_raw, deepseek_raw, codex_raw, ollama_raw, opencode_raw, muse_raw) = await asyncio.gather(
@@ -858,7 +1001,7 @@ class OrquestraTUI(App):
         )
 
         if not orq_raw:
-            orq_raw = _AGY_FALLBACK
+            orq_raw = orquestra._AGY_FALLBACK
 
         # grouped_models: {empresa: [(label_display, value), ...]}
         self.grouped_models = {
@@ -1102,6 +1245,12 @@ class OrquestraTUI(App):
                 if selected and self._set_worker_model("operador", selected):
                     self._op_model = selected
                     event.button.label = f"Op: {shorten_name(selected)}"
+                    try:
+                        self.query_one("#operador-status-lbl", Label).update(
+                            f"🤖 Operador: {shorten_name(selected)} · {EXIT_KEY_LABEL} sai"
+                        )
+                    except Exception:
+                        pass
             self.push_screen(ModelSelectionModal("Operador — executa (precisa de ferramentas)", self._agent_models()), update_op)
 
         elif event.button.id == "btn-sel-rev":
@@ -1109,7 +1258,56 @@ class OrquestraTUI(App):
                 if selected and self._set_worker_model("revisor", selected):
                     self._rev_model = selected
                     event.button.label = f"Rev: {shorten_name(selected)}"
+                    try:
+                        self.query_one("#revisor-status-lbl", Label).update(
+                            f"🔍 Revisor: {shorten_name(selected)} · {EXIT_KEY_LABEL} sai"
+                        )
+                    except Exception:
+                        pass
             self.push_screen(ModelSelectionModal("Revisor — revisa (precisa de ferramentas)", self._agent_models()), update_rev)
+
+        elif event.button.id in ("btn-logs-operador", "btn-logs-revisor"):
+            try:
+                tabs = self.query_one("#side-tabs", TabbedContent)
+                tabs.active = "side-logs"
+                log_area = self.query_one("#terminal-log", ClickableTextArea)
+                self.set_timer(0.05, log_area.focus)
+            except Exception:
+                pass
+
+        elif event.button.id in ("btn-prompt-operador", "btn-prompt-revisor"):
+            role = "operador" if "operador" in event.button.id else "revisor"
+            import orquestra
+            prompt = orquestra.get_last_worker_prompt(role)
+            if prompt:
+                copy_to_system_clipboard(prompt)
+                self.copy_to_clipboard(prompt)
+                self.notify("✓ Prompt copiado para a área de transferência!")
+                self._feed_write(f"\n[bold yellow]📥 Último Prompt enviado ao {role.capitalize()}:[/bold yellow]\n{prompt}\n")
+            else:
+                self.notify("Nenhum prompt registrado ainda para este agente.")
+
+        elif event.button.id in ("btn-clear-operador", "btn-clear-revisor"):
+            role = "operador" if "operador" in event.button.id else "revisor"
+            term_id = f"{role}-term"
+            try:
+                term = self.query_one(f"#{term_id}", PtyTerminal)
+                term.clear()
+                self.notify(f"🧹 Tela do {role.capitalize()} limpa.")
+            except Exception:
+                pass
+
+        elif event.button.id in ("btn-reconnect-operador", "btn-reconnect-revisor"):
+            role = "operador" if "operador" in event.button.id else "revisor"
+            term_id = f"{role}-term"
+            self._launch_interactive_agent(role, term_id, force_restart=True)
+            self.notify(f"⚡ Sessão interativa do {role.capitalize()} reiniciada.")
+
+        elif event.button.id in ("btn-bash-operador", "btn-bash-revisor"):
+            role = "operador" if "operador" in event.button.id else "revisor"
+            term_id = f"{role}-term"
+            self._launch_interactive_agent(role, term_id, force_bash=True, force_restart=True)
+            self.notify(f"🐚 Shell Bash iniciado no {role.capitalize()}.")
 
         # Botões de aprovação do Operário
         elif event.button.id == "btn-approve":
@@ -1120,6 +1318,28 @@ class OrquestraTUI(App):
 
         elif event.button.id == "btn-review":
             self._handle_approval("review")
+
+        elif event.button.id == "btn-clear-plan-panel":
+            import orquestra
+            orquestra.reset_worker_session(project_id=orquestra.get_project_id())
+            self._clear_plan_panel()
+
+        elif event.button.id == "btn-copy-code":
+            self.action_copy_code()
+
+        elif event.button.id == "btn-copy-all":
+            if getattr(self, "_last_raw_text", ""):
+                copy_to_system_clipboard(self._last_raw_text)
+                self.copy_to_clipboard(self._last_raw_text)
+                self.notify("✓ Mensagem completa copiada para a área de transferência!")
+            else:
+                self.notify("Nenhuma mensagem recente para copiar.")
+
+        elif event.button.id == "btn-close-copy":
+            try:
+                self.query_one("#copy-bar").add_class("hidden")
+            except Exception:
+                pass
 
         elif event.button.id == "btn-exec-plan":
             self.query_one("#plan-bar").add_class("hidden")
@@ -1610,11 +1830,62 @@ class OrquestraTUI(App):
         import orquestra
         return orquestra.get_project_dir()
 
+    def _launch_interactive_agent(self, role: str, term_id: str, force_bash: bool = False, force_restart: bool = False, resume: bool = False) -> None:
+        """Inicia ou reconecta o terminal embutido com o agente configurado para o papel."""
+        import orquestra
+        try:
+            term = self.query_one(f"#{term_id}", PtyTerminal)
+        except Exception:
+            return
+
+        config = orquestra.load_config()
+        canon = orquestra._WORKER_ALIASES.get(role.lower().strip(), role.lower().strip())
+        chosen_model = self._rev_model if canon == "revisor" else (self._op_model if canon == "operador" else "")
+
+        sess = orquestra.get_worker_session(canon)
+        if force_bash:
+            cmd = [os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"]
+            env = {}
+            bin_name = "bash"
+        else:
+            cmd, env, bin_name = orquestra.build_interactive_worker_cmd(canon, config, session_id=sess, model=chosen_model, resume=resume)
+
+        # Atualiza a label da barra de ferramentas do terminal
+        status_lbl_id = f"{role}-status-lbl"
+        try:
+            icon = "🤖" if role == "operador" else "🔍"
+            is_running = (self._current_running_worker == canon)
+            if is_running:
+                info = f"{icon} {role.capitalize()}: {bin_name} · ⚙️ Trabalhando na tarefa (veja em Logs) · {EXIT_KEY_LABEL} sai"
+            else:
+                sess_info = f" [{sess[:8]}]" if (resume and sess) else ""
+                info = f"{icon} {role.capitalize()}: {bin_name}{sess_info} · {EXIT_KEY_LABEL} sai"
+            self.query_one(f"#{status_lbl_id}", Label).update(info)
+        except Exception:
+            pass
+
+        if term.alive and not force_restart:
+            term.focus()
+            return
+
+        if force_restart:
+            term.restart(command=cmd, env=env)
+        else:
+            term.start(command=cmd, env=env)
+        term.focus()
+
+    def _focus_named_term(self, term_id: str) -> None:
+        """Sobe o terminal especificado (na 1ª vez) e põe o foco nele."""
+        try:
+            term = self.query_one(f"#{term_id}", PtyTerminal)
+            term.start()
+            term.focus()
+        except Exception:
+            pass
+
     def _focus_embedded_term(self) -> None:
         """Sobe o shell (na 1ª vez) e põe o foco nele."""
-        term = self.query_one("#embedded-term", PtyTerminal)
-        term.start()
-        term.focus()
+        self._focus_named_term("embedded-term")
 
     def action_toggle_files(self) -> None:
         """Ctrl+B: mostra/oculta o painel Arquivos (mesmo efeito do botão)."""
@@ -1632,8 +1903,14 @@ class OrquestraTUI(App):
         """Ctrl+T ou botão: abre/fecha o painel lateral de monitor dos agentes (logs)."""
         panel = self.query_one("#terminal-panel")
         btn = self.query_one("#btn-terminal")
+        try:
+            divider = self.query_one("#main-divider")
+        except Exception:
+            divider = None
         if panel.has_class("visible"):
             panel.remove_class("visible")
+            if divider:
+                divider.remove_class("visible")
             btn.remove_class("active")
             btn.label = "📊 Logs"
             if self.focused is not None and panel in self.focused.ancestors_with_self:
@@ -1642,6 +1919,8 @@ class OrquestraTUI(App):
                 self.action_focus_chat()
         else:
             panel.add_class("visible")
+            if divider:
+                divider.add_class("visible")
             btn.add_class("active")
             btn.label = "📊 Logs [✓]"
 
@@ -1649,8 +1928,14 @@ class OrquestraTUI(App):
         """Abre o painel de terminal embutido automaticamente (chamado quando um agente começa)."""
         try:
             panel = self.query_one("#terminal-panel")
+            try:
+                divider = self.query_one("#main-divider")
+            except Exception:
+                divider = None
             if not panel.has_class("visible"):
                 panel.add_class("visible")
+                if divider:
+                    divider.add_class("visible")
                 btn = self.query_one("#btn-terminal")
                 btn.add_class("active")
                 btn.label = "📊 Logs [✓]"
@@ -1693,6 +1978,52 @@ class OrquestraTUI(App):
         no histórico salvo, só a narração ao vivo acumulada na tela."""
         self.query_one("#activity-log", RichLog).clear()
 
+    def action_copy_code(self) -> None:
+        """Copia os blocos de código mais recentes para a área de transferência (Ctrl+Y)."""
+        code = getattr(self, "_last_copied_code", "")
+        if code:
+            copy_to_system_clipboard(code)
+            self.copy_to_clipboard(code)
+            self.notify("✓ Código copiado com 1 clique! Cole com Ctrl+V.")
+        elif getattr(self, "_last_raw_text", ""):
+            copy_to_system_clipboard(self._last_raw_text)
+            self.copy_to_clipboard(self._last_raw_text)
+            self.notify("✓ Resposta copiada com 1 clique! Cole com Ctrl+V.")
+        else:
+            self.notify("Nenhum código recente detectado para copiar.")
+
+    def on_click(self, event: Click) -> None:
+        """Permite clicar em qualquer link (Markdown ou URL direta) para abrir no navegador."""
+        from textual.widgets import Tab, Tabs, Button, Input
+        from textual.widgets._tabbed_content import TabbedContent
+        if isinstance(event.widget, (ChatInput, Input, Button, Tab, Tabs, TabbedContent)):
+            return
+
+        # 1. Links em RichMarkdown (com style.link)
+        if event.style and getattr(event.style, "link", None):
+            url = event.style.link
+            import webbrowser
+            self.notify(f"Abrindo navegador...")
+            webbrowser.open(url)
+            return
+
+        # 2. URLs em texto puro em qualquer widget renderizado
+        try:
+            if hasattr(event.widget, "render_line"):
+                strip = event.widget.render_line(event.y)
+                line_text = strip.text
+                x = event.x
+                import re
+                for m in re.finditer(r'https?://[^\s()\[\]{}\'">]+', line_text):
+                    if m.start() <= x <= m.end():
+                        url = m.group().rstrip(".,;!?:")
+                        import webbrowser
+                        self.notify(f"Abrindo navegador...")
+                        webbrowser.open(url)
+                        return
+        except Exception:
+            pass
+
     # ── Chat: Recebe o Enter do usuário ───────────────────────────────────────
 
     def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
@@ -1703,22 +2034,89 @@ class OrquestraTUI(App):
 
         self.query_one("#chat-input", ChatInput).text = ""
 
+        # Se o usuário pedir para limpar ou encerrar tarefas anteriores:
+        p_lower = prompt.lower()
+        if any(w in p_lower for w in ("encerrar tudo", "encerre tudo", "encerra tudo", "limpar tarefas", "limpe as tarefas",
+                                      "limpar o plano", "limpe o plano", "cancelar tarefas", "cancela tudo", "apagar tarefas",
+                                      "resetar tarefas", "resetar plano", "limpar histórico", "limpar historico",
+                                      "limpa tudo", "limpar tudo", "limpar tarefa", "encerrar tarefa")):
+            import orquestra
+            orquestra.reset_worker_session(project_id=orquestra.get_project_id())
+            self._clear_plan_panel()
+
         if prompt.startswith("/"):
             self._handle_slash(prompt)
             return
 
         self._stage_show("stage-activity")
         self._feed_write(f"\n[bold bright_white]👤 Você:[/bold bright_white] {prompt}\n")
+        try:
+            self.query_one("#copy-bar").add_class("hidden")
+        except Exception:
+            pass
         self._reset_watchdog_footer()
         self._watchdog_followup_done = False
         self.query_one("#chat-input").disabled = True
         self._run_orchestrator(prompt)
 
     def _handle_slash(self, cmd: str) -> None:
-        """Comandos rápidos dentro da TUI (/senha, /modo, /detalhe, /design, /ajuda)."""
+        """Comandos rápidos dentro da TUI (/senha, /modo, /detalhe, /design, /ajuda, /limpar, /sessao)."""
         import orquestra, json, os
         parts = cmd.split()
         head = parts[0].lower()
+
+        if head in ("/limpar", "/clear", "/reset"):
+            orquestra.reset_worker_session(project_id=orquestra.get_project_id())
+            self._clear_plan_panel()
+            self._feed_write("\n[green]✓ Checklist de tarefas e sessões anteriores dos agentes limpos.[/green]\n")
+            return
+
+        if head in ("/sessao", "/sessoes", "/session", "/sessions"):
+            pid = orquestra.get_project_id()
+            op_sess = orquestra.get_worker_session("operador", project_id=pid) or "(nenhuma)"
+            rev_sess = orquestra.get_worker_session("revisor", project_id=pid) or "(nenhuma)"
+            self._feed_write(
+                f"\n[cyan]Sessões ativas em segundo plano:[/cyan]\n"
+                f"  • Operador: [bold]{op_sess}[/bold]\n"
+                f"  • Revisor:  [bold]{rev_sess}[/bold]\n"
+                f"[dim]Use '/limpar' para reiniciar as sessões dos agentes.[/dim]\n"
+            )
+            return
+
+        if head in ("/aprender", "/ensinar", "/learn"):
+            if len(parts) < 2:
+                self._feed_write("\n[dim]Uso: /aprender <regra, padrão ou instrução permanente>[/dim]\n"
+                                 "[dim]Exemplo: /aprender Use sempre Textual para UI e nunca use --session no agy[/dim]\n")
+                return
+            lesson_text = cmd.split(maxsplit=1)[1].strip()
+            lid = orquestra.store_project_lesson(lesson_text, category="usuario", project_id=orquestra.get_project_id())
+            self._feed_write(f"\n[green]🧠 Lição gravada na memória permanente [#{lid}]:[/green] {rich_escape(lesson_text)}\n"
+                             f"[dim]O Orquestrador consultará esta lição automaticamente em todas as próximas tarefas.[/dim]\n")
+            return
+
+        if head in ("/licoes", "/lições", "/memoria", "/memória", "/lessons"):
+            lessons = orquestra.list_project_lessons(project_id=orquestra.get_project_id())
+            if not lessons:
+                self._feed_write("\n[dim]Nenhuma lição gravada ainda para este projeto. Use `/aprender <texto>` para ensinar o Orquestrador.[/dim]\n")
+            else:
+                self._feed_write(f"\n[bold cyan]🧠 Lições e Regras Aprendidas ({len(lessons)}):[/bold cyan]\n")
+                for l in lessons:
+                    cat = f"[{l['category']}] " if l.get("category") else ""
+                    self._feed_write(f"  • [bold yellow]#{l['id']}[/bold yellow] {cat}{rich_escape(l['text'])}\n")
+                self._feed_write("[dim]Para remover uma lição obsoleta, use `/esquecer <id>`.[/dim]\n")
+            return
+
+        if head in ("/esquecer", "/forget"):
+            if len(parts) < 2 or not parts[1].isdigit():
+                self._feed_write("\n[dim]Uso: /esquecer <id_da_licao> (veja os IDs com /licoes)[/dim]\n")
+                return
+            lid = int(parts[1])
+            deleted = orquestra.delete_project_lesson(lid)
+            if deleted:
+                self._feed_write(f"\n[green]✓ Lição #{lid} removida da memória permanente.[/green]\n")
+            else:
+                self._feed_write(f"\n[yellow]⚠ Lição #{lid} não encontrada.[/yellow]\n")
+            return
 
         if head.startswith("/senha") or head in ("/senhas", "/cofre", "/cofre-status"):
             if not (_VAULT and _VAULT.is_unlocked):
@@ -1870,10 +2268,10 @@ class OrquestraTUI(App):
             else:
                 self._open_design_project()
         elif head in ("/ajuda", "/help"):
-            self._feed_write("\n[dim]/senha NOME valor · /senhas · /design <o que prever> · "
-                      "/modo chat|tecnico · /detalhe minimal|normal|full · "
+            self._feed_write("\n[dim]/aprender <texto> · /licoes · /esquecer <id> · /senha NOME valor · /senhas · "
+                      "/design <o que prever> · /modo chat|tecnico · /detalhe minimal|normal|full · "
                       "/risco on|off · /auto on|off · /relato on|off · /seguir on|off · "
-                      "/quem <arquivo> · /uso · /saldo · botões do topo trocam os modelos\n"
+                      "/quem <arquivo> · /uso · /saldo · /sessao · /limpar · botões do topo trocam os modelos\n"
                       "Atalhos: Ctrl+1..4 aba do palco · Ctrl+B Arquivos · "
                       "Ctrl+T Terminal Lateral · Ctrl+K limpa o feed · "
                       "Ctrl+L foco no prompt · Ctrl+S/Ctrl+W salvar/fechar aba[/dim]\n")
@@ -1993,6 +2391,13 @@ class OrquestraTUI(App):
 
         orquestra.save_chat_message("orquestrador", "assistant", final_text)
 
+        # Aprendizado Contínuo: extrai e armazena lição formulada pelo Orquestrador
+        clean_text, lesson = orquestra._extract_lesson(final_text)
+        if lesson:
+            lid = orquestra.store_project_lesson(lesson, category="reflexao", project_id=orquestra.get_project_id())
+            self._terminal_log(f"[bold green]🧠 Lição assimilada pelo Orquestrador [#{lid}]:[/bold green] {rich_escape(lesson)}")
+            final_text = clean_text
+
         # <MOSTRAR arquivo="..."> — extrai e remove ANTES do parsing de
         # PLANO/DELEGATE/PIPELINE, senão o corte de "texto visível" (abaixo)
         # jogaria fora qualquer coisa escrita depois da tag.
@@ -2040,6 +2445,20 @@ class OrquestraTUI(App):
                 self._feed_write(f"{self._plan_pending}\n")
             self.call_from_thread(self._show_plan_bar)
             return
+
+        # Se o Orquestrador disse que encerrou as tarefas ou se é uma nova tarefa avulsa isolada:
+        final_lower = final_text.lower()
+        close_phrases = (
+            "tarefas anteriores encerradas", "histórico limpo", "historico limpo",
+            "encerrei as tarefas", "encerrei tudo", "tarefas encerradas", "cancelei as tarefas",
+            "tarefas limpas", "tarefas canceladas", "finalizei as tarefas", "limpeza concluída",
+            "limpeza concluida", "removi as tarefas", "apaguei as tarefas", "plano limpo",
+            "tarefas foram encerradas", "tarefas foram limpas", "tarefas foram canceladas",
+        )
+        if any(cp in final_lower for cp in close_phrases) or (delegates and not pipelines):
+            import orquestra
+            orquestra.reset_worker_session(project_id=orquestra.get_project_id())
+            self.call_from_thread(self._clear_plan_panel)
 
         if delegates or pipelines:
             deleg_tuples = [(m.group(1).lower(), m.group(2).strip()) for m in delegates]
@@ -2126,6 +2545,7 @@ class OrquestraTUI(App):
                                    orchestrator_react=orchestrator_react,
                                    suppress_report=suppress_report)
         finally:
+            self._current_running_worker = None
             self.call_from_thread(self._end_task)
 
     def _run_worker_body(self, binary_tag: str, instruction: str, read_only: bool = False,
@@ -2151,7 +2571,21 @@ class OrquestraTUI(App):
             worker_cfg = orquestra.apply_model_to_worker(worker_cfg, chosen)
             actual_binary = worker_cfg["binary"]
 
-        cmd, worker_env, output_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, instruction, read_only=read_only)
+        active_session = orquestra.get_worker_session(canon)
+        is_resume = bool(active_session)
+        if not active_session:
+            import uuid
+            active_session = str(uuid.uuid4())
+            orquestra.set_worker_session(canon, active_session)
+
+        # Registra o prompt enviado e marca worker em execução
+        orquestra.set_last_worker_prompt(canon, instruction)
+        self._current_running_worker = canon
+
+        cmd, worker_env, output_file = orquestra._build_worker_cmd(
+            worker_cfg, actual_binary, instruction, read_only=read_only,
+            session_id=active_session, resume_session=is_resume
+        )
 
         self._feed_write(f"\n[dim]{icon} {label} começou a trabalhar...[/dim]\n")
 
@@ -2188,9 +2622,11 @@ class OrquestraTUI(App):
             gps_thread.start()
 
         # Abre o painel terminal automaticamente e mostra banner de início
+        sess_status = f" — {'RETOMANDO SESSÃO' if is_resume else 'NOVA SESSÃO'} [{active_session[:8]}]"
         self.call_from_thread(self._show_terminal_panel)
         self._terminal_log(f"\n[bold cyan]{'═' * 50}[/bold cyan]")
-        self._terminal_log(f"[bold cyan]🚀 {icon} {label} ({actual_binary}) — INÍCIO[/bold cyan]")
+        self._terminal_log(f"[bold cyan]🚀 {icon} {label} ({actual_binary}){sess_status}[/bold cyan]")
+        self._terminal_log(f"[bold yellow]📥 Prompt do Orquestrador:[/bold yellow]\n{instruction.strip()}")
         self._terminal_log(f"[bold cyan]{'═' * 50}[/bold cyan]\n")
 
         def on_line(text: str):
@@ -2199,11 +2635,23 @@ class OrquestraTUI(App):
         def on_close(ok: bool, error_detail: str, changes_summary: str):
             pass
 
+        def _update_tab_lbl(msg: str):
+            try:
+                lbl = self.query_one(f"#{canon}-status-lbl", Label)
+                if msg:
+                    lbl.update(f"{icon} {label}: ⚙ {msg[:45]}")
+                else:
+                    lbl.update(f"{icon} {label}: {actual_binary} · {EXIT_KEY_LABEL} sai")
+            except Exception:
+                pass
+
         def on_status(text: str):
             self.call_from_thread(self._set_status, text)
+            self.call_from_thread(_update_tab_lbl, text)
 
         def on_tool(text: str):
             self.call_from_thread(self._set_status, f"{icon} {label}: {text}")
+            self.call_from_thread(_update_tab_lbl, text)
             self._terminal_log(f"[dim]⚙ {text}[/dim]")
 
         section = _TUILiveSection(label, on_line, on_close, on_status, on_tool)
@@ -2230,6 +2678,7 @@ class OrquestraTUI(App):
             self.call_from_thread(self._add_usage, result.cost_usd, result.tokens_in, result.tokens_out)
 
         on_status("")
+        self._current_running_worker = None
 
         # Para o GPS
         gps_stop.set()
@@ -2251,6 +2700,10 @@ class OrquestraTUI(App):
                 pass
 
         if is_error:
+            if is_resume:
+                err_lower = (error_detail or "").lower()
+                if any(k in err_lower for k in ("session", "not found", "resume", "invalid")):
+                    orquestra.reset_worker_session(canon)
             orquestra.save_chat_message("orquestrador", "assistant",
                                         f"[Erro do {label}]: {(error_detail or '')[:1500]}")
             err_resumo = (error_detail or "Erro desconhecido").strip().splitlines()[0][:140]
@@ -2290,7 +2743,12 @@ class OrquestraTUI(App):
             # mesma chamada). suppress_report desliga isso só pro botão
             # "🔍 Revisar" (o Revisor ali já É o retorno pedido pelo usuário).
             reported = False
+            pending_delegates = None
+            pending_pipelines = None
             if not read_only and not suppress_report and config.get("ui", {}).get("orchestrator_reports", True):
+                auto_ok_early = (not read_only) and self._should_auto_approve(config, result.changed_files)
+                has_pending_block = bool(changes_summary) and not auto_ok_early
+
                 self.call_from_thread(self._set_status, f"⠹ 🎼 Orquestrador resumindo o que {label} fez...")
                 orq_cfg = config.setdefault("roles", {}).setdefault("orquestrador", {})
                 orq_cfg["model"] = self._orq_model
@@ -2302,8 +2760,9 @@ class OrquestraTUI(App):
                 report_input = f"{display_text}\n\n{changes_summary}".strip() if changes_summary else display_text
                 comment = orquestra._orchestrator_react(
                     config, label, report_input, section=react_section,
-                    has_pending_changes=bool(changes_summary),
+                    has_pending_changes=has_pending_block,
                     changed_files=result.changed_files or None,
+                    allow_dispatch=not has_pending_block,
                 )
                 self.call_from_thread(self._set_status, "")
                 if comment:
@@ -2311,6 +2770,19 @@ class OrquestraTUI(App):
                     self._feed_write(f"\n[bold cyan]🎼 Orquestrador[/bold cyan]\n")
                     self._feed_write(RichMarkdown(comment))
                     reported = True
+
+                    if not has_pending_block:
+                        pipeline_steps_list = []
+                        for pm in orquestra.PIPELINE_RE.finditer(comment):
+                            steps = [(m.group(1).lower(), m.group(2).strip()) for m in orquestra.DELEGATE_RE.finditer(pm.group(1))]
+                            if steps:
+                                pipeline_steps_list.append(steps)
+                        clean_output_no_pipeline = orquestra.PIPELINE_RE.sub('', comment)
+                        delegate_matches = list(orquestra.DELEGATE_RE.finditer(clean_output_no_pipeline))
+                        deleg_tuples = [(m.group(1).lower(), m.group(2).strip()) for m in delegate_matches]
+                        if deleg_tuples or pipeline_steps_list:
+                            pending_delegates = deleg_tuples
+                            pending_pipelines = pipeline_steps_list
 
             if not reported:
                 primeira_linha = display_text.strip().splitlines()[0] if display_text.strip() else "Tarefa concluída."
@@ -2364,7 +2836,10 @@ class OrquestraTUI(App):
             has_bug = False
             wtext = ""
             if auto_ok:
-                self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
+                cg_w, cg_b, *_ = orquestra._resolve_worker(config, "cao_guarda")
+                cg_m = shorten_name(cg_w.get("model", cg_b or "auto"))
+                self.call_from_thread(self._set_watchdog_footer, f"🐕 Cão de Guarda ({cg_m}): analisando o diff...")
+                self._terminal_log(f"\n[dim]🐕 Cão de Guarda ({cg_m}): analisando alterações para revisão...[/dim]")
                 wtext, has_bug = orquestra.watchdog_verdict(config)
                 self._report_watchdog(wtext, has_bug)
 
@@ -2378,7 +2853,13 @@ class OrquestraTUI(App):
                         for fp in attribution["files"]:
                             orquestra.set_file_author(orquestra.get_project_id(), fp, attribution["agent_tag"],
                                                        attribution["agent_label"], attribution["instruction"])
-                self.call_from_thread(self._re_enable_input)
+                
+                # Check auto continuation
+                if pending_delegates or pending_pipelines:
+                    self._feed_write("\n[dim]⚡ Orquestrador engatilhou próximas tarefas automaticamente...[/dim]\n")
+                    self.call_from_thread(self._dispatch_delegates, pending_delegates, pending_pipelines)
+                else:
+                    self.call_from_thread(self._re_enable_input)
             else:
                 if auto_ok and has_bug:
                     self._feed_write(
@@ -2387,7 +2868,12 @@ class OrquestraTUI(App):
                 self.call_from_thread(self._show_action_bar)
                 self._watchdog_followup(wtext, has_bug)
         else:
-            self.call_from_thread(self._re_enable_input)
+            # Check auto continuation (no changes case)
+            if 'pending_delegates' in locals() and (pending_delegates or pending_pipelines):
+                self._feed_write("\n[dim]⚡ Orquestrador engatilhou próximas tarefas automaticamente...[/dim]\n")
+                self.call_from_thread(self._dispatch_delegates, pending_delegates, pending_pipelines)
+            else:
+                self.call_from_thread(self._re_enable_input)
 
     # ── Worker: Watchdog ──────────────────────────────────────────────────────
 
@@ -2403,9 +2889,13 @@ class OrquestraTUI(App):
         vez de desistir em silêncio. gh copilot/claude/agy/codex não precisam
         de git pra rodar; só o cálculo do diff precisava."""
         import orquestra
-        self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
-
         config = orquestra.load_config()
+        worker, binary, *_ = orquestra._resolve_worker(config, "cao_guarda")
+        model_name = shorten_name(worker.get("model", binary or "auto"))
+
+        self.call_from_thread(self._set_watchdog_footer, f"🐕 Cão de Guarda ({model_name}): analisando o diff...")
+        self._terminal_log(f"\n[dim]🐕 Cão de Guarda ({model_name}): analisando alterações para revisão...[/dim]")
+
         text, has_bug = orquestra.watchdog_verdict(config, file_path=file_path)
 
         # Rota pro chat do Orquestrador só na revisão pós-Aprovar (não na auditoria
@@ -2458,23 +2948,28 @@ class OrquestraTUI(App):
         completo no feed, toast + bell. Sem achado → rodapé verde que some em 8s.
         to_chat: grava o veredito no histórico do Orquestrador."""
         import orquestra
+        config = orquestra.load_config()
+        worker, binary, *_ = orquestra._resolve_worker(config, "cao_guarda")
+        model_name = shorten_name(worker.get("model", binary or "auto"))
         footer = self.query_one("#watchdog-footer", Label)
         flat = " ".join(text.split()) if text else ""
         if text and has_bug:
-            self.call_from_thread(footer.update, f"🐕 Cão de Guarda ⚠ {rich_escape(flat[:200])} · digite algo pra dispensar")
+            self._terminal_log(f"\n[bold red]🐕 Cão de Guarda ({model_name}) ⚠ Problemas detectados:[/bold red]\n{text}")
+            self.call_from_thread(footer.update, f"🐕 Cão de Guarda ({model_name}) ⚠ {rich_escape(flat[:200])} · digite algo pra dispensar")
             self.call_from_thread(footer.add_class, "alert")
-            self._feed_write(f"\n[bold red]🐕 Cão de Guarda[/bold red]\n{rich_escape(text[:8000])}\n")
-            self.call_from_thread(self.notify, "🐕 Cão de Guarda achou pontos na mudança — veja em ⚡ Atividade.",
+            self._feed_write(f"\n[bold red]🐕 Cão de Guarda ({model_name})[/bold red]\n{rich_escape(text[:8000])}\n")
+            self.call_from_thread(self.notify, f"🐕 Cão de Guarda ({model_name}) achou pontos na mudança — veja em ⚡ Atividade.",
                                   severity="warning", timeout=10)
             self.call_from_thread(self.bell)
         else:
-            self.call_from_thread(footer.update,
-                                  f"🐕 Cão de Guarda: {rich_escape(flat[:220]) if text else 'nada a apontar. ✅'}")
+            verdict_label = f"🐕 Cão de Guarda ({model_name}): {rich_escape(flat[:220]) if text else 'nada a apontar. ✅'}"
+            self._terminal_log(f"\n[bold green]🐕 Cão de Guarda ({model_name}) ✓ Veredito:[/bold green] {text or 'nada a apontar. ✅'}")
+            self.call_from_thread(footer.update, verdict_label)
             self.call_from_thread(footer.remove_class, "alert")
             self.call_from_thread(self._schedule_watchdog_cleanup)
         if text and to_chat:
             orquestra.save_chat_message("orquestrador", "assistant",
-                                        f"[Cão de Guarda — revisão automática]:\n{text}")
+                                        f"[Cão de Guarda ({model_name}) — revisão automática]:\n{text}")
 
     def _close_task(self, commit: str, has_bug: bool, wd_ran: bool = True) -> None:
         """Fecha a tarefa dizendo que acabou (feed + histórico do chat), sem LLM."""
@@ -2513,7 +3008,11 @@ class OrquestraTUI(App):
         try:
             footer = self.query_one("#watchdog-footer", Label)
             footer.remove_class("alert")
-            footer.update("🐕 Watchdog: Aguardando alterações para revisão...")
+            import orquestra
+            cfg = orquestra.load_config()
+            worker, binary, *_ = orquestra._resolve_worker(cfg, "cao_guarda")
+            m_label = shorten_name(worker.get("model", binary or "auto"))
+            footer.update(f"🐕 Cão de Guarda ({m_label}): Aguardando alterações para revisão...")
         except Exception:
             pass
 
@@ -2664,6 +3163,7 @@ class OrquestraTUI(App):
         try:
             self._run_pipeline_tui_body(steps, previous=previous, is_resume=is_resume)
         finally:
+            self._current_running_worker = None
             self.call_from_thread(self._end_task)
 
     def _run_pipeline_tui_body(self, steps: list, previous: str = "", is_resume: bool = False) -> None:
@@ -2704,7 +3204,34 @@ class OrquestraTUI(App):
                 self.call_from_thread(self._render_plan_panel)
 
             self._feed_write(f"\n[dim]🔗 Etapa {label} ({idx} de {len(steps)} restante(s))[/dim]\n")
-            cmd, env, out_file = orquestra._build_worker_cmd(worker_cfg, actual_binary, full)
+
+            active_session = orquestra.get_worker_session(canon)
+            is_resume_worker = bool(active_session)
+            if not active_session:
+                import uuid
+                active_session = str(uuid.uuid4())
+                orquestra.set_worker_session(canon, active_session)
+
+            orquestra.set_last_worker_prompt(canon, full)
+            self._current_running_worker = canon
+
+            cmd, env, out_file = orquestra._build_worker_cmd(
+                worker_cfg,
+                actual_binary,
+                full,
+                session_id=active_session,
+                resume_session=is_resume_worker,
+            )
+
+            def _update_tab_lbl(msg: str):
+                try:
+                    lbl = self.query_one(f"#{canon}-status-lbl", Label)
+                    if msg:
+                        lbl.update(f"{icon} {label}: ⚙ {msg[:45]}")
+                    else:
+                        lbl.update(f"{icon} {label}: {actual_binary} · {EXIT_KEY_LABEL} sai")
+                except Exception:
+                    pass
 
             def on_status(text: str, _label=label, _step=step_no, _total=len(steps) + offset):
                 def _update():
@@ -2716,6 +3243,7 @@ class OrquestraTUI(App):
                         status_lbl.update("")
                         status_lbl.add_class("hidden")
                 self.call_from_thread(_update)
+                self.call_from_thread(_update_tab_lbl, text)
 
             def on_tool(text: str, _label=label, _step=step_no, _total=len(steps) + offset):
                 def _update():
@@ -2724,15 +3252,18 @@ class OrquestraTUI(App):
                         status_lbl.update(f"🔗 Etapa {_step}/{_total} — {_label}: {text}")
                         status_lbl.remove_class("hidden")
                 self.call_from_thread(_update)
+                self.call_from_thread(_update_tab_lbl, text)
                 self._terminal_log(f"[dim]⚙ {text}[/dim]")
 
             def on_line(text: str, _label=label):
                 self._terminal_log(text)
 
             # Abre o painel terminal e mostra banner de início da etapa
+            sess_status = f" — {'RETOMANDO SESSÃO' if is_resume_worker else 'NOVA SESSÃO'} [{active_session[:8]}]"
             self.call_from_thread(self._show_terminal_panel)
             self._terminal_log(f"\n[bold cyan]{'═' * 50}[/bold cyan]")
-            self._terminal_log(f"[bold cyan]🔗 Etapa {step_no}/{len(steps) + offset}: {icon} {label} ({actual_binary}) — INÍCIO[/bold cyan]")
+            self._terminal_log(f"[bold cyan]🔗 Etapa {step_no}/{len(steps) + offset}: {icon} {label} ({actual_binary}){sess_status}[/bold cyan]")
+            self._terminal_log(f"[bold yellow]📥 Prompt do Orquestrador:[/bold yellow]\n{full.strip()}")
             self._terminal_log(f"[bold cyan]{'═' * 50}[/bold cyan]\n")
 
             section = _TUILiveSection(label, on_line, lambda *a: None, on_status, on_tool)
@@ -2748,6 +3279,7 @@ class OrquestraTUI(App):
                 result.final_text, result.is_error, result.error_detail, result.changes_summary,
             )
             on_status("")
+            self._current_running_worker = None
             # Banner de conclusão da etapa no terminal
             if is_error:
                 self._terminal_log(f"\n[bold red]{'═' * 50}[/bold red]")
@@ -2770,6 +3302,10 @@ class OrquestraTUI(App):
             )
             self.call_from_thread(self._add_usage, result.cost_usd, result.tokens_in, result.tokens_out)
             if is_error:
+                if is_resume_worker:
+                    err_lower = (err or "").lower()
+                    if any(k in err_lower for k in ("session", "not found", "resume", "invalid")):
+                        orquestra.reset_worker_session(canon)
                 if offset + idx - 1 < len(self._plan_steps):
                     self._plan_steps[offset + idx - 1]["status"] = "error"
                     self.call_from_thread(self._render_plan_panel)
@@ -2852,7 +3388,10 @@ class OrquestraTUI(App):
                 has_bug = False
                 wtext = ""
                 if auto_ok:
-                    self.call_from_thread(self._set_watchdog_footer, "🐕 Cão de Guarda: analisando o diff...")
+                    cg_w, cg_b, *_ = orquestra._resolve_worker(config, "cao_guarda")
+                    cg_m = shorten_name(cg_w.get("model", cg_b or "auto"))
+                    self.call_from_thread(self._set_watchdog_footer, f"🐕 Cão de Guarda ({cg_m}): analisando o diff...")
+                    self._terminal_log(f"\n[dim]🐕 Cão de Guarda ({cg_m}): analisando alterações para revisão...[/dim]")
                     wtext, has_bug = orquestra.watchdog_verdict(config)
                     self._report_watchdog(wtext, has_bug)
 
@@ -2896,9 +3435,20 @@ class OrquestraTUI(App):
         usuário lendo o Editor levaria um "puxão" de volta a cada chamada)."""
         if event.tabbed_content.id == "stage-tabs" and self._active_workers > 0:
             self._stage_pinned = True
-        if event.tabbed_content.id == "side-tabs" and event.pane.id == "side-shell":
-            # clique direto na aba 🖥 Shell: sobe o shell e leva o foco
-            self.call_after_refresh(self._focus_embedded_term)
+        if event.tabbed_content.id == "side-tabs":
+            if event.pane.id == "side-logs":
+                try:
+                    log_area = self.query_one("#terminal-log", ClickableTextArea)
+                    self.set_timer(0.05, log_area.focus)
+                except Exception:
+                    pass
+            elif event.pane.id == "side-shell":
+                # clique direto na aba 🖥 Shell: sobe o shell e leva o foco
+                self.call_after_refresh(self._focus_embedded_term)
+            elif event.pane.id == "side-operador":
+                self.set_timer(0.12, lambda: self._launch_interactive_agent("operador", "operador-term"))
+            elif event.pane.id == "side-revisor":
+                self.set_timer(0.12, lambda: self._launch_interactive_agent("revisor", "revisor-term"))
 
     # ── Helpers de UI (devem ser chamados na thread da UI) ────────────────────
 
@@ -2930,6 +3480,23 @@ class OrquestraTUI(App):
         def _write():
             try:
                 self.query_one("#activity-log", RichLog).write(item)
+                raw = getattr(item, 'markup', '') or (item if isinstance(item, str) else '')
+                if raw and len(raw) > 20:
+                    import re
+                    codes = re.findall(r"```(?:\w+)?\s*\n(.*?)\n```", raw, re.DOTALL)
+                    if codes:
+                        self._last_copied_code = "\n\n".join(c.strip() for c in codes)
+                        self._last_raw_text = raw.strip()
+                        try:
+                            self.query_one("#copy-bar").remove_class("hidden")
+                        except Exception:
+                            pass
+                    elif "http://" in raw or "https://" in raw:
+                        self._last_raw_text = raw.strip()
+                        try:
+                            self.query_one("#copy-bar").remove_class("hidden")
+                        except Exception:
+                            pass
             except Exception:
                 pass
         if threading.current_thread() is threading.main_thread():
@@ -2953,7 +3520,14 @@ class OrquestraTUI(App):
             return
         def _write():
             try:
-                self.query_one("#terminal-log", RichLog).write(text)
+                from rich.text import Text
+                try:
+                    clean_text = Text.from_markup(text).plain
+                except Exception:
+                    clean_text = text
+                ta = self.query_one("#terminal-log", ClickableTextArea)
+                ta.insert(clean_text + ("\n" if not clean_text.endswith("\n") else ""), location=ta.document.end)
+                ta.scroll_end(animate=False)
             except Exception:
                 pass
         if threading.current_thread() is threading.main_thread():
@@ -3069,6 +3643,9 @@ class OrquestraTUI(App):
         for step in self._plan_steps:
             icon = icons.get(step["status"], "⬜")
             panel.mount(Label(f"{icon} {step['text'][:100]}", classes="plan-step"))
+
+        if all(s.get("status") in ("done", "error") for s in self._plan_steps):
+            panel.mount(Button("✕ Limpar tarefas", id="btn-clear-plan-panel", classes="mini-action-btn"))
 
     def _clear_plan_panel(self) -> None:
         self._plan_steps = []

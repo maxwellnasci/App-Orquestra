@@ -321,13 +321,22 @@ try:
     c2 = orquestra.load_config()
     check(c2["roles"]["orquestrador"]["binary"] == "codex", "2ª carga idempotente")
 
-    # config válida via CLI logada (agy) — NÃO deve ser mexida
+    # config válida via CLI logada (agy) — o binário não deve ser re-roteado
     orquestra.CONFIG_FILE.write_text(json.dumps({
-        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.6-flash-high"}},
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-4-argon-high"}},
         "workers": {}, "ui": {},
     }), encoding="utf-8")
     c3 = orquestra.load_config()
     check(c3["roles"]["orquestrador"]["binary"] == "agy", "orquestrador via agy (login) preservado")
+    check(c3["roles"]["orquestrador"]["model"] == "gemini-4-argon-high", "modelo agy vigente preservado")
+
+    orquestra.CONFIG_FILE.write_text(json.dumps({
+        "roles": {"orquestrador": {"binary": "agy", "model": "gemini-3.1-pro-high"}},
+        "workers": {}, "ui": {},
+    }), encoding="utf-8")
+    c3b = orquestra.load_config()
+    check(c3b["roles"]["orquestrador"]["model"] == "gemini-4-argon-high",
+          "modelo agy aposentado (gemini-3.1) vira o default do CLI atual")
     od = c1.get("open_design")
     from pathlib import Path as _P
     if _P(orquestra.DEFAULT_CONFIG["open_design"]["repo_path"]).is_dir():
@@ -688,8 +697,159 @@ check("achou pontos" in _c2 and "limpo" not in _c2, "fechamento: Cão achou pont
 _c3 = orquestra.format_task_closing("", has_bug=False)
 check("sem commit" in _c3, "fechamento: sem commit quando nada mudou")
 _c4 = orquestra.format_task_closing("x.py", has_bug=False, wd_ran=False)
-check("não rodou" in _c4 and "limpo" not in _c4, "fechamento: Cão não rodou não vira 'limpo'")
+# ── Worker Sessions & Background Continuity ────────────────────────────────
+print("worker sessions")
+orquestra.reset_worker_session(project_id="test_proj")
+check(orquestra.get_worker_session("operador", project_id="test_proj") is None, "sessão inicial operador é None")
+orquestra.set_worker_session("operador", "sess-12345", project_id="test_proj")
+check(orquestra.get_worker_session("operador", project_id="test_proj") == "sess-12345", "grava e recupera sessão operador")
+orquestra.set_worker_session("revisor", "sess-67890", project_id="test_proj")
+check(orquestra.get_worker_session("revisor", project_id="test_proj") == "sess-67890", "grava e recupera sessão revisor")
+orquestra.reset_worker_session("operador", project_id="test_proj")
+check(orquestra.get_worker_session("operador", project_id="test_proj") is None, "reset_worker_session de um papel específico")
+check(orquestra.get_worker_session("revisor", project_id="test_proj") == "sess-67890", "reset_worker_session preserva outros papéis")
+orquestra.reset_worker_session(project_id="test_proj")
+check(orquestra.get_worker_session("revisor", project_id="test_proj") is None, "reset_worker_session limpa tudo do projeto")
 
+# Flags de sessão nos comandos dos workers:
+c_new, _, _ = orquestra._build_worker_cmd({"model": "claude-sonnet-5"}, "claude", "tarefa", session_id="uuid-abc-123", resume_session=False)
+check("--session-id" in c_new and "uuid-abc-123" in c_new and "--resume" not in c_new, "claude 1ª execução passa --session-id")
+
+c_res, _, _ = orquestra._build_worker_cmd({"model": "claude-sonnet-5"}, "claude", "tarefa", session_id="uuid-abc-123", resume_session=True)
+check("--resume" in c_res and "uuid-abc-123" in c_res and "--session-id" not in c_res, "claude retoma com --resume")
+
+cx_res, _, cx_out = orquestra._build_worker_cmd({}, "codex", "tarefa", session_id="sess-codex-xyz", resume_session=True)
+check("resume" in cx_res and "sess-codex-xyz" in cx_res, "codex retoma com codex exec resume")
+if cx_out and _os.path.exists(cx_out):
+    _os.unlink(cx_out)
+
+agy_new, _, _ = orquestra._build_worker_cmd({}, "agy", "tarefa", session_id="sess-agy-1", resume_session=False)
+check("--session" not in agy_new and "--continue" not in agy_new, "agy nova sessão NÃO passa flag --session inválida")
+
+agy_res, _, _ = orquestra._build_worker_cmd({}, "agy", "tarefa", session_id="sess-agy-1", resume_session=True)
+check("--continue" in agy_res, "agy retoma com --continue")
+
+# Testes de lições do projeto
+_orig_db = orquestra.MEMORY_DB_FILE
+import tempfile
+with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as _tf:
+    _tmp_db = Path(_tf.name)
+try:
+    orquestra.MEMORY_DB_FILE = _tmp_db
+    orquestra._init_memory_db()
+    orquestra.store_project_lesson("Lição teste de projeto", category="unit-test", project_id="test_pid")
+    _lessons = orquestra.list_project_lessons(project_id="test_pid")
+    check(any(l["text"] == "Lição teste de projeto" for l in _lessons), "store_project_lesson e list_project_lessons funcionam")
+    _target_id = next(l["id"] for l in _lessons if l["text"] == "Lição teste de projeto")
+    check(orquestra.delete_project_lesson(_target_id) is True, "delete_project_lesson funciona")
+finally:
+    orquestra.MEMORY_DB_FILE = _orig_db
+    if _tmp_db.exists():
+        _tmp_db.unlink()
+
+# Diretriz de não encerramento precoce em builds/servidores
+check("DIRETRIZ DE AGUARDO DE SERVIDORES" in c_new[2] or "DIRETRIZ DE AGUARDO" in "".join(c_new), "worker recebe diretriz de aguardo de servidores/builds")
+
+# ── Comandos Interativos e Visualização de Prompts ─────────────────────────────
+print("worker interactive & prompts")
+orquestra.set_last_worker_prompt("revisor", "Prompt de teste para o revisor")
+check(orquestra.get_last_worker_prompt("revisor") == "Prompt de teste para o revisor", "grava e recupera prompt do revisor")
+check(orquestra.get_last_worker_prompt("operador") == "", "papel sem prompt retorna vazio")
+
+cfg_test = orquestra.DEFAULT_CONFIG
+ic_cmd, ic_env, ic_bin = orquestra.build_interactive_worker_cmd("revisor", cfg_test, session_id="uuid-sess-123", resume=True)
+check(ic_bin == "claude", "revisor default é claude")
+check("--resume" in ic_cmd and "uuid-sess-123" in ic_cmd, "claude interativo retoma sessão com --resume")
+check(ic_env.get("CLAUDE_CODE_NO_FLICKER") == "1", "claude interativo define CLAUDE_CODE_NO_FLICKER=1")
+
+ic_clean_cmd, _, _ = orquestra.build_interactive_worker_cmd("revisor", cfg_test, session_id="uuid-sess-123", resume=False)
+check("--resume" not in ic_clean_cmd, "claude interativo padrão inicia limpo sem --resume")
+
+ic_new_cmd, _, _ = orquestra.build_interactive_worker_cmd("revisor", cfg_test, session_id="")
+check(ic_new_cmd[0] == "claude" and "--resume" not in ic_new_cmd, "claude interativo sem sessão roda claude puro")
+
+ic_codex_cmd, _, ic_codex_bin = orquestra.build_interactive_worker_cmd("codex", cfg_test, session_id="sess-codex-1", resume=True)
+check(ic_codex_bin == "codex", "binário codex identificado")
+check("resume" in ic_codex_cmd and "sess-codex-1" in ic_codex_cmd, "codex interativo retoma sessão")
+
+ic_muse_cmd, _, ic_muse_bin = orquestra.build_interactive_worker_cmd("muse", cfg_test, session_id="sess-muse-1", resume=True)
+check("resume" in ic_muse_cmd and "sess-muse-1" in ic_muse_cmd, "muse interativo retoma sessão")
+
+ic_agy_cmd, _, ic_agy_bin = orquestra.build_interactive_worker_cmd("agy", cfg_test, session_id="sess-agy-1", resume=True)
+check("--continue" in ic_agy_cmd, "agy interativo retoma com --continue")
+
+# ── Emulador de Terminal: Sequências CSI (SCO/VT) ──────────────────────────────
+print("terminal csi emulation")
+import orquestra_term
+t_screen = orquestra_term._Screen(40, 10)
+t_stream = orquestra_term.pyte.ByteStream(t_screen)
+
+t_screen.cursor.x = 15
+t_screen.cursor.y = 4
+t_stream.feed(b"\x1b[s")  # CSI s: salva
+t_screen.cursor.x = 30
+t_screen.cursor.y = 8
+t_stream.feed(b"\x1b[u")  # CSI u: restaura
+check((t_screen.cursor.x, t_screen.cursor.y) == (15, 4), "CSI s/u salva e restaura cursor")
+
+# Dupla restauração não pula para (0, 0)
+t_stream.feed(b"\x1b[u")
+check((t_screen.cursor.x, t_screen.cursor.y) == (15, 4), "CSI u sem pilha preserva cursor e não pula pra 0,0")
+
+# Rolagem vertical CSI S / CSI T
+for idx in range(5):
+    t_screen.buffer[idx][0] = orquestra_term.pyte.screens.Char(str(idx))
+t_stream.feed(b"\x1b[1S")  # Rola 1 linha pra cima
+check(t_screen.buffer[0][0].data == "1" and t_screen.buffer[3][0].data == "4", "CSI S rola tela para cima")
+t_stream.feed(b"\x1b[1T")  # Rola 1 linha pra baixo
+check(t_screen.buffer[1][0].data == "1" and t_screen.buffer[4][0].data == "4", "CSI T rola tela para baixo")
+
+# Repetição CSI b (REP)
+t_screen.cursor.x = 0
+t_screen.cursor.y = 2
+t_stream.feed(b"X\x1b[4b")
+rep_text = "".join(t_screen.buffer[2][i].data for i in range(5))
+check(rep_text == "XXXXX", "CSI b repete caractere anterior")
+
+# Backtab CSI Z (CBT)
+t_screen.cursor.x = 16
+t_stream.feed(b"\x1b[Z")
+check(t_screen.cursor.x == 8, "CSI Z move cursor para tab stop anterior")
+
+# Form Feed (\x0c / Ctrl+L)
+t_screen.buffer[0][0] = orquestra_term.pyte.screens.Char("Z")
+t_screen.cursor.x = 10
+t_screen.cursor.y = 5
+t_stream.feed(b"\x0c")
+check(t_screen.cursor.x == 0 and t_screen.cursor.y == 0, "Form Feed move cursor para o topo")
+check(t_screen.buffer[0][0].data == " ", "Form Feed limpa o conteúdo da tela")
+
+# PtyTerminal.clear()
+p_term = orquestra_term.PtyTerminal()
+p_term._screen = orquestra_term._Screen(40, 10)
+p_term._screen.buffer[0][0] = orquestra_term.pyte.screens.Char("A")
+p_term._screen.cursor.x = 8
+p_term._screen.cursor.y = 3
+p_term.clear()
+check(p_term._screen.cursor.x == 0 and p_term._screen.cursor.y == 0, "PtyTerminal.clear() zera posição do cursor")
+check(p_term._screen.buffer[0][0].data == " ", "PtyTerminal.clear() limpa o buffer do emulador")
+
+
+
+# ── Antigravity: lista ao vivo do binário instalado ─────────────────────────
+print("agy models")
+_agy_txt = "Fetching available models...\ngemini-4-argon-high\tGemini 4 Argon (High)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+_parsed = orquestra._parse_agy_models_text(_agy_txt)
+check(len(_parsed) == 2 and _parsed[0][0] == "gemini-4-argon-high", "parse de `agy models` ignora status e lê id<TAB>rótulo")
+check(orquestra.engine_for_model("claude-opus-5")["binary"] == "claude", "claude-opus-5 continua no Claude Code")
+check(orquestra.engine_for_model("claude-opus-5-5-high")["binary"] == "agy", "claude-opus-5-5 do Antigravity vai pro binário agy")
+check(orquestra.engine_for_model("gemini-4-argon-high")["binary"] == "agy", "gemini-4-argon vai pro binário agy")
+check(orquestra._current_agy_model("gemini-3.1-pro-high") == "gemini-4-argon-high", "gemini-3.1-pro-high está aposentado")
+check(orquestra._current_agy_model("claude-opus-4-6-thinking") == "claude-opus-5-5-high",
+      "claude-opus-4-6-thinking do Antigravity vira opus 5.5")
+_agy_cmd, _, _ = orquestra._build_worker_cmd({"model": "claude-opus-4-6-thinking"}, "agy", "faça X", read_only=True)
+check("claude-opus-5-5-high" in _agy_cmd and "claude-opus-4-6-thinking" not in _agy_cmd,
+      "comando agy troca o modelo rejeitado pelo CLI atual")
 
 print()
 if FAILS:
